@@ -17,14 +17,13 @@ export default defineConfig({
     // 覆盖率地板（CI 跑 npm run test:coverage；本地 pre-commit 不跑 vitest，它要真库）。
     // 范围 = 全部 src，只排除入口（listen / 信号处理，测不到也不该测）与 prisma generate 的产物
     // （几万行生成代码会把百分比冲成噪音）。
-    // 覆盖率地板只防倒退、只准上调。出厂占位 0：首次 npm run test:coverage 实测后
-    // 改成「lines 实测值减 1 取整」。
+    // 覆盖率地板只防倒退、只准上调：「lines 实测值减 1 取整」（2026-09-30 实测 lines 89.3%）。
     coverage: {
       provider: "v8",
       include: ["src/**"],
       exclude: ["src/main.ts", "src/db/generated/**"],
       reporter: ["text-summary"],
-      thresholds: { lines: 0 },
+      thresholds: { lines: 88 },
     },
   },
 });

@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 
 import { verifyPassword } from "../src/core/password.js";
-import { closeDb, getDb } from "../src/db/client.js";
+import { assertSchemaCurrent, closeDb, getDb } from "../src/db/client.js";
 import { Prisma } from "../src/db/generated/client.js";
 import { SEED_ACCOUNT_IDS, SEED_USERS, seedDatabase } from "../src/db/seed.js";
 import { makeAccount, makeGroup } from "./factories.js";
@@ -257,6 +257,49 @@ describe("db schema 约束", () => {
       where: { id: account.id },
       data: { status: "rate_limited", rateLimitedUntil: new Date() },
     });
+  });
+});
+
+describe("启动时的 schema 闸门（assertSchemaCurrent，题目 A0）", () => {
+  afterAll(async () => {
+    await closeDb();
+  });
+
+  it("迁移链全部应用：通过", async () => {
+    await expect(assertSchemaCurrent()).resolves.toBeUndefined();
+  });
+
+  it("库比代码旧：有迁移没跑完（finished_at 为空）→ 拒绝启动，并点名是哪个迁移", async () => {
+    const db = getDb();
+    const [last] = await db.$queryRaw<{ migration_name: string }[]>`
+      SELECT migration_name FROM _prisma_migrations ORDER BY migration_name DESC LIMIT 1`;
+    const name = last!.migration_name;
+    await db.$executeRaw`
+      UPDATE _prisma_migrations SET finished_at = NULL WHERE migration_name = ${name}`;
+    try {
+      await expect(assertSchemaCurrent()).rejects.toThrow(
+        `未应用的迁移 ${name}`,
+      );
+    } finally {
+      await db.$executeRaw`
+        UPDATE _prisma_migrations SET finished_at = started_at WHERE migration_name = ${name}`;
+    }
+  });
+
+  it("库比代码新：库里有本地没有的迁移（回滚部署）→ 拒绝启动", async () => {
+    const db = getDb();
+    const name = "29991231000000_from_newer_release";
+    await db.$executeRaw`
+      INSERT INTO _prisma_migrations (id, checksum, migration_name, started_at, finished_at, applied_steps_count)
+      VALUES (${randomUUID()}, 'x', ${name}, now(), now(), 1)`;
+    try {
+      await expect(assertSchemaCurrent()).rejects.toThrow(
+        `库里有本地没有的迁移 ${name}`,
+      );
+    } finally {
+      await db.$executeRaw`
+        DELETE FROM _prisma_migrations WHERE migration_name = ${name}`;
+    }
   });
 });
 

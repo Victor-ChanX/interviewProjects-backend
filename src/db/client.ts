@@ -84,10 +84,11 @@ export function runMigrations(): void {
 }
 
 /**
- * schema 落后于代码时拒绝启动：
- * prisma/migrations 下每个迁移目录名都必须在 _prisma_migrations 里且 finished_at 非空
- * （rolled_back_at 为空）。
- * 为什么：迁移没跑就把新代码放出去，会在运行期以奇怪的 SQL 错误暴露，不如启动即失败。
+ * 库的迁移状态与代码不一致时拒绝启动，两头都拦：
+ * - 库比代码旧：prisma/migrations 下每个迁移目录名都必须在 _prisma_migrations 里且 finished_at 非空
+ *   （rolled_back_at 为空）；
+ * - 库比代码新：库里成功应用过、本地却没有的迁移（旧版本代码被回滚部署到新库上）。
+ * 为什么：带着不认识的表结构继续服务，会在运行期以奇怪的 SQL 错误暴露，不如启动即失败。
  */
 export async function assertSchemaCurrent(): Promise<void> {
   const database = getDb();
@@ -105,6 +106,13 @@ export async function assertSchemaCurrent(): Promise<void> {
   if (missing.length > 0) {
     throw new Error(
       `数据库 schema 落后于代码：未应用的迁移 ${missing.join(", ")}（先跑 npm run db:deploy）`,
+    );
+  }
+  const known = new Set(expected);
+  const unknown = [...applied].filter((name) => !known.has(name)).sort();
+  if (unknown.length > 0) {
+    throw new Error(
+      `数据库 schema 比代码新：库里有本地没有的迁移 ${unknown.join(", ")}（代码版本比库旧，是不是回滚部署了？）`,
     );
   }
 }

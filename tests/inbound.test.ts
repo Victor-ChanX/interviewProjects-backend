@@ -254,7 +254,7 @@ describe("ingest", () => {
       ]);
     });
 
-    it("mediaUrl 原样存进 payload 与 media_url 列（不下载，C1 不做）", async () => {
+    it("mediaUrl 原样存进 payload 与 media_url 列（入站只记账，下载由 media worker 另做）", async () => {
       const group = await localGroup();
       await ingest(
         frame(
