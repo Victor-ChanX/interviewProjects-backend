@@ -5,7 +5,8 @@
 //   一批里的消息分属不同账号，互不影响；逐条串行的话一次 send 最慢要十几秒，后面的全被拖住。
 // - 确认（runConfirmTick）= 回收过期领取（领取者死了 → unknown）→ unknown 按 by-client-id 确认（确认未发出的回
 //   queued）。单独一个循环：派发时一次 send
-//   可能挂十几秒，确认不能排在它后面等（A2：收到 504 起 5 秒内定态）。
+//   可能挂十几秒，确认不能排在它后面等（A2：收到 504 起 5 秒内定态）。确认后的那一次重发也不在确认 tick 里等：
+//   worker 把它放到后台跑（stop() 前等完），否则一条慢重发推迟下一轮确认，别的 unknown 行可能超过 5 秒（后端 #51）。
 // runOutboxTick = 确认 + 派发，按顺序跑一遍（测试直接 await 它，不起循环）；「确认未发出 → 重发」落在同一个 tick 里。
 // 写法是 while + 可打断的 sleep 而不是 setInterval：tick 慢于间隔时不会叠着跑（同一批被领两次的来源之一），
 // stop() 立即打断等待、等在途 tick 完成后返回（优雅停机：不在外部调用中途退出，那正是制造 unknown 的方法）。
@@ -23,6 +24,7 @@ import {
   type DispatchOutcome,
   recoverStaleClaims,
   resolveUnknown,
+  type ResolveUnknownOptions,
 } from "../services/outbox-service.js";
 
 export type OutboxTickDeps = {
@@ -33,6 +35,8 @@ export type OutboxTickDeps = {
   log?: Pick<Logger, "info" | "warn" | "error">;
   /** 一次 tick 最多领几条 */
   batchSize?: number;
+  /** 确认后的重发怎么跑；不给 = 在确认 tick 里当场等（见 ResolveUnknownOptions） */
+  deferResend?: ResolveUnknownOptions["deferResend"];
 };
 
 export type OutboxWorkerDeps = OutboxTickDeps & {
@@ -118,6 +122,7 @@ export async function runConfirmTick(deps: OutboxTickDeps): Promise<{
     const r = await resolveUnknown(
       serviceDeps,
       deps.batchSize ?? DEFAULT_BATCH_SIZE,
+      { deferResend: deps.deferResend },
     );
     result.unknownChecked = r.checked;
     result.resends = r.resends;
@@ -197,6 +202,16 @@ export function startOutboxWorker(deps: OutboxWorkerDeps): OutboxWorkerHandle {
   const sleep = deps.sleep ?? defaultSleep;
   let stopped = false;
   const pending = new Set<{ cancel: () => void }>();
+  // 确认循环交出来的重发：后台跑，stop() 前等它们落账
+  const resends = new Set<Promise<void>>();
+  const deferResend: ResolveUnknownOptions["deferResend"] = (resend) => {
+    const running = resend().then(
+      (outcome) => log.info({ outcome }, "确认未发出后的重发已派发"),
+      (err: unknown) => log.error({ err }, "确认未发出后的重发记账失败"),
+    );
+    const tracked = running.finally(() => resends.delete(tracked));
+    resends.add(tracked);
+  };
 
   const every = async (tick: () => Promise<void>): Promise<void> => {
     while (!stopped) {
@@ -221,7 +236,7 @@ export function startOutboxWorker(deps: OutboxWorkerDeps): OutboxWorkerHandle {
   });
   const confirmLoop = every(async () => {
     try {
-      const r = await runConfirmTick({ ...deps, log });
+      const r = await runConfirmTick({ ...deps, log, deferResend });
       if (r.recovered > 0 || r.unknownChecked > 0) {
         log.info(r, "outbox 回收 / 确认 unknown");
       }
@@ -236,6 +251,7 @@ export function startOutboxWorker(deps: OutboxWorkerDeps): OutboxWorkerHandle {
       stopped = true;
       for (const s of pending) s.cancel();
       await Promise.all([dispatchLoop, confirmLoop]);
+      await Promise.all([...resends]);
     },
   };
 }

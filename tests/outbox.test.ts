@@ -347,6 +347,33 @@ describe("outbox（#7）", () => {
       },
     );
 
+    it("走真实终态级联（成员行已被删）的账号 → 409 ACCOUNT_UNAVAILABLE，不是 ACCOUNT_NOT_IN_GROUP", async () => {
+      const { group } = await stageGroup();
+      const member = await addMember(group, { status: "online" });
+      const t = await app.inject({
+        method: "POST",
+        url: `/api/accounts/${member.id}/transition`,
+        headers: admin,
+        payload: { to: "suspended", expectedFrom: "online" },
+      });
+      expect(t.statusCode).toBe(200);
+      expect(
+        await getDb().groupMember.count({ where: { accountId: member.id } }),
+      ).toBe(0);
+
+      const res = await app.inject({
+        method: "POST",
+        url: `/api/groups/${group.id}/send`,
+        headers: admin,
+        payload: { accountId: member.id, text: "x" },
+      });
+      expect(res.statusCode).toBe(409);
+      expect(res.json()).toMatchObject({
+        error: { code: "ACCOUNT_UNAVAILABLE", status: "suspended" },
+      });
+      expect(await getDb().message.count()).toBe(0);
+    });
+
     it("群不存在 → 404 GROUP_NOT_FOUND；群 unreachable → 409 GROUP_UNREACHABLE", async () => {
       const { group, creator } = await stageGroup();
       const missing = await app.inject({
@@ -966,6 +993,87 @@ describe("outbox（#7）", () => {
         claimedBy: null,
       });
       expect((await simState()).sendCalls).toHaveLength(2);
+    });
+
+    it("worker 的确认 tick 不等重发：重发交给 deferResend 在后台跑，确认 tick 先返回", async () => {
+      const { group, creator } = await stageGroup();
+      await scenario({
+        send: { responses: [{ status: 504, landAfterMs: null }] },
+      });
+      const { messageId } = await enqueue(group, creator);
+      await tick();
+      clock.advance(CONFIRM_WINDOW_MS + 1);
+
+      let release: () => void = () => undefined;
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const slowSend: GatewayClient = {
+        ...gatewayClient,
+        async send(input) {
+          await held; // 网关 202 很慢
+          return gatewayClient.send(input);
+        },
+      };
+      const deferred: Promise<unknown>[] = [];
+      const r = await runConfirmTick({
+        clock,
+        gateway: slowSend,
+        workerId: "w-confirm",
+        log: silent,
+        deferResend: (resend) => deferred.push(resend()),
+      });
+      // 确认 tick 已经返回，而重发还卡在网关上
+      expect(deferred).toHaveLength(1);
+      expect(r.resends.accepted).toBe(0);
+      expect(await row(messageId)).toMatchObject({
+        deliveryStatus: "queued",
+        resendCount: 1,
+        claimedBy: "w-confirm",
+      });
+
+      release();
+      await Promise.all(deferred);
+      expect(await row(messageId)).toMatchObject({
+        deliveryStatus: "accepted",
+        claimedBy: null,
+      });
+    });
+
+    it("确认按行兜底：一行记账时库出错，别的行照常定态，确认 tick 不整批失败", async () => {
+      const { group, creator } = await stageGroup();
+      const other = await addMember(group);
+      await scenario({
+        send: {
+          responses: [
+            { status: 504, landAfterMs: 0 },
+            { status: 504, landAfterMs: 0 },
+          ],
+        },
+      });
+      const a = await enqueue(group, creator, "a");
+      const b = await enqueue(group, other, "b");
+      await tick();
+      await sleepMs(20); // 模拟器 landAfterMs: 0 的定时器
+      expect((await simState()).messages).toHaveLength(2);
+
+      const r = await withFailingUpdates(
+        "messages",
+        `NEW.id = '${a.messageId}' AND NEW.delivery_status = 'sent'`,
+        () =>
+          runConfirmTick({
+            clock,
+            gateway: gatewayClient,
+            workerId: "w1",
+            log: silent,
+          }),
+      );
+      expect(r.unknownChecked).toBe(2);
+      expect((await row(a.messageId)).deliveryStatus).toBe("unknown");
+      expect((await row(b.messageId)).deliveryStatus).toBe("sent");
+
+      await tick();
+      expect((await row(a.messageId)).deliveryStatus).toBe("sent");
     });
 
     it("多条 unknown 的确认并发进行：一条慢查询不拖住别的", async () => {

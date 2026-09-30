@@ -145,6 +145,15 @@ export type ApplyDeliveryResult = {
   status: DeliveryStatus | null;
 };
 
+export type ResolveUnknownOptions = {
+  /**
+   * 确认没发出、已重新领取的那条怎么重发。不给 = 在本次确认里当场 await（测试与 runOutboxTick 用，结果计入 resends）。
+   * worker 给一个「后台跑、停机前等完」的调度：一条慢的重发（网关 202 本身可能要 1–2 秒）不拖住下一轮确认，
+   * 其它 unknown 行照样在「504 起 5 秒」内定态（后端 #51）。
+   */
+  deferResend?: (resend: () => Promise<DispatchOutcome>) => void;
+};
+
 export type ResolveUnknownStats = {
   checked: number;
   sent: number;
@@ -226,13 +235,8 @@ export async function enqueueMessageInTx(
   // 看得见这里新入队的行；反过来级联先提交，这里读到的就是终态、直接拒绝。不锁的话，「读到 online → 级联提交 →
   // 本行提交」会留下一条终态账号的 queued，级联永远看不到它（A1）。
   await tx.$queryRaw`SELECT id FROM accounts WHERE id = ${input.accountId} FOR SHARE`;
-  if (!member) {
-    throw new Conflict(
-      "ACCOUNT_NOT_IN_GROUP",
-      "该账号不是这个群的成员，等它入群后再发",
-      { groupId: input.groupId, accountId: input.accountId },
-    );
-  }
+  // 先判账号状态、再判成员：终态级联会删掉该账号的成员行，先判成员的话终态账号拿到的是 ACCOUNT_NOT_IN_GROUP，
+  // 而题目 2.3 要求 idle / disconnected / 终态一律 409 ACCOUNT_UNAVAILABLE（后端 #51）。
   const account = await tx.account.findUnique({
     where: { id: input.accountId },
   });
@@ -251,6 +255,13 @@ export async function enqueueMessageInTx(
         ? `账号已${account.status === "suspended" ? "被平台停用" : "会话失效"}，不能发消息`
         : `账号当前是 ${account.status}，先 connect 再发`,
       { accountId: input.accountId, status: account.status },
+    );
+  }
+  if (!member) {
+    throw new Conflict(
+      "ACCOUNT_NOT_IN_GROUP",
+      "该账号不是这个群的成员，等它入群后再发",
+      { groupId: input.groupId, accountId: input.accountId },
     );
   }
 
@@ -1023,6 +1034,7 @@ async function backoffOrFail(
 export async function resolveUnknown(
   deps: DispatchDeps,
   limit: number = DEFAULT_BATCH_SIZE,
+  opts: ResolveUnknownOptions = {},
 ): Promise<ResolveUnknownStats> {
   const clock = deps.clock ?? systemClock;
   const { gateway, log } = deps;
@@ -1109,11 +1121,27 @@ export async function resolveUnknown(
     log?.info(ctx, "确认未发出，用同一 clientMsgId 重发一次");
     stats.requeued += 1;
     if (claimed === "deferred") return;
+    if (opts.deferResend) {
+      opts.deferResend(() => dispatchOne(claimed, deps));
+      return;
+    }
     const outcome = await dispatchOne(claimed, deps);
     stats.resends[outcome] += 1;
   };
 
-  await Promise.all(rows.map(confirmOne));
+  // 按行兜底：一行记账时库出错不拖垮整批（其余行这个 tick 照常定态），出错的行下个 tick 再确认
+  await Promise.all(
+    rows.map(async (row) => {
+      try {
+        await confirmOne(row);
+      } catch (err) {
+        log?.error(
+          { err, messageId: row.id, clientMsgId: row.clientMsgId },
+          "确认 unknown 失败，下个 tick 再试",
+        );
+      }
+    }),
+  );
   return stats;
 }
 
