@@ -586,6 +586,44 @@ describe("outbox（#7）", () => {
       ]);
     });
 
+    it("账号先于排在前面的那条到点（两边截止差几毫秒）：后面的也等着，不插队", async () => {
+      const { group, creator: a } = await stageGroup();
+      await scenario({
+        send: {
+          responses: [
+            { status: 429, retryAfterSeconds: 5, match: { accountId: a.id } },
+          ],
+        },
+      });
+      const m1 = await enqueue(group, a, "a-1");
+      clock.advance(1);
+      const m2 = await enqueue(group, a, "a-2");
+      await tick();
+      const limitedAt = clock.now();
+      // 真实进程里 requeue 的排期与 enterRateLimited 的截止各自取时钟：让 a-1 比账号晚 50ms 到点
+      await getDb().message.update({
+        where: { id: m1.messageId },
+        data: { nextAttemptAt: new Date(limitedAt.getTime() + 5_050) },
+      });
+
+      clock.advance(5_000);
+      await recoverRateLimited({ clock, log: silent });
+      expect((await account(a.id)).status).toBe("online");
+      expect((await tick()).claimed).toBe(0);
+      expect((await row(m2.messageId)).deliveryStatus).toBe("queued");
+
+      clock.advance(50);
+      await tick();
+      await tick();
+      expect(
+        (await simState()).sendCalls.map((c) => [c.clientMsgId, c.status]),
+      ).toEqual([
+        [m1.clientMsgId, 429],
+        [m1.clientMsgId, 202],
+        [m2.clientMsgId, 202],
+      ]);
+    });
+
     it("限流期内即使账号状态还没被恢复，到期时刻一过就照常领取（不依赖限流 worker 的时序）", async () => {
       const { group, creator: a } = await stageGroup();
       await scenario({

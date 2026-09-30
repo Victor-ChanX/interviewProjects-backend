@@ -252,7 +252,8 @@ export async function enqueueMessageInTx(
  * 一条语句领一批（交互式事务里 $queryRaw 标签模板，Prisma 查询 API 没有 FOR UPDATE）：
  * - queued、未被领、到点（next_attempt_at 空或 ≤ now）；
  * - 账号不在限流期（status = rate_limited 且 rate_limited_until > now 的一条都不领）；
- * - 该账号没有在途的一条（claimed_by 非空）—— 顺序发出；
+ * - 该账号没有在途的一条（claimed_by 非空），且它是该账号最早的一条 queued —— 顺序发出：排在前面的
+ *   还没到点（429 回 queued 的 next_attempt_at 可能比账号的限流截止晚几毫秒、503 退避）时后面的也等着；
  * - `FOR UPDATE OF m, a SKIP LOCKED`：别的副本正在领同一账号（锁着 accounts 行）时跳过该账号的行，
  *   两个副本不会同时各拿一条同账号的消息；commit 后靠 claimed_by 继续互斥。
  * 一批里同一账号只取最早一条（其余留在 queued，下个 tick 再看），然后标 claimedBy / lockedAt、attempts + 1、
@@ -284,6 +285,12 @@ export async function claimBatch(
           WHERE f.account_id = m.account_id
             AND f.delivery_status = 'queued'
             AND f.claimed_by IS NOT NULL
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM messages e
+          WHERE e.account_id = m.account_id
+            AND e.delivery_status = 'queued'
+            AND (e.sent_at, e.id) < (m.sent_at, m.id)
         )
       ORDER BY m.sent_at, m.id
       LIMIT ${limit}
