@@ -43,6 +43,22 @@ export type Config = {
    * 想在非 production 下也开（例如预发环境）设 COOKIE_SECURE=1。
    */
   cookieSecure: boolean;
+  /** 真实 LLM 版 Agent 服务（src/llm-agent，`npm run llm-agent`，题目 C2）的监听端口，默认 8300 */
+  llmAgentPort: number;
+  /**
+   * llm-agent 管理端点（/admin/*）的令牌：请求头 x-admin-token 必须等于它。llm-agent 启动时必填；
+   * 后端用它调这些端点（控制台的 /api/llm/*），缺了后端把 LLM 设置视为不支持。
+   * 上游（base url / key / 模型）不走 env：只来自控制台保存的配置文件（llmAgentConfigFile）。
+   */
+  llmAgentAdminToken: string | undefined;
+  /** 控制台保存的 LLM 配置文件（含 API key，写入时 chmod 600，不进 git / 镜像）；默认启动目录（仓库根）下的 .llm-agent.json */
+  llmAgentConfigFile: string;
+  /**
+   * 一次 /agent/turn 调上游的**总**时长上限（含 429 / 5xx 的重试与退避），毫秒，默认 10000。
+   * 必须小于后端的 agentTurnTimeoutMs（AGENT_TURN_TIMEOUT_MS，默认 12000）：否则后端先超时记 TURN_TIMEOUT，
+   * 本服务还在重试，答案到了也被丢弃。留 1–2 秒给本服务自身与网络。
+   */
+  llmTimeoutMs: number;
 };
 
 function readMs(
@@ -88,4 +104,8 @@ export const config: Readonly<Config> = Object.freeze({
   ),
   cookieSecure:
     process.env.NODE_ENV === "production" || process.env.COOKIE_SECURE === "1",
+  llmAgentPort: readPort(process.env.LLM_AGENT_PORT, 8300),
+  llmAgentAdminToken: process.env.LLM_AGENT_ADMIN_TOKEN || undefined,
+  llmAgentConfigFile: process.env.LLM_AGENT_CONFIG_FILE || ".llm-agent.json",
+  llmTimeoutMs: readMs(process.env.LLM_TIMEOUT_MS, "LLM_TIMEOUT_MS", 10_000),
 });

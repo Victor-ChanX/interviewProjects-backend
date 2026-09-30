@@ -26,6 +26,7 @@ import groupSendRoutes from "./api/routes/group-send.js";
 import groupRoutes from "./api/routes/groups.js";
 import healthRoutes from "./api/routes/health.js";
 import jobRoutes from "./api/routes/jobs.js";
+import llmSettingsRoutes from "./api/routes/llm-settings.js";
 import sequenceRunRoutes from "./api/routes/sequence-runs.js";
 import sequenceRoutes from "./api/routes/sequences.js";
 import wsRoutes from "./api/routes/ws.js";
@@ -33,6 +34,7 @@ import { config } from "./core/config.js";
 import { DomainError, type ErrorCode } from "./core/errors.js";
 import { assertJwtSecretConfigured } from "./core/jwt.js";
 import type { GatewayClient } from "./services/gateway-client.js";
+import type { LlmAdminClient } from "./services/llm-settings-service.js";
 import { createWsHub, type WsHub } from "./services/ws-hub.js";
 // 副作用 import：让 .meta({ id }) 的 schema 在 app.swagger() 之前已进 z.globalRegistry
 import "./schemas/account.js";
@@ -41,6 +43,7 @@ import "./schemas/auth.js";
 import "./schemas/group.js";
 import "./schemas/health.js";
 import "./schemas/job.js";
+import "./schemas/llm-settings.js";
 import "./schemas/message.js";
 import "./schemas/sequence.js";
 
@@ -74,6 +77,11 @@ export type BuildAppOptions = {
    * 测试同样自己建（轮询间隔调小）。不给则建一个没人轮询的 hub：连接能认证，但收不到事件。
    */
   wsHub?: WsHub;
+  /**
+   * llm-agent 管理端点的客户端（#19，/api/llm/*）。不给则按 AGENT_URL + LLM_AGENT_ADMIN_TOKEN 建（缺任一 = 不支持）；
+   * 测试把 llm-agent 起在 listen(0) 上后经这里注入，传 null 表示「不支持」。
+   */
+  llmAdmin?: LlmAdminClient | null;
 };
 
 export async function buildApp(
@@ -174,6 +182,11 @@ export async function buildApp(
   void app.register(sequenceRoutes, { prefix: "/api/sequences" });
   void app.register(sequenceRunRoutes);
   void app.register(wsRoutes, { hub: opts.wsHub ?? createWsHub() });
+  // LLM 设置（#19）：代理 llm-agent 的管理端点，路由文件写全路径
+  void app.register(
+    llmSettingsRoutes,
+    opts.llmAdmin !== undefined ? { llmAdmin: opts.llmAdmin } : {},
+  );
 
   return app;
 }

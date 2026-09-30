@@ -45,7 +45,16 @@ export type ErrorCode =
   // 同群已有 running 的序列运行（409：部分唯一索引撞出来的，等它结束）
   | "SEQUENCE_ALREADY_RUNNING"
   // 预检：某步文本里的 {key} 解析不到（422；extra 带 stepIndex / key）
-  | "UNRESOLVED_PLACEHOLDER";
+  | "UNRESOLVED_PLACEHOLDER"
+  // ---- LLM 设置（#19，题目 C2：控制台配置 llm-agent 的上游）----
+  // 没带 apiKey 且 baseUrl 与已保存的不同：不能把已存的 key 发给另一个主机（422：填上 key 就能过）
+  | "LLM_API_KEY_REQUIRED"
+  // 服务商对这个 key 回 401 / 403（422：换个 key 就能过）
+  | "LLM_UPSTREAM_UNAUTHORIZED"
+  // 服务商或 llm-agent 不可用、超时、回了不可理解的东西（502）
+  | "LLM_UPSTREAM_ERROR"
+  // AGENT_URL 指向的服务没有管理端点（例如 Agent 模拟器），或没配 LLM_AGENT_ADMIN_TOKEN（409：切到 llm-agent 后就能用）
+  | "LLM_AGENT_UNSUPPORTED";
 
 export type ErrorExtra = Record<string, unknown>;
 
