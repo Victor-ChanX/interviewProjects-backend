@@ -44,17 +44,20 @@ enum AccountStatus {
 
 model Account {
   /// 种子预置（acc-1 …），也是网关侧的 accountId
-  id               String        @id
-  status           AccountStatus @default(idle)
+  id                  String        @id
+  status              AccountStatus @default(idle)
   /// 网关 connect 返回；同一账号每次相同，null = 从未 connect
-  platformUserId   String?       @unique @map("platform_user_id")
+  platformUserId      String?       @unique @map("platform_user_id")
   /// RATE_LIMITED 的 retryAfterSeconds 到期时刻；到期恢复由 worker 按这列排期。
   /// 约束见 20260930101643_domain_model：status = rate_limited 时必须非空
-  rateLimitedUntil DateTime?     @map("rate_limited_until") @db.Timestamptz
+  rateLimitedUntil    DateTime?     @map("rate_limited_until") @db.Timestamptz
+  /// 操作员标了 idle / disconnected、网关 disconnect 还没确认成功的时刻（后端 #58）：非空 = 待断开，
+  /// 转移后先当场调一次，失败由 rate-limit-worker 每 10 秒重试，成功或重新 connect 后置空
+  disconnectPendingAt DateTime?     @map("disconnect_pending_at") @db.Timestamptz
   /// 乐观锁：transition 用 { where: { id, version } } 做 CAS，撞不上 → CAS_CONFLICT
-  version          Int           @default(0)
-  createdAt        DateTime      @default(now()) @map("created_at") @db.Timestamptz
-  updatedAt        DateTime      @updatedAt @map("updated_at") @db.Timestamptz
+  version             Int           @default(0)
+  createdAt           DateTime      @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt           DateTime      @updatedAt @map("updated_at") @db.Timestamptz
 
   createdGroups    Group[]           @relation("group_creator")
   memberships      GroupMember[]

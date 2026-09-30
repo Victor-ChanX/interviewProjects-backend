@@ -22,9 +22,11 @@ import { logger } from "../src/core/logger.js";
 import { closeDb, getDb } from "../src/db/client.js";
 import type { AccountStatus } from "../src/db/generated/client.js";
 import {
+  DISCONNECT_RETRY_MS,
   enterRateLimited,
   enterTerminal,
   recoverRateLimited,
+  retryPendingDisconnects,
   transition,
   type TransitionSource,
 } from "../src/services/account-service.js";
@@ -341,6 +343,94 @@ describe("accounts", () => {
       );
       expect(again.statusCode).toBe(200);
       expect(again.json()).toMatchObject({ status: "idle", changed: true });
+    });
+
+    it("网关当时断不开：待断开落库，rate-limit-worker 过了重试间隔再调一次，成功后清掉（不会永久丢失）", async () => {
+      const account = await accountIn("idle");
+      await post(`/api/accounts/${account.id}/connect`, admin);
+      await gateway.inject({
+        method: "POST",
+        url: "/_sim/scenario",
+        payload: { outage: { all: true } },
+      });
+      const res = await post(`/api/accounts/${account.id}/transition`, admin, {
+        to: "disconnected",
+        expectedFrom: "online",
+      });
+      expect(res.statusCode).toBe(200);
+      const pending = (
+        await getDb().account.findUniqueOrThrow({ where: { id: account.id } })
+      ).disconnectPendingAt;
+      expect(pending).not.toBeNull();
+      const online = async () =>
+        (await gateway.inject({ method: "GET", url: "/_sim/state" }))
+          .json<{ accounts: { accountId: string; online: boolean }[] }>()
+          .accounts.find((a) => a.accountId === account.id)?.online;
+      expect(await online()).toBe(true);
+
+      // 网关恢复；重试间隔之内不重试，过了才重试
+      await gateway.inject({
+        method: "POST",
+        url: "/_sim/scenario",
+        payload: { outage: { all: false } },
+      });
+      const clock = fakeClock(pending!);
+      expect(
+        await retryPendingDisconnects({
+          clock,
+          gateway: createGatewayClient({ baseUrl: gatewayUrl }),
+          log: logger.child({}, { level: "silent" }),
+        }),
+      ).toEqual({ due: 0, disconnected: 0 });
+      clock.advance(DISCONNECT_RETRY_MS);
+      expect(
+        await retryPendingDisconnects({
+          clock,
+          gateway: createGatewayClient({ baseUrl: gatewayUrl }),
+          log: logger.child({}, { level: "silent" }),
+        }),
+      ).toEqual({ due: 1, disconnected: 1 });
+      expect(await online()).toBe(false);
+      expect(
+        (await getDb().account.findUniqueOrThrow({ where: { id: account.id } }))
+          .disconnectPendingAt,
+      ).toBeNull();
+    });
+
+    it("待断开期间重新 connect：待断开清掉，不会事后把刚连上的账号断开", async () => {
+      const account = await accountIn("idle");
+      await post(`/api/accounts/${account.id}/connect`, admin);
+      await gateway.inject({
+        method: "POST",
+        url: "/_sim/scenario",
+        payload: { outage: { all: true } },
+      });
+      await post(`/api/accounts/${account.id}/transition`, admin, {
+        to: "disconnected",
+        expectedFrom: "online",
+      });
+      await gateway.inject({
+        method: "POST",
+        url: "/_sim/scenario",
+        payload: { outage: { all: false } },
+      });
+      const again = await post(`/api/accounts/${account.id}/connect`, admin);
+      expect(again.statusCode).toBe(200);
+      const row = await getDb().account.findUniqueOrThrow({
+        where: { id: account.id },
+      });
+      expect(row).toMatchObject({
+        status: "online",
+        disconnectPendingAt: null,
+      });
+      const clock = fakeClock(new Date(Date.now() + DISCONNECT_RETRY_MS * 2));
+      expect(
+        await retryPendingDisconnects({
+          clock,
+          gateway: createGatewayClient({ baseUrl: gatewayUrl }),
+          log: logger.child({}, { level: "silent" }),
+        }),
+      ).toEqual({ due: 0, disconnected: 0 });
     });
   });
 

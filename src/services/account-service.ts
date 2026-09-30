@@ -169,24 +169,97 @@ export async function transition(
   deps: TransitionDeps = {},
 ): Promise<TransitionResult> {
   const clock = deps.clock ?? systemClock;
-  const result = await getDb().$transaction((tx) =>
-    transitionInTx(tx, accountId, input, clock.now()),
-  );
+  const now = clock.now();
+  const offline = OFFLINE_TARGETS.includes(input.to);
+  const result = await getDb().$transaction(async (tx) => {
+    const r = await transitionInTx(tx, accountId, input, now);
+    // 要断开网关连接的意图与状态同一事务落库（后端 #58）：commit 之后那次调用失败 / 进程死在中间，
+    // rate-limit-worker 按 disconnectPendingAt 接着重试，不会永久丢失。转到 online（connect）则清掉。
+    if (r.changed) {
+      await tx.account.update({
+        where: { id: accountId },
+        data: { disconnectPendingAt: offline ? now : null },
+      });
+    }
+    return r;
+  });
 
   // commit 之后才记业务日志 / 做外部副作用
   logTransition(accountId, input.to, input.source, result, deps.log);
-  if (result.changed && deps.gateway && OFFLINE_TARGETS.includes(input.to)) {
-    try {
-      await deps.gateway.disconnect(accountId);
-    } catch (err) {
-      // 本地已下线即生效；网关侧断不开只影响网关那边的在线标记，下次 connect 会覆盖。
-      deps.log?.warn(
-        { err, accountId, to: input.to },
-        "网关 disconnect 失败，本地状态已生效",
-      );
-    }
+  if (result.changed && deps.gateway && offline) {
+    await disconnectPending(accountId, now, deps.gateway, deps.log);
   }
   return result;
+}
+
+/** 网关 disconnect 重试间隔：失败后过这么久 rate-limit-worker 再试 */
+export const DISCONNECT_RETRY_MS = 10_000;
+
+/**
+ * 对一个待断开的账号调一次网关 disconnect：成功就清掉 disconnectPendingAt（条件：仍是这一次的待断开，期间没有
+ * 重新 connect / 再标一次）；失败把它推到 now（下一次 DISCONNECT_RETRY_MS 后再试）。返回是否断开成功。
+ */
+async function disconnectPending(
+  accountId: string,
+  pendingAt: Date,
+  gateway: Pick<GatewayClient, "disconnect">,
+  log: TransitionDeps["log"],
+  now: Date = pendingAt,
+): Promise<boolean> {
+  try {
+    await gateway.disconnect(accountId);
+  } catch (err) {
+    log?.warn({ err, accountId }, "网关 disconnect 失败，稍后重试");
+    await getDb().account.updateMany({
+      where: { id: accountId, disconnectPendingAt: pendingAt },
+      data: { disconnectPendingAt: now },
+    });
+    return false;
+  }
+  await getDb().account.updateMany({
+    where: { id: accountId, disconnectPendingAt: pendingAt },
+    data: { disconnectPendingAt: null },
+  });
+  return true;
+}
+
+/**
+ * 重试待断开的账号（rate-limit-worker 每 tick 调，后端 #58）：disconnectPendingAt 早于 now − DISCONNECT_RETRY_MS、
+ * 且仍是 idle / disconnected（已重新 connect 的会被清掉，不在此列）的，逐个再调一次网关 disconnect。
+ */
+export async function retryPendingDisconnects(deps: {
+  clock?: Clock;
+  gateway: Pick<GatewayClient, "disconnect">;
+  log?: TransitionDeps["log"];
+  limit?: number;
+}): Promise<{ due: number; disconnected: number }> {
+  const now = (deps.clock ?? systemClock).now();
+  const rows = await getDb().account.findMany({
+    where: {
+      disconnectPendingAt: {
+        lte: new Date(now.getTime() - DISCONNECT_RETRY_MS),
+      },
+      status: { in: [...OFFLINE_TARGETS] },
+    },
+    select: { id: true, disconnectPendingAt: true },
+    orderBy: { disconnectPendingAt: "asc" },
+    take: deps.limit ?? 50,
+  });
+  let disconnected = 0;
+  for (const row of rows) {
+    if (
+      await disconnectPending(
+        row.id,
+        row.disconnectPendingAt!,
+        deps.gateway,
+        deps.log,
+        now,
+      )
+    ) {
+      disconnected += 1;
+    }
+  }
+  return { due: rows.length, disconnected };
 }
 
 /** 转移的事务体（见文件头三条硬规则）：状态写入、终态级联、ws 事件在调用方的同一个事务里。 */

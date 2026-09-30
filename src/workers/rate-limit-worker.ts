@@ -2,13 +2,21 @@
 // 排期在库里：accounts.rateLimitedUntil；这里的定时器只是「多久看一次」，重启后从库里的截止时刻继续。
 // 每个 tick 调 account-service 的 recoverRateLimited：到期且仍是 rate_limited 的才转移，
 // 期间被改过的（状态变了 / until 被刷新）由它的 CAS 跳过。
+// 同一个 tick 顺带重试「标了 idle / disconnected 但网关 disconnect 还没成功」的账号（后端 #58，排期在
+// accounts.disconnectPendingAt）。
 // 写法是 while + 可打断的 sleep 而不是 setInterval：tick 慢于间隔时不会叠着跑，stop() 立即返回。
 import type { Clock } from "../core/clock.js";
 import { logger, type Logger } from "../core/logger.js";
-import { recoverRateLimited } from "../services/account-service.js";
+import {
+  recoverRateLimited,
+  retryPendingDisconnects,
+} from "../services/account-service.js";
+import type { GatewayClient } from "../services/gateway-client.js";
 
 export type RateLimitWorkerDeps = {
   clock: Clock;
+  /** 给了才重试待断开的账号 */
+  gateway?: Pick<GatewayClient, "disconnect">;
   /** 多久看一次（限流以秒计，1s 足够） */
   intervalMs: number;
   log?: Logger;
@@ -45,6 +53,17 @@ export function startRateLimitWorker(
       if (due > 0) log.info({ due, recovered }, "限流到期恢复");
     } catch (err) {
       log.error({ err }, "限流恢复 tick 失败");
+    }
+    if (!deps.gateway) return;
+    try {
+      const r = await retryPendingDisconnects({
+        clock: deps.clock,
+        gateway: deps.gateway,
+        log,
+      });
+      if (r.due > 0) log.info(r, "重试网关 disconnect");
+    } catch (err) {
+      log.error({ err }, "重试网关 disconnect 失败");
     }
   };
 

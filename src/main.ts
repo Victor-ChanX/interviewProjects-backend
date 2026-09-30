@@ -51,6 +51,7 @@ async function main(): Promise<void> {
   // 限流到期恢复（#6）：排期在 accounts.rateLimitedUntil，这里只是每秒看一眼
   const rateLimitWorker = startRateLimitWorker({
     clock: systemClock,
+    gateway,
     intervalMs: 1_000,
   });
   // 入站 SSE（#8）：游标在 event_cursor，断线 / 重启都带 since 补拉。
