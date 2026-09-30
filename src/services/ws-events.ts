@@ -32,6 +32,11 @@ export const WS_EVENT_TYPES = [
   "group_settings_changed",
   /** 建群 / leave-all job 状态 { jobId, groupId, kind, status, step }（#11：每步推进与终态） */
   "job",
+  /**
+   * 不一致记录被标记为已处理 { id, resolvedAt, resolvedBy }（#22：POST /api/inconsistencies/:id/resolve；
+   * 只在「未处理 → 已处理」那一次推，重复 resolve 不推）。操作回执，不进 GET /api/activity 的动态流。
+   */
+  "inconsistency_resolved",
 ] as const;
 export type WsEventType = (typeof WS_EVENT_TYPES)[number];
 

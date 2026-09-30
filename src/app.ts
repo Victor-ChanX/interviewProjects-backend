@@ -19,12 +19,15 @@ import {
 } from "fastify-type-provider-zod";
 
 import accountRoutes from "./api/routes/accounts.js";
+import activityRoutes from "./api/routes/activity.js";
 import agentRunRoutes from "./api/routes/agent-runs.js";
 import authRoutes from "./api/routes/auth.js";
+import dashboardRoutes from "./api/routes/dashboard.js";
 import groupMessageRoutes from "./api/routes/group-messages.js";
 import groupSendRoutes from "./api/routes/group-send.js";
 import groupRoutes from "./api/routes/groups.js";
 import healthRoutes from "./api/routes/health.js";
+import inconsistencyRoutes from "./api/routes/inconsistencies.js";
 import jobRoutes from "./api/routes/jobs.js";
 import llmSettingsRoutes from "./api/routes/llm-settings.js";
 import sequenceRunRoutes from "./api/routes/sequence-runs.js";
@@ -38,10 +41,13 @@ import type { LlmAdminClient } from "./services/llm-settings-service.js";
 import { createWsHub, type WsHub } from "./services/ws-hub.js";
 // 副作用 import：让 .meta({ id }) 的 schema 在 app.swagger() 之前已进 z.globalRegistry
 import "./schemas/account.js";
+import "./schemas/activity.js";
 import "./schemas/agent-run.js";
 import "./schemas/auth.js";
+import "./schemas/dashboard.js";
 import "./schemas/group.js";
 import "./schemas/health.js";
+import "./schemas/inconsistency.js";
 import "./schemas/job.js";
 import "./schemas/llm-settings.js";
 import "./schemas/message.js";
@@ -187,6 +193,11 @@ export async function buildApp(
     llmSettingsRoutes,
     opts.llmAdmin !== undefined ? { llmAdmin: opts.llmAdmin } : {},
   );
+
+  // 工作台与监控（#22）：概览计数、异常中心、最近动态；全局 agent run 列表在 agentRunRoutes 里
+  void app.register(dashboardRoutes);
+  void app.register(inconsistencyRoutes);
+  void app.register(activityRoutes);
 
   return app;
 }

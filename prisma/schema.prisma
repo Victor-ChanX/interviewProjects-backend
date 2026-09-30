@@ -650,6 +650,8 @@ model Inconsistency {
   payload    Json?
   createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz
   resolvedAt DateTime? @map("resolved_at") @db.Timestamptz
+  /// 谁标记的已处理（登录用户名，#22 异常中心 POST /api/inconsistencies/:id/resolve）；未处理为 null
+  resolvedBy String?   @map("resolved_by")
 
   @@index([resolvedAt, createdAt])
   @@map("inconsistencies")

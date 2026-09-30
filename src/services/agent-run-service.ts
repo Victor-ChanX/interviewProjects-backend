@@ -60,6 +60,13 @@ import {
   GatewayResponseError,
   GatewayUnreachableError,
 } from "./gateway-client.js";
+import type { AgentRunListItem, AgentRunPage } from "../schemas/agent-run.js";
+import {
+  clampLimit,
+  decodeTimeCursor,
+  encodeTimeCursor,
+  sliceCursorPage,
+} from "./cursor.js";
 import { enqueueMessageInTx } from "./outbox-service.js";
 import { emitWsEvent } from "./ws-events.js";
 
@@ -1655,4 +1662,61 @@ export async function listAgentRuns(
     db.agentRun.count({ where: { groupId } }),
   ]);
   return { items: rows.map(toAgentRunRead), total };
+}
+
+// ---- 全局列表（#22：GET /api/agent-runs，控制台「Agent 运行」页）-------------------------------------------
+
+export type ListAllAgentRunsOptions = {
+  status?: AgentRunStatus;
+  groupId?: string;
+  /** 上一页的 nextCursor；不给 = 从最新一条开始 */
+  before?: string;
+  limit?: number;
+};
+
+/**
+ * 全部群的 run（不含 steps / triggerMessages），可按 status、groupId 筛；keyset 游标分页 `{ items, nextCursor }`：
+ * 排序键 (createdAt desc, id desc)，游标见 src/services/cursor.ts（createdAt 由 Clock 写入，毫秒精度）。
+ * 翻页途中新建的 run 的 createdAt 比游标新，只会出现在第一页之前，不挤动后面的页 —— 不重不漏。
+ * groupId 是筛选条件而不是路径资源：不存在的群返回空列表，不 404。
+ */
+export async function listAllAgentRuns(
+  opts: ListAllAgentRunsOptions = {},
+): Promise<AgentRunPage> {
+  const limit = clampLimit(opts.limit);
+  const cursor =
+    opts.before === undefined ? null : decodeTimeCursor(opts.before);
+  const where: Prisma.AgentRunWhereInput = {
+    ...(opts.status !== undefined ? { status: opts.status } : {}),
+    ...(opts.groupId !== undefined ? { groupId: opts.groupId } : {}),
+    ...(cursor
+      ? {
+          OR: [
+            { createdAt: { lt: cursor.at } },
+            { createdAt: cursor.at, id: { lt: cursor.id } },
+          ],
+        }
+      : {}),
+  };
+  const rows = await getDb().agentRun.findMany({
+    where,
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+    take: limit + 1,
+    include: { group: { select: { gatewayGroupId: true } } },
+  });
+  const { page, nextCursor } = sliceCursorPage(rows, limit, (last) =>
+    encodeTimeCursor({ at: last.createdAt, id: last.id }),
+  );
+  const items: AgentRunListItem[] = page.map((run) => ({
+    id: run.id,
+    groupId: run.groupId,
+    gatewayGroupId: run.group.gatewayGroupId,
+    status: run.status,
+    endReason: run.endReason,
+    summary: run.summary,
+    stepCount: run.stepCount,
+    createdAt: run.createdAt.toISOString(),
+    finishedAt: run.finishedAt?.toISOString() ?? null,
+  }));
+  return { items, nextCursor };
 }

@@ -13,7 +13,11 @@ import { hashPassword } from "../src/core/password.js";
 import { getDb } from "../src/db/client.js";
 import type {
   Account,
+  AgentRun,
+  AgentRunEndReason,
+  AgentRunStatus,
   Group,
+  Inconsistency,
   Message,
   Prisma,
   Session,
@@ -232,4 +236,51 @@ export async function makeMessage(
 export function tokenFrom(headers: Record<string, string>): string {
   const header = headers.authorization ?? "";
   return header.startsWith("Bearer ") ? header.slice("Bearer ".length) : header;
+}
+
+/** 各终态默认配的 endReason（库里 CHECK agent_runs_end_reason_matches_status 要求二者匹配） */
+const DEFAULT_END_REASON: Readonly<
+  Record<AgentRunStatus, AgentRunEndReason | null>
+> = {
+  running: null,
+  finished: "final",
+  failed: "budget_exhausted",
+  blocked: "audit_blocked",
+  cancelled: "cancelled",
+};
+
+/**
+ * 往 agent_runs 直接插一行（列表 / 统计用例）。status 默认 running（同群至多一个 running：部分唯一索引）；
+ * endReason 按 status 取默认值，非 running 的 finishedAt 默认等于 createdAt。createdAt 默认「现在」，排序相关的用例显式传。
+ */
+export async function makeAgentRun(
+  overrides: Partial<Prisma.AgentRunUncheckedCreateInput> & { groupId: string },
+): Promise<AgentRun> {
+  const status = overrides.status ?? "running";
+  const createdAt = overrides.createdAt ?? new Date();
+  return getDb().agentRun.create({
+    data: {
+      triggerMessages: [],
+      endReason: DEFAULT_END_REASON[status],
+      finishedAt: status === "running" ? null : createdAt,
+      ...overrides,
+      status,
+      createdAt,
+    },
+  });
+}
+
+/** 往 inconsistencies 直接插一行（异常中心 / 统计用例）。createdAt 默认「现在」，排序相关的用例显式传。 */
+export async function makeInconsistency(
+  overrides: Partial<Prisma.InconsistencyUncheckedCreateInput> = {},
+): Promise<Inconsistency> {
+  return getDb().inconsistency.create({
+    data: {
+      kind: "inbound_event_failed",
+      ref: `evt-${randomUUID().slice(0, 8)}`,
+      message: "处理网关事件写库失败",
+      payload: { note: "test" },
+      ...overrides,
+    },
+  });
 }

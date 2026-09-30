@@ -102,3 +102,43 @@ export const AgentRunListResponse = z
   })
   .meta({ id: "AgentRunListResponse" });
 export type AgentRunListResponse = z.infer<typeof AgentRunListResponse>;
+
+// ---- 全局 agent run 列表（#22：GET /api/agent-runs，控制台「Agent 运行」页）----------------------------------
+
+/** 全局列表项：不含 steps / triggerMessages；带群的网关 id（gatewayGroupId，建群未完成时为 null）便于显示 */
+export const AgentRunListItem = z
+  .object({
+    id: z.string(),
+    groupId: z.string(),
+    gatewayGroupId: z.string().nullable(),
+    status: AgentRunStatus,
+    endReason: AgentRunEndReason.nullable(),
+    summary: z.string().nullable(),
+    stepCount: z.number().int(),
+    createdAt: z.iso.datetime(),
+    finishedAt: z.iso.datetime().nullable(),
+  })
+  .meta({ id: "AgentRunListItem" });
+export type AgentRunListItem = z.infer<typeof AgentRunListItem>;
+
+/** `?status=&groupId=&before=&limit=`：before 是上一页的 nextCursor（不透明），limit 默认 50、上限 200 */
+export const AgentRunListQuery = z.object({
+  status: AgentRunStatus.optional(),
+  groupId: z.string().min(1).optional(),
+  before: z.string().min(1).optional(),
+  limit: z.coerce.number().int().min(1).max(200).default(50),
+});
+export type AgentRunListQuery = z.infer<typeof AgentRunListQuery>;
+
+/**
+ * 游标分页形状 `{ items, nextCursor }`（按 createdAt、id 倒序；nextCursor 为 null = 到底了）。
+ * 命名为 AgentRunPage 而不是 *ListResponse：openapi 导出的审计对 `*ListResponse` 要求 items + total，
+ * 那是分页 / 短列表形状的规则，游标形状不该匹配它（同 MessagePage）。
+ */
+export const AgentRunPage = z
+  .object({
+    items: z.array(AgentRunListItem),
+    nextCursor: z.string().nullable(),
+  })
+  .meta({ id: "AgentRunPage" });
+export type AgentRunPage = z.infer<typeof AgentRunPage>;
