@@ -282,6 +282,22 @@ export async function assertSessionActive(sessionId: string): Promise<void> {
   }
 }
 
+/**
+ * 一批会话里已经不能用的（作废、或行已不在）：WS hub 定期复核已认证连接用（logout / 复用作废后，已建立的
+ * 连接也要断，题目 B3）。一次查询，不逐个查。
+ */
+export async function inactiveSessionIds(
+  sessionIds: readonly string[],
+): Promise<Set<string>> {
+  if (sessionIds.length === 0) return new Set();
+  const active = await getDb().session.findMany({
+    where: { id: { in: [...sessionIds] }, revokedAt: null },
+    select: { id: true },
+  });
+  const alive = new Set(active.map((r) => r.id));
+  return new Set(sessionIds.filter((id) => !alive.has(id)));
+}
+
 /** 同上，不抛：WS 的 auth 帧（src/api/routes/ws.ts）拒绝方式是回帧 + 关连接，不走错误信封。 */
 export async function isSessionActive(sessionId: string): Promise<boolean> {
   const row = await getDb().session.findUnique({

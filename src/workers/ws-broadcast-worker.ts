@@ -35,7 +35,13 @@ export function startWsBroadcastWorker(
 
   const tick = async (): Promise<void> => {
     try {
-      const { delivered, authTimedOut } = await deps.hub.pump();
+      const { delivered, authTimedOut, sessionEnded } = await deps.hub.pump();
+      if (sessionEnded > 0) {
+        log.info(
+          { sessionEnded },
+          "关闭 token 到期 / 会话作废的 WebSocket 连接",
+        );
+      }
       if (authTimedOut > 0) {
         log.info({ authTimedOut }, "关闭认证超时的 WebSocket 连接");
       }

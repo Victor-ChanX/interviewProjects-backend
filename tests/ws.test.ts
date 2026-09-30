@@ -18,13 +18,16 @@ import {
 
 import { buildApp } from "../src/app.js";
 import type { Clock } from "../src/core/clock.js";
+import { ACCESS_TOKEN_TTL_SECONDS } from "../src/core/jwt.js";
 import { logger } from "../src/core/logger.js";
 import { closeDb, getDb } from "../src/db/client.js";
 import { emitWsEvent, type WsEventType } from "../src/services/ws-events.js";
 import {
   createWsHub,
   DEFAULT_AUTH_TIMEOUT_MS,
+  DEFAULT_SESSION_RECHECK_MS,
   WS_CLOSE_AUTH_TIMEOUT,
+  WS_CLOSE_SESSION_ENDED,
   WS_CLOSE_SHUTDOWN,
   type WsHub,
 } from "../src/services/ws-hub.js";
@@ -48,12 +51,17 @@ type EventFrame = { seq: number; type: string; payload: unknown };
 const MAX_REPLAY = 5;
 const POLL_MS = 20;
 
-function fakeClock(start = new Date()): Clock & { advance(ms: number): void } {
+function fakeClock(
+  start = new Date(),
+): Clock & { advance(ms: number): void; reset(): void } {
   let now = start.getTime();
   return {
     now: () => new Date(now),
     advance(ms) {
       now += ms;
+    },
+    reset() {
+      now = Date.now();
     },
   };
 }
@@ -143,6 +151,8 @@ describe("WS /ws", () => {
 
   beforeEach(async () => {
     await truncateAll();
+    // hub 按注入时钟判 token 到期：每个用例从「现在」起，前面用例拨快的时钟不让新签的 token 显得已过期
+    clock.reset();
     token = tokenFrom(await loginAs(app, "viewer"));
   });
 
@@ -200,6 +210,28 @@ describe("WS /ws", () => {
     ]);
     expect(c.closed?.code).toBe(4401);
     expect(hub.size).toBe(0);
+  });
+
+  it("已建立的连接：logout 之后（会话作废）被 4401 关闭，不再收事件", async () => {
+    const c = await open();
+    expect(
+      (await logout(app, { authorization: `Bearer ${token}` })).statusCode,
+    ).toBe(200);
+    clock.advance(DEFAULT_SESSION_RECHECK_MS);
+    await vi.waitFor(() => expect(c.closed).not.toBeNull());
+    expect(c.closed?.code).toBe(WS_CLOSE_SESSION_ENDED);
+    expect(hub.size).toBe(0);
+  });
+
+  it("已建立的连接：access token 到期即 4401 关闭；到期前照常", async () => {
+    const c = await open();
+    clock.advance(ACCESS_TOKEN_TTL_SECONDS * 1000 - 5_000);
+    await emit("message", { groupId: "g", msgId: "before-expiry" });
+    await vi.waitFor(() => expect(c.events()).toHaveLength(1));
+    expect(c.closed).toBeNull();
+    clock.advance(5_000);
+    await vi.waitFor(() => expect(c.closed).not.toBeNull());
+    expect(c.closed?.code).toBe(WS_CLOSE_SESSION_ENDED);
   });
 
   it("第一帧不是 auth（ping / 非 JSON）：按未认证拒绝并关闭", async () => {

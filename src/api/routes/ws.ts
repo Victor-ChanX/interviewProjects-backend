@@ -3,7 +3,8 @@
 // 协议：连接后第一帧必须是 `{ type: "auth", accessToken, sinceSeq? }`：
 //   通过 → `{ type: "auth", success: true }`，之后收事件帧 `{ seq, type, payload }`（带 sinceSeq 先补发 seq > sinceSeq 的）；
 //   失败 → `{ type: "auth", success: false, code: "UNAUTHORIZED" }` 并关闭（close code 4401）；
-//   认证前 5 秒没收到 auth 帧 → 关闭（hub 按注入时钟在 pump 里判，这里不起定时器）。
+//   认证前 5 秒没收到 auth 帧 → 关闭（hub 按注入时钟在 pump 里判，这里不起定时器）；
+//   认证后 access token 到期、或会话被 logout / refresh 复用作废 → 同样 4401 关闭（hub 在 pump 里判）。
 // 心跳：`{ type: "ping" }` → `{ type: "pong" }`。认证后的未知帧忽略。
 //
 // 为什么没有 preHandler 闸门：WebSocket 的浏览器客户端不能带 Authorization 头，凭证只能放在第一帧里，
@@ -103,6 +104,10 @@ export default async function wsRoutes(
           }
           const { resync } = await opts.hub.authenticate(conn, {
             sinceSeq: frame.data.sinceSeq,
+            session: {
+              id: result.claims.sessionId,
+              expiresAt: new Date(result.claims.exp * 1000),
+            },
           });
           req.log.info(
             {

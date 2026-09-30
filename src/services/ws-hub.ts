@@ -12,6 +12,9 @@
 //
 // 轮询的定时器不在这里（service 不起定时器）：src/workers/ws-broadcast-worker.ts 每 pollIntervalMs 调一次 pump()。
 // 认证超时同理按注入时钟算：attach 时记 connectedAt，pump 里把超过 authTimeoutMs 仍未认证的连接关掉。
+// 认证不是一次性的（题目 B3：logout 后同一 access token 立即失效）：认证时记下会话 id 与 token 到期时刻，pump 里
+// token 一到期就关；每 sessionRecheckMs 按会话 id 批量查一次库，作废的（logout / refresh 复用）也关。都用 4401 ——
+// 客户端据此走 refresh，拿新 token 带 sinceSeq 重连，期间的事件照常补发。
 //
 // 帧（服务端 → 客户端）：
 //   { type: "auth", success: true }                        认证通过（authenticate 里发，保证在任何事件帧之前）
@@ -20,6 +23,7 @@
 import { type Clock, systemClock } from "../core/clock.js";
 import { logger, type Logger } from "../core/logger.js";
 import { getDb } from "../db/client.js";
+import { inactiveSessionIds } from "./auth-service.js";
 import { assignWsSeqs } from "./ws-events.js";
 
 /** hub 对连接的最小要求（@fastify/websocket 给的 ws.WebSocket 满足它；service 不 import ws / fastify） */
@@ -35,6 +39,8 @@ export type WsConnection = {
   authenticated: boolean;
   /** 已推到的 seq：只推大于它的行。未认证时无意义 */
   lastSentSeq: number;
+  /** 认证用的会话 id 与 access token 到期时刻；未认证时为 null */
+  session: { id: string; expiresAt: Date } | null;
 };
 
 export type WsHubDeps = {
@@ -46,6 +52,8 @@ export type WsHubDeps = {
   maxReplay?: number;
   /** 一次 pump 最多取多少行（落后的连接分几次追上） */
   batchSize?: number;
+  /** 多久按会话 id 复核一次已认证连接（logout / 作废后多久断开） */
+  sessionRecheckMs?: number;
 };
 
 export type PumpResult = {
@@ -53,6 +61,8 @@ export type PumpResult = {
   delivered: number;
   /** 本次因认证超时关掉的连接数 */
   authTimedOut: number;
+  /** 本次因 token 到期或会话作废关掉的连接数 */
+  sessionEnded: number;
 };
 
 export type WsHub = {
@@ -64,7 +74,10 @@ export type WsHub = {
    */
   authenticate(
     conn: WsConnection,
-    opts?: { sinceSeq?: number },
+    opts: {
+      sinceSeq?: number;
+      session: { id: string; expiresAt: Date };
+    },
   ): Promise<{ resync: { sinceSeq: number; fromSeq: number } | null }>;
   /** 连接关闭 / 出错：从集合移除（幂等） */
   detach(conn: WsConnection): void;
@@ -79,9 +92,12 @@ export type WsHub = {
 export const DEFAULT_AUTH_TIMEOUT_MS = 5_000;
 export const DEFAULT_MAX_REPLAY = 1_000;
 export const DEFAULT_BATCH_SIZE = 500;
+export const DEFAULT_SESSION_RECHECK_MS = 2_000;
 
 /** 客户端要求服务端关闭时用的应用级 close code（4000–4999 归应用定义） */
 export const WS_CLOSE_AUTH_TIMEOUT = 4401;
+/** token 到期 / 会话作废：同一个 4401，客户端统一走 refresh 后重连 */
+export const WS_CLOSE_SESSION_ENDED = 4401;
 export const WS_CLOSE_SHUTDOWN = 1001;
 
 async function maxSeq(): Promise<number> {
@@ -95,6 +111,9 @@ export function createWsHub(deps: WsHubDeps = {}): WsHub {
   const authTimeoutMs = deps.authTimeoutMs ?? DEFAULT_AUTH_TIMEOUT_MS;
   const maxReplay = deps.maxReplay ?? DEFAULT_MAX_REPLAY;
   const batchSize = deps.batchSize ?? DEFAULT_BATCH_SIZE;
+  const sessionRecheckMs = deps.sessionRecheckMs ?? DEFAULT_SESSION_RECHECK_MS;
+  /** 上一次按会话 id 复核的时刻（注入时钟）；null = 还没复核过 */
+  let lastSessionCheck: number | null = null;
 
   const conns = new Set<WsConnection>();
   /** hub 自己的水位：没有连接时也推进，避免第一个连接进来时把历史全推一遍。null = 还没初始化 */
@@ -144,12 +163,13 @@ export function createWsHub(deps: WsHubDeps = {}): WsHub {
         connectedAt: clock.now(),
         authenticated: false,
         lastSentSeq: 0,
+        session: null,
       };
       conns.add(conn);
       return conn;
     },
 
-    async authenticate(conn, opts = {}) {
+    async authenticate(conn, opts) {
       // 认证时刻的 max(seq)：没带 sinceSeq 的连接从「现在」起推，之前的事件不推（客户端先走 REST 拉现状）。
       // hub 水位也对齐到它：表是真相，表里的 max 比内存水位小只可能是表被清过（测试的 truncate），跟着表走。
       const max = await maxSeq();
@@ -178,6 +198,7 @@ export function createWsHub(deps: WsHubDeps = {}): WsHub {
       if (resync) {
         safeSend(conn, JSON.stringify({ type: "resync", ...resync }));
       }
+      conn.session = opts.session;
       conn.authenticated = true;
       return { resync };
     },
@@ -187,7 +208,11 @@ export function createWsHub(deps: WsHubDeps = {}): WsHub {
     async pump() {
       await assignWsSeqs(getDb());
       const base = await ensureWatermark();
-      const result: PumpResult = { delivered: 0, authTimedOut: 0 };
+      const result: PumpResult = {
+        delivered: 0,
+        authTimedOut: 0,
+        sessionEnded: 0,
+      };
 
       // 认证超时：按注入时钟算，不起定时器
       const now = clock.now().getTime();
@@ -198,6 +223,31 @@ export function createWsHub(deps: WsHubDeps = {}): WsHub {
         ) {
           safeClose(conn, WS_CLOSE_AUTH_TIMEOUT, "auth timeout");
           result.authTimedOut += 1;
+        }
+      }
+
+      // 已认证的连接：token 到期立刻关；会话作废按间隔批量复核
+      const endSession = (conn: WsConnection, reason: string): void => {
+        safeClose(conn, WS_CLOSE_SESSION_ENDED, reason);
+        result.sessionEnded += 1;
+      };
+      for (const conn of [...conns]) {
+        if (conn.session && now >= conn.session.expiresAt.getTime()) {
+          endSession(conn, "token expired");
+        }
+      }
+      if (
+        lastSessionCheck === null ||
+        now - lastSessionCheck >= sessionRecheckMs
+      ) {
+        lastSessionCheck = now;
+        const withSession = [...conns].filter((c) => c.session !== null);
+        const ids = [...new Set(withSession.map((c) => c.session?.id ?? ""))];
+        const inactive = await inactiveSessionIds(ids);
+        for (const conn of withSession) {
+          if (conns.has(conn) && inactive.has(conn.session?.id ?? "")) {
+            endSession(conn, "session revoked");
+          }
         }
       }
 
