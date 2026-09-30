@@ -78,7 +78,7 @@ npm run dev                     # 后端照常；控制台的模型设置经后�
 | `LLM_AGENT_PORT` | 8300 | 监听端口 |
 
 `AGENT_URL` 仍指向 Agent 模拟器时，控制台的模型设置显示「不支持」（`supported: false`），其余功能照常。
-审计请求恒带 `response_format: {"type":"json_object"}`；个别服务商不支持时，「测试连接」会把失败原因报出来。
+审计请求先带 `response_format: {"type":"json_object"}`；服务商拒绝这个参数时自动去掉它重试一次，并从回复正文里取出 JSON 结论，所以不支持 JSON 模式的服务商也能用。
 
 **服务商示例**（2026-09-30 按官方文档核实；模型名会更新，以控制台「获取模型列表」和出处为准）。本服务不回传
 `reasoning_content`，所以对能关思考的服务商自动关掉（`src/llm-agent/providers.ts`），关不掉又要求回传的模型不能用。
@@ -87,7 +87,7 @@ npm run dev                     # 后端照常；控制台的模型设置经后�
 | --- | --- | --- | --- | --- |
 | DeepSeek | `https://api.deepseek.com` | `deepseek-flash`、`deepseek-v4-pro` | 思考默认开启，本服务自动关；带 tools 时不回传 `reasoning_content` 会 400 | [models](https://api-docs.deepseek.com/quick_start/pricing)、[thinking](https://api-docs.deepseek.com/guides/thinking_mode) |
 | Kimi（Moonshot） | `https://api.moonshot.ai/v1` | `kimi-k2.6` | 只有 `kimi-k2.6` 能关思考（本服务自动关）；`kimi-k3`、`kimi-k2.7-code` 始终思考且要求回传思考内容，不能用 | [thinking](https://platform.kimi.ai/docs/guide/use-thinking-models)、[API](https://platform.kimi.ai/docs/api/chat) |
-| 小米 MiMo | `https://api.xiaomimimo.com/v1` | `mimo-v2.6-flash`、`mimo-v2.6-pro` | 思考默认开启，本服务自动关；`tool_choice` 只认 `auto`（本服务就发 `auto`）；JSON 模式未能从文档确认，以「测试连接」为准 | [OpenAI API](https://mimo.mi.com/docs/en-US/api/chat/openai-api) |
+| 小米 MiMo | `https://api.xiaomimimo.com/v1` | `mimo-v2.6-flash`、`mimo-v2.6-pro` | 思考默认开启，本服务自动关；`tool_choice` 只认 `auto`（本服务就发 `auto`）；JSON 模式未能从文档确认，不支持时审计自动改用普通请求 | [OpenAI API](https://mimo.mi.com/docs/en-US/api/chat/openai-api) |
 | Google Gemini | `https://generativelanguage.googleapis.com/v1beta/openai/` | 见服务商文档（示例用 `gemini-3.8-flash`） | 文档写明 2.5 Pro 与 3 系列不能关思考；3 系列在兼容端点上的 thought signature 回传规则未核实，多轮工具调用以「测试连接」为准 | [OpenAI compatibility](https://ai.google.dev/gemini-api/docs/openai) |
 
 **超时关系**：后端每轮等 `/agent/turn` 的时间是 `AGENT_TURN_TIMEOUT_MS`（默认 12000，题目允许 10–15 秒），等

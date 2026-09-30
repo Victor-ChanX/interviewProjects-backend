@@ -16,7 +16,7 @@
 | `translate.ts` | 纯函数：请求校验、Anthropic ↔ OpenAI 两个方向的转换、审计输出解析 |
 | `providers.ts` | 服务商差异：按主机名 + 模型名给请求体加参数（关思考），附官方文档出处 |
 | `prompts.ts` | 中文系统提示词（turn / audit 各一份） |
-| `audit.ts` | `/agent/audit`：审核提示词 + `response_format: json_object` → `{ verdict, reason }` |
+| `audit.ts` | `/agent/audit`：审核提示词 + `response_format: json_object`（被拒则去掉重试一次）→ `{ verdict, reason }` |
 
 地位与 `src/sim/*` 相同：不 import `src/db`、`src/services`，只用 `src/core` 的 config / logger / clock。
 不存会话状态 —— 后端每轮都传完整历史，`runId` 只进日志。
@@ -40,7 +40,7 @@
 - **立即生效**：`/agent/turn`、`/agent/audit` 每次请求都重新读配置文件，保存后不用重启；重启后照样读回。
 - **未配置**：`/agent/turn`、`/agent/audit` 回 503 `LLM_NOT_CONFIGURED`（「请先在控制台『模型设置』里配置」）；
   后端分别记为协议错误 / 审计拿不到结论，这是 2.2 的既有语义。
-- 为什么「测试连接」要带工具历史：真实的第二轮就是这个形状，要求回传思考内容、或不支持 `json_object` 的
+- 为什么「测试连接」要带工具历史：真实的第二轮就是这个形状，要求回传思考内容的
   服务商会在这里直接报出来，而不是等到 agent run 里连续协议错误。
 
 ## 协议转换

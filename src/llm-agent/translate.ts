@@ -385,20 +385,35 @@ export function auditUserMessage(text: string, groupId: string): string {
  * 对**模型**宽容一点：剥掉一层 markdown 代码围栏再 JSON.parse（没开 JSON 模式的服务商常这样包）。
  * 对**后端**严格：本服务自己的响应永远是合法 JSON。
  */
+/**
+ * 从模型正文里取出一个 JSON 对象：整段就是 JSON / 包在 ``` 围栏里 / 前后夹着说明文字（没开 JSON 模式时常见）
+ * 三种都认；都不是返回 null。只取第一个 `{` 到最后一个 `}` 之间的片段，不做更激进的修复。
+ */
+function parseJsonObjectLoosely(content: string): unknown {
+  const trimmed = content.trim();
+  const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/i.exec(trimmed);
+  const candidates = [fenced?.[1] ?? trimmed];
+  const start = trimmed.indexOf("{");
+  const end = trimmed.lastIndexOf("}");
+  if (start !== -1 && end > start)
+    candidates.push(trimmed.slice(start, end + 1));
+  for (const text of candidates) {
+    try {
+      return JSON.parse(text) as unknown;
+    } catch {
+      // 试下一个候选
+    }
+  }
+  return null;
+}
+
 export function parseAuditVerdict(completion: unknown): AuditVerdict | null {
   if (!isRecord(completion) || !Array.isArray(completion.choices)) return null;
   const choice: unknown = completion.choices[0];
   if (!isRecord(choice) || !isRecord(choice.message)) return null;
   const content = choice.message.content;
   if (typeof content !== "string") return null;
-  const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/i.exec(content.trim());
-  const jsonText = fenced?.[1] ?? content.trim();
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(jsonText);
-  } catch {
-    return null;
-  }
+  const parsed = parseJsonObjectLoosely(content);
   if (!isRecord(parsed)) return null;
   const { verdict, reason } = parsed;
   if (verdict !== "pass" && verdict !== "fail") return null;

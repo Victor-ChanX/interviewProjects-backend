@@ -636,6 +636,46 @@ describe("llm-agent（C2 / #19）", () => {
       });
     });
 
+    it("前后夹着说明文字（没开 JSON 模式时常见）→ 取出其中的 JSON 对象照常解析", async () => {
+      fake.auditScript.push(
+        say('判定如下：{"verdict":"fail","reason":"含广告链接"}，请知悉。'),
+      );
+      expect((await audit("hi")).json()).toEqual({
+        verdict: "fail",
+        reason: "含广告链接",
+      });
+    });
+
+    it("服务商拒绝 JSON 模式（400）→ 去掉 response_format 重试一次，拿到结论", async () => {
+      fake.auditScript.push({
+        status: 400,
+        body: { error: { message: "response_format is not supported" } },
+      });
+      fake.auditScript.push(say('{"verdict":"pass","reason":"正常内容"}'));
+      const res = await audit("hi");
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({ verdict: "pass", reason: "正常内容" });
+      expect(fake.received).toHaveLength(2);
+      expect(fake.received[0]?.body.response_format).toEqual({
+        type: "json_object",
+      });
+      expect(fake.received[1]?.body).not.toHaveProperty("response_format");
+    });
+
+    it("限流 / 故障（429、5xx）不触发去掉 JSON 模式的重试", async () => {
+      for (let i = 0; i < 3; i += 1)
+        fake.auditScript.push({ status: 429, body: {} });
+      const res = await audit("hi");
+      expect(res.statusCode).toBe(500);
+      expect(
+        fake.received.every(
+          (r) =>
+            (r.body.response_format as { type?: string } | undefined)?.type ===
+            "json_object",
+        ),
+      ).toBe(true);
+    });
+
     it("模型输出不是 JSON / verdict 是别的值 → 500 AUDIT_UNAVAILABLE（后端重试后 blocked）", async () => {
       fake.auditScript.push(say("我觉得可以"));
       const notJson = await audit("hi");
