@@ -25,7 +25,7 @@ LLM_AGENT_ADMIN_TOKEN=<任意随机串>        # 只有接真实模型时需要
 # 后端仓
 npm run sim:gateway                                   # 网关模拟器 :8100
 npm run sim:agent                                     # Agent 模拟器 :8200
-set -a; . ./.env; set +a; npm run dev                 # 后端 :8000（启动时自动迁移 + 种子）
+npm run dev                                           # 后端 :8000（读 .env；启动时自动迁移 + 种子）
 
 # 前端仓
 VITE_API_PROXY=http://localhost:8000 npm run dev      # 控制台 http://localhost:5173

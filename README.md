@@ -1,28 +1,73 @@
 # 多账号群组消息平台 · 后端
 
-Node 22 + TypeScript + Fastify + Prisma + PostgreSQL。控制台在
+Node 22 + TypeScript + Fastify + Prisma + PostgreSQL。控制台（React）在
 [interviewProjects-frontend](https://github.com/Victor-ChanX/interviewProjects-frontend)。
-规划、数据模型与任务拆分见 [docs/plan.md](docs/plan.md)；题目要求的两个外部服务（消息网关、Agent 服务）
-由本仓的模拟器提供，行为可按场景脚本化。
+题目要求的两个外部服务（消息网关、Agent 服务）由本仓的模拟器提供，行为可按场景脚本化；另有一个接真实 Claude / Gemini 的
+Agent 服务（题目 C2）。规划、数据模型与任务拆分见 [docs/plan.md](docs/plan.md)。
 
-## 运行
+## 本地跑起来
 
-前提：Node ≥ 22.18、PostgreSQL 14+（本机能 `CREATE DATABASE`，迁移漂移检查会临时建库）。
+前提：**Node ≥ 22.18**、**PostgreSQL 14+**（连接用的角色要能 `CREATE DATABASE`：测试与迁移漂移检查会临时建 schema / 库）。
+想用控制台的话，把前端仓与本仓并排 clone（`../interviewProjects-frontend`）。
 
 ```bash
-cp .env.example .env            # 填 DATABASE_URL（连接串要带用户名）、JWT_SECRET、GATEWAY_URL、AGENT_URL
-npm install                     # postinstall 生成 Prisma client（src/db/generated/，不进 git）
+# 1. 建库、配环境变量
+createdb group_message_platform
+cp .env.example .env            # 改 DATABASE_URL（连接串要带用户名）与 JWT_SECRET（≥ 32 字符，openssl rand -hex 32）
 
-# 三个进程各开一个终端
-npm run sim:gateway             # 消息网关模拟器  http://localhost:8100（SIM_GATEWAY_PORT）
-npm run sim:agent               # Agent 服务模拟器 http://localhost:8200（SIM_AGENT_PORT）
-npm run dev                     # 后端 http://localhost:8000：启动时前滚迁移 → 校验 schema → 幂等种子 → 起 worker → listen
+# 2. 装依赖（postinstall 会生成 Prisma client 到 src/db/generated/，不进 git）
+npm install
+
+# 3. 三个进程各开一个终端
+npm run sim:gateway             # 消息网关模拟器  http://localhost:8100
+npm run sim:agent               # Agent 服务模拟器 http://localhost:8200
+npm run dev                     # 后端 http://localhost:8000（读 .env；启动时前滚迁移 → 校验 schema → 幂等种子 → 起 worker → listen）
+
+# 4. 验证
+curl -s localhost:8000/api/health  # {"ok":true,"schemaVersion":"…"}
 ```
 
 启动即预置：账号 `acc-1` … `acc-5`（`idle`）、用户 `admin/admin`（全部权限）、`viewer/viewer`（只读）。
-健康：`GET /api/health` → `{ ok, schemaVersion }`。
+接口契约：`.ai/openapi.json`（OpenAPI 3，`npm run openapi` 从路由的 zod schema 导出，前端仓的类型由它生成）。
 
-部署到服务器（Docker Compose / Dokploy）见 [docs/deploy.md](docs/deploy.md)。
+**控制台**：在前端仓 `cp .env.example .env && npm install && npm run dev`，打开 http://localhost:5173 用 `admin / admin` 登录
+（详见前端仓 README）。群详情右上角的「模拟外部发言」能以外部成员身份往群里推消息、触发 Agent（`.env.example` 里
+`SIM_CONTROLS_ENABLED=1` 已打开，见下文「演示：模拟外部成员发言」）。
+
+**重启了网关模拟器，就要连库一起重置**：模拟器的事件编号在内存里从 1 重新开始，而后端把见过的编号记在库里，
+新事件会被当成重复推送丢掉。做法见 [docs/manual-testing.md](docs/manual-testing.md)「0.2 每轮测试前重置」。
+
+### 环境变量
+
+`.env.example` 是本地开发的完整模板；`src/core/config.ts` 是唯一读取处，启动时一次性校验，缺必填项直接启动失败。
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `DATABASE_URL` | 必填 | PostgreSQL 连接串（带用户名） |
+| `JWT_SECRET` | 必填 | access token（HS256）签名密钥，≥ 32 字符 |
+| `PORT` | 3000 | 后端监听端口（`.env.example` 与部署都用 8000） |
+| `GATEWAY_URL` | 必填 | 消息网关地址；本地是模拟器 `http://localhost:8100` |
+| `AGENT_URL` | 必填 | Agent 服务地址：模拟器 `http://localhost:8200`，或真实 LLM 版 `http://localhost:8300` |
+| `SIM_CONTROLS_ENABLED` | 0 | 1 = 控制台可「模拟外部发言」（经网关模拟器 `/_sim/push`）；只在网关是模拟器时打开 |
+| `COOKIE_SECURE` | 生产 1、其余 0 | refresh cookie 是否带 `Secure`；站点只有 http 时设 0 |
+| `AGENT_TURN_TIMEOUT_MS` | 12000 | 每轮等 `/agent/turn` 的时间，只能在 10000–15000（题目 A5） |
+| `AGENT_AUDIT_TIMEOUT_MS` | 5000 | 等 `/agent/audit` 的时间 |
+| `MEDIA_DIR` / `MEDIA_RETENTION_DAYS` | `media` / 30 | 媒体文件（题目 C1）的存放目录与保留天数 |
+| `LLM_AGENT_ADMIN_TOKEN` 等 | — | 真实 LLM 版 Agent 的配置，见下文「接入真实 LLM」 |
+| `SIM_GATEWAY_PORT` / `SIM_AGENT_PORT` | 8100 / 8200 | 两个模拟器的端口 |
+
+### 常见问题
+
+- **启动报「数据库 schema 落后于代码 / 比代码新」**：启动门禁发现库的迁移记录与本地 `prisma/migrations/` 对不上。
+  落后：`npm run db:deploy` 或直接重启（启动时会自动前滚）；比代码新：代码版本比库旧（切回了旧分支 / 回滚部署），换回新代码或重建库。
+- **控制台里外部消息不出现、Agent 不触发**：多半是只重启了网关模拟器没重置库，见上面「重启了网关模拟器」。
+- **`npm test` 报没有 DATABASE_URL**：测试不读 .env，见下文「测试」。
+
+## 部署（Docker Compose / Dokploy）
+
+`docker-compose.yml` 一次起后端、两个模拟器与真实 LLM 版 Agent；数据库用单独的 PostgreSQL（Dokploy 里单独建一个 Database 服务），
+`DATABASE_URL` 填它的内网连接串。前端是另一个独立部署的 nginx 镜像。步骤、环境变量、重置数据与用完后彻底清理见
+[docs/deploy.md](docs/deploy.md)；变量模板是 [.env.deploy.example](.env.deploy.example)。
 
 ## 一分钟走一遍
 
@@ -45,6 +90,20 @@ curl -s "localhost:8000/api/groups/<id>/messages?limit=50" -H "$H"         # que
 WebSocket：`ws://localhost:8000/ws`，第一帧 `{ "type": "auth", "accessToken": "…", "sinceSeq"?: n }`，
 之后收 `{ seq, type, payload }`（`account_status_changed` / `account_terminal` / `inconsistency` / `message` /
 `agent_run` / `sequence_run` …）。
+
+## 演示：模拟外部成员发言
+
+题目里「外部用户在群里发言」发生在网关那一侧；本地与演示环境的网关都是模拟器，用它的 `/_sim/push` 推。
+`SIM_CONTROLS_ENABLED=1` 时后端代为调用（仅 admin），控制台群详情右上角的「模拟外部发言」就是它：
+
+```bash
+curl -s localhost:8000/api/sim-controls -H "$H"                              # { "enabled": true }
+curl -s localhost:8000/api/groups/<id>/simulate-inbound -H "$H" -H 'content-type: application/json' \
+  -d '{"senderPlatformUserId":"ext-alice","text":"请问活动几点开始？"}'        # 202；消息经事件流进入时间线
+```
+
+群开着 `agentEnabled` 时会随之触发一次 agent run。不经后端、直接打模拟器也行：
+`curl -s -X POST localhost:8100/_sim/push -H 'content-type: application/json' -d '{"kind":"message","groupId":"<网关群 ID>","senderPlatformUserId":"ext-alice","text":"hi"}'`。
 
 ## 复现题目 2.4 的典型场景
 
@@ -112,9 +171,13 @@ npm run dev                     # 后端照常；控制台的模型设置经后�
 外部服务用本仓模拟器起在随机端口；不 mock 数据库、禁外网。
 
 ```bash
-DATABASE_URL=postgres://<user>@localhost:5432/<db> npm test
-npm run test:coverage
+set -a; . ./.env; set +a        # 测试不读 .env：把 DATABASE_URL 带进环境（或单独设 TEST_DATABASE_URL，优先用它）
+npm test                        # 全量约 2 分钟（2026-09-30 实测）
+npm run test:coverage           # CI 跑这个；行覆盖率地板见 vitest.config.mts
 ```
+
+提交前的本地门禁（`.githooks/pre-commit`，`npm install` 时自动装上）：`tsc`、`eslint`、`prettier`、项目地图、openapi 快照、
+迁移漂移、规范检查；CI 另在干净 Postgres 上跑迁移链、全量测试与构建。
 
 浏览器端到端（Playwright：登录 → 群详情 → agent run 每一步）在前端仓：并排 checkout 两个仓后在前端仓跑它的 e2e 脚本，
 它会自己拉起本仓的两个模拟器与后端，见前端仓 README「端到端」。
