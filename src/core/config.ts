@@ -28,7 +28,29 @@ export type Config = {
   simAgentPort: number;
   /** 消息网关模拟器（src/sim/gateway，`npm run sim:gateway`）的监听端口 */
   simGatewayPort: number;
+  /**
+   * Agent 服务（题目 2.2）的 base url，如 http://localhost:8200（#12）。与 gatewayUrl 同样惰性：
+   * 缺了在第一次调 /agent/turn 时报错；测试把模拟器（src/sim/agent，listen(0)）的地址注入 agent worker。
+   */
+  agentUrl: string | undefined;
+  /** /agent/turn 每轮超时（题目 A5：10–15 秒可配），毫秒，默认 12000 */
+  agentTurnTimeoutMs: number;
+  /** /agent/audit 单次超时（题目没规定；审计最多 3 次、耗时计入 60 秒预算，所以不能太长），毫秒，默认 5000 */
+  agentAuditTimeoutMs: number;
 };
+
+function readMs(
+  raw: string | undefined,
+  name: string,
+  fallback: number,
+): number {
+  if (raw === undefined || raw === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n <= 0) {
+    throw new Error(`${name} 不是合法的毫秒数：${raw}`);
+  }
+  return n;
+}
 
 function readPort(raw: string | undefined, fallback = 3000): number {
   if (raw === undefined || raw === "") return fallback;
@@ -47,4 +69,15 @@ export const config: Readonly<Config> = Object.freeze({
   gatewayUrl: process.env.GATEWAY_URL || undefined,
   jwtSecret: process.env.JWT_SECRET || undefined,
   projectMapBuild: process.env.PROJECT_MAP_BUILD === "1",
+  agentUrl: process.env.AGENT_URL || undefined,
+  agentTurnTimeoutMs: readMs(
+    process.env.AGENT_TURN_TIMEOUT_MS,
+    "AGENT_TURN_TIMEOUT_MS",
+    12_000,
+  ),
+  agentAuditTimeoutMs: readMs(
+    process.env.AGENT_AUDIT_TIMEOUT_MS,
+    "AGENT_AUDIT_TIMEOUT_MS",
+    5_000,
+  ),
 });

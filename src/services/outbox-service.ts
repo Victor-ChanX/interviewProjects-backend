@@ -150,76 +150,9 @@ export async function enqueueMessage(
   input: EnqueueInput,
   deps: OutboxDeps = {},
 ): Promise<EnqueueResult> {
-  const clock = deps.clock ?? systemClock;
-  const result = await getDb().$transaction(async (tx) => {
-    const group = await tx.group.findUnique({ where: { id: input.groupId } });
-    if (!group) {
-      throw new NotFound("GROUP_NOT_FOUND", "群不存在或已被删除", {
-        groupId: input.groupId,
-      });
-    }
-    if (group.status !== "active" || group.gatewayGroupId === null) {
-      throw new Conflict(
-        "GROUP_UNREACHABLE",
-        group.status === "active"
-          ? "群尚未在网关建好，稍后再试"
-          : `群已${group.status === "left" ? "退出" : "不可写"}，不能再发消息`,
-        { groupId: input.groupId, status: group.status },
-      );
-    }
-    const member = await tx.groupMember.findFirst({
-      where: { groupId: input.groupId, accountId: input.accountId },
-      select: { accountId: true },
-    });
-    if (!member) {
-      throw new Conflict(
-        "ACCOUNT_NOT_IN_GROUP",
-        "该账号不是这个群的成员，等它入群后再发",
-        { groupId: input.groupId, accountId: input.accountId },
-      );
-    }
-    const account = await tx.account.findUnique({
-      where: { id: input.accountId },
-    });
-    if (!account) {
-      throw new NotFound(
-        "ACCOUNT_NOT_FOUND",
-        `账号 ${input.accountId} 不存在`,
-        {
-          accountId: input.accountId,
-        },
-      );
-    }
-    if (
-      (account.status !== "online" && account.status !== "rate_limited") ||
-      account.platformUserId === null
-    ) {
-      throw new Conflict(
-        "ACCOUNT_UNAVAILABLE",
-        isTerminal(account.status)
-          ? `账号已${account.status === "suspended" ? "被平台停用" : "会话失效"}，不能发消息`
-          : `账号当前是 ${account.status}，先 connect 再发`,
-        { accountId: input.accountId, status: account.status },
-      );
-    }
-
-    const now = clock.now();
-    const clientMsgId = randomUUID();
-    const row = await tx.message.create({
-      data: {
-        groupId: input.groupId,
-        accountId: account.id,
-        clientMsgId,
-        senderPlatformUserId: account.platformUserId,
-        isOwn: true,
-        text: input.text,
-        sentAt: now,
-        deliveryStatus: "queued",
-      },
-    });
-    await emitMessageEvent(tx, row);
-    return { messageId: row.id, clientMsgId };
-  });
+  const result = await getDb().$transaction((tx) =>
+    enqueueMessageInTx(tx, input, deps),
+  );
 
   deps.log?.info(
     {
@@ -231,6 +164,83 @@ export async function enqueueMessage(
     "出站消息已入队",
   );
   return result;
+}
+
+/**
+ * enqueueMessage 的事务体，给「入队必须与别的写同一事务」的调用方用：agent 的 send_message（#12）要把
+ * agent_idempotency (runId, key → clientMsgId) 与出站行一起提交 —— 分两个事务，进程死在中间就是
+ * 「已入队却没有幂等记录 → 恢复后再入队一次」，正是 A5 第 8 条禁止的重复发送。
+ * 校验与写入同 enqueueMessage；不打日志（commit 由调用方掌握，日志在 commit 之后记）。
+ */
+export async function enqueueMessageInTx(
+  tx: Tx,
+  input: EnqueueInput,
+  deps: OutboxDeps = {},
+): Promise<EnqueueResult> {
+  const clock = deps.clock ?? systemClock;
+  const group = await tx.group.findUnique({ where: { id: input.groupId } });
+  if (!group) {
+    throw new NotFound("GROUP_NOT_FOUND", "群不存在或已被删除", {
+      groupId: input.groupId,
+    });
+  }
+  if (group.status !== "active" || group.gatewayGroupId === null) {
+    throw new Conflict(
+      "GROUP_UNREACHABLE",
+      group.status === "active"
+        ? "群尚未在网关建好，稍后再试"
+        : `群已${group.status === "left" ? "退出" : "不可写"}，不能再发消息`,
+      { groupId: input.groupId, status: group.status },
+    );
+  }
+  const member = await tx.groupMember.findFirst({
+    where: { groupId: input.groupId, accountId: input.accountId },
+    select: { accountId: true },
+  });
+  if (!member) {
+    throw new Conflict(
+      "ACCOUNT_NOT_IN_GROUP",
+      "该账号不是这个群的成员，等它入群后再发",
+      { groupId: input.groupId, accountId: input.accountId },
+    );
+  }
+  const account = await tx.account.findUnique({
+    where: { id: input.accountId },
+  });
+  if (!account) {
+    throw new NotFound("ACCOUNT_NOT_FOUND", `账号 ${input.accountId} 不存在`, {
+      accountId: input.accountId,
+    });
+  }
+  if (
+    (account.status !== "online" && account.status !== "rate_limited") ||
+    account.platformUserId === null
+  ) {
+    throw new Conflict(
+      "ACCOUNT_UNAVAILABLE",
+      isTerminal(account.status)
+        ? `账号已${account.status === "suspended" ? "被平台停用" : "会话失效"}，不能发消息`
+        : `账号当前是 ${account.status}，先 connect 再发`,
+      { accountId: input.accountId, status: account.status },
+    );
+  }
+
+  const now = clock.now();
+  const clientMsgId = randomUUID();
+  const row = await tx.message.create({
+    data: {
+      groupId: input.groupId,
+      accountId: account.id,
+      clientMsgId,
+      senderPlatformUserId: account.platformUserId,
+      isOwn: true,
+      text: input.text,
+      sentAt: now,
+      deliveryStatus: "queued",
+    },
+  });
+  await emitMessageEvent(tx, row);
+  return { messageId: row.id, clientMsgId };
 }
 
 // ---- 领取 ------------------------------------------------------------------------------

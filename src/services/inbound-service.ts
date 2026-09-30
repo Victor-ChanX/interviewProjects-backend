@@ -41,6 +41,7 @@ import type { Logger } from "../core/logger.js";
 import { getDb } from "../db/client.js";
 import { Prisma } from "../db/generated/client.js";
 import { enterTerminal } from "./account-service.js";
+import { onInboundMessage } from "./agent-run-service.js";
 import type { GatewayEvent } from "./gateway-client.js";
 import { emitWsEvent } from "./ws-events.js";
 
@@ -385,6 +386,18 @@ async function handleMessage(
       skipDuplicates: true,
     });
     created = count === 1;
+    if (created) {
+      // agent 触发（#12，A5 第 1 条）：非自己的消息第一次进入时间线 → 同一事务里建 run / 记 pending。
+      // 只在 created 时调：补投 / 重复（S2）不会再触发；isOwn 的消息（S3）根本不走这个分支。
+      const inserted = await tx.message.findUniqueOrThrow({
+        where: { groupId_msgId: { groupId: group.id, msgId: data.msgId } },
+        select: { id: true },
+      });
+      await onInboundMessage(
+        { groupId: group.id, messageId: inserted.id },
+        { tx, clock: ctx.clock, log: ctx.log },
+      );
+    }
   }
 
   // ws 事件只在这条消息**第一次**进入时间线时发：新建行；或回流补进已有的出站行且之前没处理过同 msgId 的
