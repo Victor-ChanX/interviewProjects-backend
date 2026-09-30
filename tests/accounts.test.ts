@@ -87,7 +87,7 @@ async function accountIn(status: AccountStatus, clock: Clock = fakeClock()) {
 async function wsEvents(type?: string) {
   return getDb().wsEvent.findMany({
     where: type ? { type } : {},
-    orderBy: { seq: "asc" },
+    orderBy: { id: "asc" },
   });
 }
 

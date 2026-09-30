@@ -630,10 +630,15 @@ model Session {
 
 // ---- WebSocket 事件日志（A4 / B4）------------------------------------------------
 
-/// 推给前端的每个事件先落库再推：seq 全局单调，重连按 sinceSeq 补发。
+/// 推给前端的每个事件先落库再推：seq 全局单调、连续，重连按 sinceSeq 补发。
 /// type 用 String（account_status_changed / account_terminal / inconsistency / message / agent_run / sequence_run …）。
+/// 两个序号：id 是写入顺序（事务里分配，提交顺序可能与它不同）；seq 是推送顺序，由排号器（src/services/ws-events.ts
+/// 的 assignWsSeqs）在事件**提交之后**补上 —— 读者只看已排号的行，晚提交的小 id 拿到的是更大的 seq，不会被水位跳过。
 model WsEvent {
-  seq       Int      @id @default(autoincrement())
+  /// 写入顺序，只给排号器排序用，不对外
+  id        Int      @id @default(autoincrement())
+  /// 推送顺序；null = 还没排号，不推、不补发、不进动态流
+  seq       Int?     @unique
   type      String
   payload   Json
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz

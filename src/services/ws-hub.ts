@@ -1,7 +1,7 @@
 // WebSocket 推送 hub（issue #9 / #18）：把 ws_events 表的新行推给本进程的已认证连接。
 //
-// 事件源是表，不是进程内队列：ws_events.seq 自增、全局单调，业务在自己的事务里写行（src/services/ws-events.ts），
-// hub 只做「seq > 水位」的轮询 + 广播。多副本各自轮询同一张表，谁写的行大家都推；进程重启，水位从 max(seq)
+// 事件源是表，不是进程内队列：业务在自己的事务里写行（src/services/ws-events.ts），hub 每次轮询先排号
+// （assignWsSeqs：提交之后才给 seq，连续、按可见顺序单调），再做「seq > 水位」的读取 + 广播。多副本各自轮询同一张表，谁写的行大家都推；进程重启，水位从 max(seq)
 // 重新开始，断线期间的事件由客户端带 sinceSeq 重连补发 —— 所以这里的连接集合虽然在内存里，但它不是「跨请求状态」
 // （连接本来就只属于这个进程），真相全在库里。
 //
@@ -20,6 +20,7 @@
 import { type Clock, systemClock } from "../core/clock.js";
 import { logger, type Logger } from "../core/logger.js";
 import { getDb } from "../db/client.js";
+import { assignWsSeqs } from "./ws-events.js";
 
 /** hub 对连接的最小要求（@fastify/websocket 给的 ws.WebSocket 满足它；service 不 import ws / fastify） */
 export type WsSink = {
@@ -184,6 +185,7 @@ export function createWsHub(deps: WsHubDeps = {}): WsHub {
     detach,
 
     async pump() {
+      await assignWsSeqs(getDb());
       const base = await ensureWatermark();
       const result: PumpResult = { delivered: 0, authTimedOut: 0 };
 
@@ -213,14 +215,20 @@ export function createWsHub(deps: WsHubDeps = {}): WsHub {
       });
       if (rows.length === 0) return result;
 
-      const frames = rows.map((row) => ({
-        seq: row.seq,
-        data: JSON.stringify({
-          seq: row.seq,
-          type: row.type,
-          payload: row.payload,
-        }),
-      }));
+      const frames = rows.flatMap((row) =>
+        row.seq === null
+          ? []
+          : [
+              {
+                seq: row.seq,
+                data: JSON.stringify({
+                  seq: row.seq,
+                  type: row.type,
+                  payload: row.payload,
+                }),
+              },
+            ],
+      );
       for (const conn of live) {
         if (!conns.has(conn)) continue;
         for (const frame of frames) {

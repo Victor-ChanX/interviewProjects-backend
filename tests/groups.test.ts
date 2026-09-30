@@ -329,7 +329,7 @@ describe("建群 job（#11）", () => {
       expect(row.finishedAt).not.toBeNull();
       const jobEvents = await getDb().wsEvent.findMany({
         where: { type: "job" },
-        orderBy: { seq: "asc" },
+        orderBy: { id: "asc" },
       });
       expect(jobEvents.at(-1)?.payload).toMatchObject({
         jobId,
@@ -839,7 +839,7 @@ describe("建群 job（#11）", () => {
       });
       const events = await getDb().wsEvent.findMany({
         where: { type: "group_settings_changed" },
-        orderBy: { seq: "asc" },
+        orderBy: { id: "asc" },
       });
       expect(events.map((e) => e.payload)).toEqual([
         { groupId, agentEnabled: true, autoKickEnabled: false },

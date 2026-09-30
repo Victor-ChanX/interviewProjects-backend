@@ -32,7 +32,13 @@ import {
   startWsBroadcastWorker,
   type WsBroadcastWorkerHandle,
 } from "../src/workers/ws-broadcast-worker.js";
-import { authHeaders, loginAs, logout, tokenFrom } from "./factories.js";
+import {
+  authHeaders,
+  loginAs,
+  logout,
+  publishWsEvent,
+  tokenFrom,
+} from "./factories.js";
 import { truncateAll } from "./setup.js";
 
 type Frame = Record<string, unknown>;
@@ -109,7 +115,7 @@ async function connectAuthed(
 }
 
 async function emit(type: WsEventType, payload: Record<string, string>) {
-  return emitWsEvent(getDb(), type, payload);
+  return publishWsEvent(type, payload);
 }
 
 describe("WS /ws", () => {
@@ -256,6 +262,47 @@ describe("WS /ws", () => {
       expect(seqs).toEqual([...seqs].sort((x, y) => x - y));
       expect(new Set(seqs).size).toBe(seqs.length);
     }
+  });
+
+  it("晚提交的事件不被跳过：先写入的 A 晚于 B 提交 → 两条都推到、seq 按提交顺序，重连补发也都在", async () => {
+    const c = await open();
+    const before = c.events().length;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let markWritten!: () => void;
+    const written = new Promise<void>((resolve) => {
+      markWritten = resolve;
+    });
+    // A 先写入（拿到更小的 id）但事务挂着不提交
+    const txA = getDb().$transaction(
+      async (tx) => {
+        await emitWsEvent(tx, "message", { groupId: "g", msgId: "late" });
+        markWritten();
+        await gate;
+      },
+      { timeout: 10_000 },
+    );
+    await written;
+    // B 后写入、先提交，推送先到；此时水位若按写入序号走，就越过了 A
+    await emitWsEvent(getDb(), "message", { groupId: "g", msgId: "early" });
+    await vi.waitFor(() => expect(c.events()).toHaveLength(before + 1));
+    release();
+    await txA;
+    await vi.waitFor(() => expect(c.events()).toHaveLength(before + 2));
+    const got = c.events().slice(before);
+    expect(got.map((e) => (e.payload as { msgId: string }).msgId)).toEqual([
+      "early",
+      "late",
+    ]);
+    expect(got[1]!.seq).toBe(got[0]!.seq + 1);
+
+    // 断线补发同样看得见 A
+    await c.close();
+    const again = await open(got[0]!.seq - 1);
+    await vi.waitFor(() => expect(again.events()).toHaveLength(2));
+    expect(again.events().map((e) => e.seq)).toEqual(got.map((e) => e.seq));
   });
 
   it("没带 sinceSeq 的连接只收认证之后的事件", async () => {

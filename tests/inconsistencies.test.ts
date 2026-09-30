@@ -59,7 +59,7 @@ describe("异常中心 /api/inconsistencies", () => {
   const resolvedEvents = () =>
     getDb().wsEvent.findMany({
       where: { type: "inconsistency_resolved" },
-      orderBy: { seq: "asc" },
+      orderBy: { id: "asc" },
     });
 
   /** 5 条，createdAt = 现在 − i 秒；第 2、4 条（i = 1、3）已处理。返回按插入顺序（即最新在前） */

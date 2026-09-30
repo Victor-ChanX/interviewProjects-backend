@@ -44,7 +44,7 @@ backend/ (Fastify + Prisma + PostgreSQL)
 | `agent_runs` / `agent_steps` / `agent_pending_messages` | run 状态机、每步（含协议错误步、`rawResponse` 2KB 截断）、待处理触发消息 | `unique(groupId) where status = 'running'`；`(runId, idempotencyKey)` |
 | `sequences` / `sequence_runs` / `sequence_run_steps` | 序列定义、运行、步骤（`resolvedVars` / `varSources` / `scheduledAt`） | `unique(groupId) where status = 'running'` |
 | `users` / `sessions` | admin / viewer；refresh token 轮换族（复用旧 token → 整族作废） | `tokenFamily` |
-| `ws_events` | WebSocket 事件日志：全局单调 `seq`，重连按 `sinceSeq` 补发 | `seq` 自增 |
+| `ws_events` | WebSocket 事件日志：全局单调 `seq`，重连按 `sinceSeq` 补发 | `id` 自增（写入序）；`seq` 在提交后由排号器连续分配（推送序） |
 | `inconsistencies` | 写库失败等不一致，供操作员查看 | |
 
 ## 4. 里程碑与拆分

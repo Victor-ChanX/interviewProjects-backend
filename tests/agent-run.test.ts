@@ -339,7 +339,7 @@ describe("agent run（#12 / #13）", () => {
     (
       await getDb().wsEvent.findMany({
         where: { type: "agent_run" },
-        orderBy: { seq: "asc" },
+        orderBy: { id: "asc" },
       })
     ).map((e) => e.payload as Json);
   const parseContent = (s: string | null): Json =>

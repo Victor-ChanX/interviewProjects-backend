@@ -1,8 +1,9 @@
 // 最近动态（#22：GET /api/activity）：ws_events 的只读视图，控制台「实时动态」首屏用它，之后靠 WS 追加
 // （帧同形 { seq, type, payload }，前端按 seq 去重、拼接）。
 //
-// - 按 seq 倒序（seq 全局单调，是事件的真实顺序；createdAt 可能同毫秒）；keyset 游标 = seq，`WHERE seq < 游标`。
-//   翻页途中新写入的事件 seq 更大，只会出现在第一页之前，不挤动后面的页 —— 不重不漏。
+// - 按 seq 倒序（seq 是推送顺序，与 WS 帧同一个号；createdAt 可能同毫秒）；keyset 游标 = seq，`WHERE seq < 游标`。
+//   只列已排号的行（src/services/ws-events.ts 的 assignWsSeqs）：翻页途中新排号的事件 seq 更大，只会出现在第一页之前，
+//   不挤动后面的页 —— 不重不漏。
 // - 只下发白名单类型（src/schemas/activity.ts 的 ActivityEventType）：操作回执类（inconsistency_resolved）不进动态流。
 //   白名单是 WS_EVENT_TYPES 的子集，下面的类型标注让两边对不上时 tsc 红。
 // - payload 原样下发（形状见 src/services/ws-events.ts 各 type 的注释）。
@@ -42,12 +43,16 @@ export async function listActivity(
   const rows = await getDb().wsEvent.findMany({
     where: {
       type: { in: [...types] },
-      ...(beforeSeq !== null ? { seq: { lt: beforeSeq } } : {}),
+      seq: beforeSeq !== null ? { lt: beforeSeq } : { not: null },
     },
     orderBy: { seq: "desc" },
     take: limit + 1,
   });
-  const { page, nextCursor } = sliceCursorPage(rows, limit, (last) =>
+  // where 已排除未排号的行；这里只是把 seq 的类型收窄成 number
+  const published = rows.flatMap((row) =>
+    row.seq === null ? [] : [{ ...row, seq: row.seq }],
+  );
+  const { page, nextCursor } = sliceCursorPage(published, limit, (last) =>
     encodeSeqCursor(last.seq),
   );
   const items: ActivityItem[] = [];

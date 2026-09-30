@@ -21,9 +21,15 @@ import type {
   Message,
   Prisma,
   Session,
+  WsEvent,
 } from "../src/db/generated/client.js";
 import { SEED_USERS } from "../src/db/seed.js";
 import { REFRESH_COOKIE_NAME } from "../src/services/auth-service.js";
+import {
+  assignWsSeqs,
+  emitWsEvent,
+  type WsEventType,
+} from "../src/services/ws-events.js";
 
 
 const LOGIN_PATH = "/api/auth/login";
@@ -283,4 +289,23 @@ export async function makeInconsistency(
       ...overrides,
     },
   });
+}
+
+// ---- ws_events ------------------------------------------------------------------------
+
+/**
+ * 写一条 ws 事件并立刻排号（生产里 ws-hub 每次轮询先调 assignWsSeqs），返回带 seq 的行：
+ * 给要按 seq 断言顺序 / 游标的用例用。
+ */
+export async function publishWsEvent(
+  type: WsEventType,
+  payload: Prisma.InputJsonObject,
+): Promise<WsEvent & { seq: number }> {
+  const row = await emitWsEvent(getDb(), type, payload);
+  await assignWsSeqs(getDb());
+  const published = await getDb().wsEvent.findUniqueOrThrow({
+    where: { id: row.id },
+  });
+  if (published.seq === null) throw new Error(`ws_events ${row.id} 没排上号`);
+  return { ...published, seq: published.seq };
 }

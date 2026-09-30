@@ -1,13 +1,13 @@
 // issue #22：最近动态 GET /api/activity —— ws_events 的只读视图（白名单类型、按 seq 倒序、游标分页）。
-// 真库，事件用 src/services/ws-events.ts 的 emitWsEvent 写（与业务写入方同一个入口）。
+// 真库，事件用 factories 的 publishWsEvent 写（emitWsEvent + 排号，与业务写入方同一个入口）。
 import type { FastifyInstance } from "fastify";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { buildApp } from "../src/app.js";
-import { closeDb, getDb } from "../src/db/client.js";
+import { closeDb } from "../src/db/client.js";
 import type { ActivityPage } from "../src/schemas/activity.js";
-import { emitWsEvent, type WsEventType } from "../src/services/ws-events.js";
-import { loginAs } from "./factories.js";
+import type { WsEventType } from "../src/services/ws-events.js";
+import { loginAs, publishWsEvent } from "./factories.js";
 import { truncateAll } from "./setup.js";
 
 type ErrorBody = { error: { code: string } };
@@ -40,7 +40,7 @@ describe("GET /api/activity", () => {
     });
 
   const emit = async (type: WsEventType, n: number) =>
-    (await emitWsEvent(getDb(), type, { n })).seq;
+    (await publishWsEvent(type, { n })).seq;
 
   it("主流程：只下发白名单类型，按 seq 倒序，payload 原样", async () => {
     const s1 = await emit("account_status_changed", 1);
@@ -48,11 +48,10 @@ describe("GET /api/activity", () => {
     const s3 = await emit("message", 3);
     const s4 = await emit("job", 4);
     await emit("inconsistency_resolved", 5);
-    const s6 = await getDb().wsEvent.create({
-      data: {
-        type: "member_changed",
-        payload: { groupId: "g", platformUserId: "pu", change: "joined" },
-      },
+    const s6 = await publishWsEvent("member_changed", {
+      groupId: "g",
+      platformUserId: "pu",
+      change: "joined",
     });
 
     const res = await list();

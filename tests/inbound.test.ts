@@ -81,7 +81,7 @@ async function waitFor(
 
 const db = () => getDb();
 const wsEvents = (type: string) =>
-  db().wsEvent.findMany({ where: { type }, orderBy: { seq: "asc" } });
+  db().wsEvent.findMany({ where: { type }, orderBy: { id: "asc" } });
 const inconsistencies = (kind?: string) =>
   db().inconsistency.findMany({
     where: kind ? { kind } : {},

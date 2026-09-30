@@ -348,7 +348,7 @@ describe("定时序列（#15）", () => {
     (
       await getDb().wsEvent.findMany({
         where: { type: "sequence_run" },
-        orderBy: { seq: "asc" },
+        orderBy: { id: "asc" },
       })
     ).map((e) => e.payload as Json);
 

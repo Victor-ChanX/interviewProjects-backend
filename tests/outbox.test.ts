@@ -223,7 +223,7 @@ describe("outbox（#7）", () => {
     (
       await getDb().wsEvent.findMany({
         where: { type: "message" },
-        orderBy: { seq: "asc" },
+        orderBy: { id: "asc" },
       })
     ).map((e) => e.payload as Json);
 
@@ -894,7 +894,7 @@ describe("outbox（#7）", () => {
       expect(stopped.finishedAt?.getTime()).toBe(clock.now().getTime());
       expect((await account(creator.id)).status).toBe("online");
 
-      const events = await db.wsEvent.findMany({ orderBy: { seq: "asc" } });
+      const events = await db.wsEvent.findMany({ orderBy: { id: "asc" } });
       expect(
         events.filter((e) => e.type === "sequence_run").map((e) => e.payload),
       ).toEqual([

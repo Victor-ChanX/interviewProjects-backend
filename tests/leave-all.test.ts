@@ -346,7 +346,7 @@ describe("leave-all job（#16）", () => {
       });
       const jobEvents = await getDb().wsEvent.findMany({
         where: { type: "job", payload: { path: ["jobId"], equals: jobId } },
-        orderBy: { seq: "asc" },
+        orderBy: { id: "asc" },
       });
       expect(jobEvents.map((e) => (e.payload as Json).step)).toEqual([
         "leave",

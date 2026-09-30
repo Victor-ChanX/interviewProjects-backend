@@ -244,7 +244,7 @@ describe("重启恢复与并发（#10）", () => {
     (
       await getDb().wsEvent.findMany({
         where: { type: "message" },
-        orderBy: { seq: "asc" },
+        orderBy: { id: "asc" },
       })
     )
       .map((e) => e.payload as Json)
@@ -719,7 +719,7 @@ describe("重启恢复与并发（#10）", () => {
       });
       const events = await getDb().wsEvent.findMany({
         where: { type: { in: ["account_terminal", "account_status_changed"] } },
-        orderBy: { seq: "asc" },
+        orderBy: { id: "asc" },
       });
       expect(events.map((e) => [e.type, e.payload])).toEqual([
         [

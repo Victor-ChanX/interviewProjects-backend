@@ -242,7 +242,7 @@ describe("典型场景 S1–S4（#10，出站 tick + 入站 consumeOnce 串联�
     (
       await getDb().wsEvent.findMany({
         where: { type: "message" },
-        orderBy: { seq: "asc" },
+        orderBy: { id: "asc" },
       })
     ).map((e) => e.payload as Json);
 
