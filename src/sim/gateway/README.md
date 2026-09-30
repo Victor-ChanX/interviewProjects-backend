@@ -50,7 +50,7 @@ SSE 帧：`id: <eventId>` / `event: <type>` / `data: <JSON>`，data 里带 `even
 | `GET /_sim/scenario` | 当前场景 |
 | `POST /_sim/scenario <补丁>` | 按节浅合并（`{ send: { responses: [...] } }` 只改这一项；数组整体替换），返回完整场景；非法 → 400 |
 | `POST /_sim/reset` | 清空账号 / 群 / 消息 / 事件 / 定时器，场景恢复默认，掐断所有 SSE，eventId 从 1 重新开始 |
-| `GET /_sim/state` | `accounts` / `groups`（members、pendingJoins、ownerLeft、writeForbidden）/ `invites` / `messages` / `sendCalls`（每次 send 的状态码）/ `promoteCalls`（每次 promote 的状态码与错误码）/ `events { count, lastEventId, byType, items }` / `streams.open` / `pendingTimers` |
+| `GET /_sim/state` | `accounts` / `groups`（members、pendingJoins、ownerLeft、writeForbidden）/ `invites` / `messages` / `sendCalls`（每次 send 的状态码）/ `promoteCalls`（每次 promote 的状态码与错误码）/ `leaveCalls`（每次 leave 的 accountId 与状态码，按调用顺序）/ `events { count, lastEventId, byType, items }` / `streams.open` / `pendingTimers` |
 | `POST /_sim/push` | 手动推事件，返回 `{ eventIds }`：`{ kind: "message", groupId, text, senderPlatformUserId?, sentAt?, media?: { contentType, base64, expiresAfterMs? } }`（外部用户消息，可带 mediaUrl）、`{ kind: "member_joined" \| "member_left", groupId, platformUserId }`（外部用户进出群）、`{ kind: "account_status", accountId, status }`（停用 / 失效：移出所有群 + member_left + account_status）、`{ kind: "redeliver", msgId }`（离线补投：新 eventId、原 msgId / sentAt）、`{ kind: "raw", type, data }` |
 | `POST /_sim/streams/disconnect` | 掐断所有 SSE 连接 |
 | `POST /_sim/invites/expire { inviteLink? }` | 让某条（或全部）邀请链接立刻过期 |
@@ -76,7 +76,7 @@ SSE 帧：`id: <eventId>` / `event: <type>` / `data: <JSON>`，data 里带 `even
 - join 永不到：`{ "join": { "neverJoin": true } }`（A2 的 JOIN_TIMEOUT）。
 - kick 慢 / 超时：`{ "kick": { "responseDelayMs": { "min": 1000, "max": 5000 } } }`；
   `{ "kick": { "timeout": { "removed": true, "convergeAfterMs": 1500 } } }`（504，1.5s 后成员列表变化 + member_left）。
-- leave 没退成：`{ "leave": { "fail": true } }`。
+- leave 没退成：`{ "leave": { "fail": true } }`（全部）或 `{ "leave": { "failAccountIds": ["<accountId>"] } }`（只这些账号 500，其余照常）。
 - 账号停用 / 失效（同步错误形式）：`{ "send": { "responses": [{ "status": 403, "code": "ACCOUNT_SUSPENDED", "pushStatusEvent": false }] } }`、
   `[{ "status": 401 }]`；事件形式：`POST /_sim/push { "kind": "account_status", ... }`。
 - 群不可写：`{ "groups": { "writeForbidden": ["<groupId>"] } }` 或 `send.outcome: "failed:GROUP_WRITE_FORBIDDEN"`（message_failed）。

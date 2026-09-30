@@ -1,5 +1,5 @@
-// 建群 job 的状态机（题目 A3 / B2 / A2 的 NOT_MEMBER_YET 行；issue #11）。leave-all（#16）复用这里的
-// 领取 / 回收 / 推进框架（advanceJob 按 jobs.kind 分派），只需再加一个 kind 的步骤函数。
+// 建群 job（题目 A3 / B2 / A2 的 NOT_MEMBER_YET 行；issue #11）与 leave-all job（题目 B2；issue #16）的状态机。
+// 两种 kind 共用领取 / 回收 / 推进 / 收尾框架（advanceJob 按 jobs.kind 分派），各自一段步骤函数。
 //
 // 一切从一个事实出发：进程随时会死。所以**每一步都落库**（jobs.step + jobs.state 是唯一的进度真相），
 // 顺序永远是 写库（意图）→ commit → 调网关 → 写库（结果）；重启后从 step / state 继续，不从头来：
@@ -32,6 +32,27 @@
 // 领取：`FOR UPDATE SKIP LOCKED` 一条语句（多副本各领各的），标 claimedBy / lockedAt 后 commit，再跑步骤；
 // 跑完释放领取并按 outcome 写 nextRunAt。lockedAt 过旧仍未释放 = 领取者死了，回收步骤放回队列（step / state
 // 都在库里，接手者从该步继续）。定时器只在 worker 里（多久看一次），排期本身是 jobs.nextRunAt。
+//
+// ---- leave_all（题目 B2，#16）：非群主先退、群主最后退 ----
+//
+//   state.memberAccountIds 是建 job 时从成员表快照的非群主服务账号（accountId 非空且 role ≠ creator，按入群顺序），
+//   state.leaves[accountId] ∈ pending | calling | left | failed 记每个账号（含群主）的进度；step 恒为 leave，
+//   API 的 `leave:<accountId>` 取 state.currentAccountId。
+//   每个账号一步：写库（currentAccountId + calling，意图）→ POST leave → 写库（left / failed，结果）。
+//   - 200 → left；成员行**不在这里删**，等入站 worker 的 member_left（网关的真相）—— 但 job 收尾时若事件还没到，
+//     也清一次已退账号的行（与网关最终一致；晚到的 member_left 删 0 行、照常发 ws 事件，幂等）。
+//   - 500（题目：没退成）/ 409 ACCOUNT_OFFLINE / 其他 4xx → job_errors { leave, accountId, code }，**继续下一位**。
+//   - 连不上 / 502 / 503 / 504（结果未知）→ calling 留着、有界退避；重试前先 GET members 对账：网关里已不在 →
+//     视为已退（不重发，「确认对方没收到之前不重发」）；还在 → 再发；退避超限记 GATEWAY_UNAVAILABLE、继续下一位。
+//     进程死在「发出」与「记账」之间也是同一条路（calling 就是那个痕迹）。
+//   非群主全部处理完：有任一 failed → **群主不退**、直接收尾（job failed；失败账号在库与网关里都仍是成员）；
+//   全部 left → 群主同样一步 leave；200 后同一事务里 groups.status = left + 成员表清空（题目：完成后 left、
+//   members = []）+ ws group_status_changed；群主 leave 失败也记 errors、job failed（群状态不变）。
+//   收尾前对账：GET /groups/:id/members（网关视角）与本地 group_members 比对，不一致 → inconsistencies
+//   { kind: leave_all_members_mismatch } + ws inconsistency，**不阻断**收尾（题目：完成后成员表与网关一致 ——
+//   一致靠上面的清理，不一致要看得见）。
+//   前置：群里同一时刻至多一个 running 的 job（部分唯一索引 jobs_one_running_per_group），所以两个 leave-all
+//   不会交错着退同一个账号。
 import { z } from "zod";
 
 import type { Clock } from "../core/clock.js";
@@ -81,6 +102,14 @@ export const JOB_ERROR_CODES = Object.freeze({
   /** 账号在建群途中已没有 platformUserId（被标离线 / 终态） */
   accountNotConnected: "ACCOUNT_NOT_CONNECTED",
   internal: "INTERNAL",
+});
+
+/** leave-all 收尾对账写进 inconsistencies.kind 的取值（#16） */
+export const LEAVE_ALL_INCONSISTENCY_KINDS = Object.freeze({
+  /** 网关成员列表与本地 group_members 不一致（payload 里 gatewayOnly / localOnly 是 platformUserId） */
+  membersMismatch: "leave_all_members_mismatch",
+  /** 收尾时网关不可用，没对成账 */
+  reconcileUnavailable: "leave_all_reconcile_unavailable",
 });
 
 // ---- 类型 ----------------------------------------------------------------------------
@@ -140,9 +169,52 @@ export function initialCreateGroupState(
   };
 }
 
+// ---- leave_all 的 state（#16）--------------------------------------------------------------
+
+/** leave-all 的入参与 create_group 同形（群主 + 非群主服务账号快照），jobs.input 存它。 */
+export type LeaveAllJobInput = CreateGroupJobInput;
+
+const leaveProgressSchema = z.enum(["pending", "calling", "left", "failed"]);
+export type LeaveProgress = z.infer<typeof leaveProgressSchema>;
+
+/** jobs.state 的形状（leave_all）。改这里要考虑存量 running 的 job：只加可选字段 / 带默认值。 */
+const leaveAllStateSchema = z.object({
+  /** 非群主服务账号，按入群顺序（建 job 时快照） */
+  memberAccountIds: z.array(z.string()),
+  /** 当前 leave 步骤的账号；API 层拼 `leave:<accountId>` 用 */
+  currentAccountId: z.string().nullable(),
+  /** 每个账号（含群主）的进度；calling = 已写下意图、还没记到结果 */
+  leaves: z.record(z.string(), leaveProgressSchema),
+  transientFailures: z.number().int(),
+  crashes: z.number().int().default(0),
+});
+export type LeaveAllState = z.output<typeof leaveAllStateSchema>;
+
+export function initialLeaveAllState(input: LeaveAllJobInput): LeaveAllState {
+  return {
+    memberAccountIds: [...input.memberAccountIds],
+    currentAccountId: null,
+    leaves: Object.fromEntries(
+      [...input.memberAccountIds, input.creatorAccountId].map(
+        (id): [string, LeaveProgress] => [id, "pending"],
+      ),
+    ),
+    transientFailures: 0,
+    crashes: 0,
+  };
+}
+
+/** 两种 kind 的 state 联合：领取 / 崩溃 / 收尾这些共用步骤只用到 currentAccountId 与 crashes */
+type JobState = CreateGroupState | LeaveAllState;
+
 export type JobGateway = Pick<
   GatewayClient,
-  "createGroup" | "createInvite" | "joinGroup" | "promote"
+  | "createGroup"
+  | "createInvite"
+  | "joinGroup"
+  | "promote"
+  | "leave"
+  | "listMembers"
 >;
 
 export type JobServiceDeps = {
@@ -281,13 +353,7 @@ async function runStep(job: Job, deps: JobServiceDeps): Promise<StepOutcome> {
     case "create_group":
       return createGroupStep(job, deps);
     case "leave_all":
-      // #16 在这里接：leave 步骤函数。现在还没有实现，按错误收尾而不是永远挂着。
-      return failWithError(job, deps, {
-        step: "leave",
-        accountId: null,
-        code: JOB_ERROR_CODES.internal,
-        message: "leave_all 尚未实现（#16）",
-      });
+      return leaveAllStep(job, deps);
   }
 }
 
@@ -298,11 +364,11 @@ async function onCrash(
 ): Promise<StepOutcome> {
   const message = err instanceof Error ? err.message : String(err);
   deps.log?.error({ err, jobId: job.id, step: job.step }, "job 步骤异常");
-  const state = parseState(job);
+  const state = safeState(job);
   const crashes = state.crashes + 1;
   if (crashes > CRASH_MAX_FAILURES) {
     return failWithError(job, deps, {
-      step: job.step ?? "create",
+      step: job.step ?? (job.kind === "leave_all" ? "leave" : "create"),
       accountId: state.currentAccountId,
       code: JOB_ERROR_CODES.internal,
       message,
@@ -324,10 +390,11 @@ function parseState(job: Job): CreateGroupState {
   return createGroupStateSchema.parse(job.state);
 }
 
-function toJson(state: CreateGroupState): Prisma.InputJsonObject {
+function toJson(state: JobState): Prisma.InputJsonObject {
   return state;
 }
 
+/** create_group 与 leave_all 的入参同形 */
 function parseInput(job: Job): CreateGroupJobInput {
   return z
     .object({
@@ -372,21 +439,29 @@ async function createGroupStep(
   }
 }
 
-type StepCtx = {
+/** 两种 kind 的步骤上下文共有的部分：persist / finish / 网关错误处理只依赖这些 */
+type BaseCtx = {
   job: Job;
   groupId: string;
-  input: CreateGroupJobInput;
-  state: CreateGroupState;
   deps: JobServiceDeps;
 };
 
-/** 写一步的进度（state / step / nextRunAt）；同一事务里可附带别的写。 */
+type StepCtx = BaseCtx & {
+  input: CreateGroupJobInput;
+  state: CreateGroupState;
+};
+
+/**
+ * 写一步的进度（state / step / nextRunAt）；同一事务里可附带别的写。
+ * ws 事件 job 在 step 变化时推；emitStep = true 强制推（leave 的 `leave:<accountId>` 换人时 step 种类不变）。
+ */
 async function persist(
-  ctx: StepCtx,
+  ctx: BaseCtx,
   patch: {
     step?: JobStepKind;
-    state: CreateGroupState;
+    state: JobState;
     lastError?: string | null;
+    emitStep?: boolean;
   },
   also?: (tx: Prisma.TransactionClient) => Promise<void>,
 ): Promise<void> {
@@ -401,13 +476,18 @@ async function persist(
           : {}),
       },
     });
-    if (patch.step !== undefined && patch.step !== ctx.job.step) {
+    const step = patch.step ?? ctx.job.step;
+    if (
+      step !== null &&
+      ((patch.step !== undefined && patch.step !== ctx.job.step) ||
+        patch.emitStep === true)
+    ) {
       await emitWsEvent(tx, "job", {
         jobId: ctx.job.id,
         groupId: ctx.groupId,
         kind: ctx.job.kind,
         status: "running",
-        step: stepString(patch.step, patch.state.currentAccountId),
+        step: stepString(step, patch.state.currentAccountId),
       });
     }
     if (also) await also(tx);
@@ -909,7 +989,9 @@ async function recordPromoteError(
 // ---- 收尾与网关错误 -------------------------------------------------------------------------
 
 /** 终态：有 errors → failed，否则 finished；释放领取、写 finishedAt、推 ws 事件 */
-async function finish(ctx: StepCtx): Promise<StepOutcome> {
+async function finish(
+  ctx: BaseCtx & { state: JobState },
+): Promise<StepOutcome> {
   const { deps } = ctx;
   const now = deps.clock.now();
   const status = await getDb().$transaction(async (tx) => {
@@ -954,21 +1036,23 @@ async function failWithError(
   },
 ): Promise<StepOutcome> {
   await getDb().jobError.create({ data: { jobId: job.id, ...error } });
-  const ctx: StepCtx = {
+  return finish({
     job,
     groupId: job.groupId ?? "",
-    input: { creatorAccountId: "", memberAccountIds: [] },
     state: safeState(job),
     deps,
-  };
-  return finish(ctx);
+  });
 }
 
-function safeState(job: Job): CreateGroupState {
+/** 按 kind 解析 state；解析不了（存量坏数据）退回空的初始 state，让收尾还能写下去 */
+function safeState(job: Job): JobState {
+  const empty = { creatorAccountId: "", memberAccountIds: [] };
+  if (job.kind === "leave_all") {
+    const parsed = leaveAllStateSchema.safeParse(job.state);
+    return parsed.success ? parsed.data : initialLeaveAllState(empty);
+  }
   const parsed = createGroupStateSchema.safeParse(job.state);
-  return parsed.success
-    ? parsed.data
-    : initialCreateGroupState({ creatorAccountId: "", memberAccountIds: [] });
+  return parsed.success ? parsed.data : initialCreateGroupState(empty);
 }
 
 function describe(err: unknown): string {
@@ -1035,7 +1119,7 @@ async function onGatewayError(
   return { kind: "wait", until: new Date(now.getTime() + delay) };
 }
 
-async function requireGatewayGroupId(ctx: StepCtx): Promise<string> {
+async function requireGatewayGroupId(ctx: BaseCtx): Promise<string> {
   const group = await getDb().group.findUniqueOrThrow({
     where: { id: ctx.groupId },
     select: { gatewayGroupId: true },
@@ -1046,4 +1130,348 @@ async function requireGatewayGroupId(ctx: StepCtx): Promise<string> {
     );
   }
   return group.gatewayGroupId;
+}
+
+// ---- leave_all 的步骤（#16，见文件头「leave_all」一节）--------------------------------------
+
+type LeaveCtx = BaseCtx & {
+  input: LeaveAllJobInput;
+  state: LeaveAllState;
+};
+
+/** 每一步重新从 state 决定做什么：非群主按顺序 → 群主 → 收尾。step 恒为 leave，进度全在 state.leaves。 */
+async function leaveAllStep(
+  job: Job,
+  deps: JobServiceDeps,
+): Promise<StepOutcome> {
+  const state = leaveAllStateSchema.parse(job.state);
+  const input = parseInput(job);
+  if (!job.groupId) {
+    return failWithError(job, deps, {
+      step: "leave",
+      accountId: null,
+      code: JOB_ERROR_CODES.internal,
+      message: "job 没有关联的群",
+    });
+  }
+  const ctx: LeaveCtx = { job, groupId: job.groupId, input, state, deps };
+  const next = nextPendingLeave(state);
+  if (next !== null) return leaveOne(ctx, next);
+  const anyFailed = state.memberAccountIds.some(
+    (id) => state.leaves[id] === "failed",
+  );
+  if (!anyFailed) {
+    // 非群主全部退成功，才轮到群主（题目：群主先退的话剩下的账号无法再操作）
+    const creator = state.leaves[input.creatorAccountId] ?? "pending";
+    if (creator === "pending" || creator === "calling") {
+      return leaveOne(ctx, input.creatorAccountId);
+    }
+  }
+  return finishLeaveAll(ctx);
+}
+
+/** 下一个还没处理完的非群主（pending / calling），按快照顺序 */
+function nextPendingLeave(state: LeaveAllState): string | null {
+  for (const id of state.memberAccountIds) {
+    const p = state.leaves[id] ?? "pending";
+    if (p === "pending" || p === "calling") return id;
+  }
+  return null;
+}
+
+/** 网关明确回了结果（含题目的 500「没退成」）还是结果未知（连不上 / 502 / 503 / 504） */
+function isTransientGatewayError(err: unknown): boolean {
+  return (
+    err instanceof GatewayUnreachableError ||
+    (err instanceof GatewayResponseError &&
+      (err.status === 502 || err.status === 503 || err.status === 504))
+  );
+}
+
+/** 一个账号的 leave：写意图（calling）→ POST leave → 写结果。calling 复位时先对账再决定重不重发。 */
+async function leaveOne(
+  ctx: LeaveCtx,
+  accountId: string,
+): Promise<StepOutcome> {
+  const { deps, state } = ctx;
+  const gatewayGroupId = await requireGatewayGroupId(ctx);
+  const progress = state.leaves[accountId] ?? "pending";
+
+  if (progress === "calling") {
+    // 上次发出后没记账（进程死在中间 / 结果未知）：网关成员列表是真相，已不在 → 视为已退、不重发
+    let gone: boolean;
+    try {
+      gone = await hasLeftGateway(ctx, accountId, gatewayGroupId);
+    } catch (err) {
+      return onLeaveTransient(ctx, err, accountId);
+    }
+    if (gone) {
+      deps.log?.info(
+        { jobId: ctx.job.id, groupId: ctx.groupId, accountId },
+        "leave 结果未记账，网关成员列表里已不在：视为已退",
+      );
+      return markLeft(ctx, accountId);
+    }
+  } else {
+    const calling: LeaveAllState = {
+      ...state,
+      currentAccountId: accountId,
+      leaves: { ...state.leaves, [accountId]: "calling" },
+    };
+    await persist(ctx, {
+      step: "leave",
+      state: calling,
+      emitStep: state.currentAccountId !== accountId,
+    });
+    ctx.state = calling;
+  }
+
+  try {
+    await deps.gateway.leave(gatewayGroupId, { accountId });
+  } catch (err) {
+    if (err instanceof GatewayResponseError && !isTransientGatewayError(err)) {
+      // 500（没退成）/ 409 ACCOUNT_OFFLINE / 其他 4xx：明确失败，记 errors，继续下一位
+      return leaveFailed(ctx, accountId, err.code, err.message);
+    }
+    return onLeaveTransient(ctx, err, accountId);
+  }
+  return markLeft(ctx, accountId);
+}
+
+/** 网关成员列表里没有该账号的 platformUserId → true。账号没有 platformUserId（已离线 / 终态）→ false，让重发拿到明确的码。 */
+async function hasLeftGateway(
+  ctx: LeaveCtx,
+  accountId: string,
+  gatewayGroupId: string,
+): Promise<boolean> {
+  const account = await getDb().account.findUnique({
+    where: { id: accountId },
+    select: { platformUserId: true },
+  });
+  if (!account?.platformUserId) return false;
+  const members = await ctx.deps.gateway.listMembers(gatewayGroupId);
+  return !members.some((m) => m.platformUserId === account.platformUserId);
+}
+
+/** 结果未知：有界退避后重试（calling 留着，重试前会对账）；超限记 GATEWAY_UNAVAILABLE、继续下一位 */
+async function onLeaveTransient(
+  ctx: LeaveCtx,
+  err: unknown,
+  accountId: string,
+): Promise<StepOutcome> {
+  const { deps, state } = ctx;
+  const failures = state.transientFailures + 1;
+  if (failures > TRANSIENT_MAX_FAILURES) {
+    return leaveFailed(
+      ctx,
+      accountId,
+      JOB_ERROR_CODES.gatewayUnavailable,
+      `网关连续 ${state.transientFailures} 次不可用：${describe(err)}`,
+    );
+  }
+  const now = deps.clock.now();
+  const delay = Math.min(
+    TRANSIENT_BASE_MS * 2 ** state.transientFailures,
+    TRANSIENT_CAP_MS,
+  );
+  await persist(ctx, {
+    state: { ...state, transientFailures: failures },
+    lastError: describe(err),
+  });
+  deps.log?.warn(
+    { err, jobId: ctx.job.id, accountId, failures, delay },
+    "leave 结果未知，退避后对账再试",
+  );
+  return { kind: "wait", until: new Date(now.getTime() + delay) };
+}
+
+/** 该账号 leave 失败：job_errors { leave, accountId, code }，state 记 failed，继续下一位（群主失败则收尾） */
+async function leaveFailed(
+  ctx: LeaveCtx,
+  accountId: string,
+  code: string,
+  message: string,
+): Promise<StepOutcome> {
+  const { deps, state } = ctx;
+  const failed: LeaveAllState = {
+    ...state,
+    leaves: { ...state.leaves, [accountId]: "failed" },
+    transientFailures: 0,
+  };
+  await persist(ctx, { state: failed }, async (tx) => {
+    await tx.jobError.create({
+      data: { jobId: ctx.job.id, step: "leave", accountId, code, message },
+    });
+  });
+  ctx.state = failed;
+  deps.log?.warn(
+    { jobId: ctx.job.id, groupId: ctx.groupId, accountId, code },
+    "账号 leave 失败",
+  );
+  return { kind: "continue" };
+}
+
+/**
+ * 该账号已退：state 记 left。非群主 → 继续下一位（成员行等 member_left）；群主 → 同一事务里
+ * groups.status = left + 成员表清空 + ws group_status_changed（题目：完成后 left、members = []），再去收尾对账。
+ */
+async function markLeft(
+  ctx: LeaveCtx,
+  accountId: string,
+): Promise<StepOutcome> {
+  const { deps, state } = ctx;
+  const isCreator = accountId === ctx.input.creatorAccountId;
+  const left: LeaveAllState = {
+    ...state,
+    currentAccountId: accountId,
+    leaves: { ...state.leaves, [accountId]: "left" },
+    transientFailures: 0,
+  };
+  await persist(ctx, { state: left }, async (tx) => {
+    if (!isCreator) return;
+    const group = await tx.group.findUniqueOrThrow({
+      where: { id: ctx.groupId },
+      select: { status: true },
+    });
+    if (group.status !== "left") {
+      await tx.group.update({
+        where: { id: ctx.groupId },
+        data: { status: "left" },
+      });
+      await emitWsEvent(tx, "group_status_changed", {
+        groupId: ctx.groupId,
+        from: group.status,
+        to: "left",
+        reason: "leave_all",
+      });
+    }
+    // 成员表由 member_left 事件清；这里也清一次（事件可能晚到），与网关最终一致 —— 见文件头
+    await deleteMemberRows(tx, ctx.groupId, {});
+  });
+  ctx.state = left;
+  deps.log?.info(
+    { jobId: ctx.job.id, groupId: ctx.groupId, accountId, isCreator },
+    isCreator ? "群主已退群，群已 left" : "账号已退群",
+  );
+  return { kind: "continue" };
+}
+
+/** 删成员行并逐行发 member_changed(left)；晚到的 member_left 再删 0 行、再发一次事件（幂等，前端按它刷新） */
+async function deleteMemberRows(
+  tx: Prisma.TransactionClient,
+  groupId: string,
+  where: Prisma.GroupMemberWhereInput,
+): Promise<number> {
+  const rows = await tx.groupMember.findMany({
+    where: { groupId, ...where },
+    select: { platformUserId: true, accountId: true },
+  });
+  if (rows.length === 0) return 0;
+  await tx.groupMember.deleteMany({
+    where: {
+      groupId,
+      platformUserId: { in: rows.map((r) => r.platformUserId) },
+    },
+  });
+  for (const r of rows) {
+    await emitWsEvent(tx, "member_changed", {
+      groupId,
+      platformUserId: r.platformUserId,
+      accountId: r.accountId,
+      change: "left",
+    });
+  }
+  return rows.length;
+}
+
+/**
+ * 收尾：1. 已退账号的本地行若还在（member_left 未到）清掉（失败路径只清 left 的；成功路径 markLeft 已清全部）；
+ * 2. 对账：网关成员列表 vs 本地，不一致写 inconsistencies + ws inconsistency，不阻断；3. 按 errors 定终态。
+ * 全部幂等：进程死在中间重做一遍结果相同（最多多一行不一致记录，可见即可）。
+ */
+async function finishLeaveAll(ctx: LeaveCtx): Promise<StepOutcome> {
+  const leftIds = Object.entries(ctx.state.leaves)
+    .filter(([, p]) => p === "left")
+    .map(([id]) => id);
+  if (leftIds.length > 0) {
+    await getDb().$transaction(async (tx) => {
+      const cleaned = await deleteMemberRows(tx, ctx.groupId, {
+        accountId: { in: leftIds },
+      });
+      if (cleaned > 0) {
+        ctx.deps.log?.info(
+          { jobId: ctx.job.id, groupId: ctx.groupId, cleaned },
+          "已退账号的成员行仍在（member_left 未到），收尾时清理",
+        );
+      }
+    });
+  }
+  await reconcileMembers(ctx);
+  return finish(ctx);
+}
+
+/** 网关视角 vs 本地成员表；差集非空或网关不可用 → 一行 inconsistencies + ws inconsistency（看得见，不阻断） */
+async function reconcileMembers(ctx: LeaveCtx): Promise<void> {
+  const { deps } = ctx;
+  const gatewayGroupId = await requireGatewayGroupId(ctx);
+  let remote: string[];
+  try {
+    remote = (await deps.gateway.listMembers(gatewayGroupId)).map(
+      (m) => m.platformUserId,
+    );
+  } catch (err) {
+    await recordLeaveInconsistency(
+      ctx,
+      LEAVE_ALL_INCONSISTENCY_KINDS.reconcileUnavailable,
+      `leave-all 收尾时网关成员列表不可用，未对账：${describe(err)}`,
+      { gatewayGroupId },
+    );
+    return;
+  }
+  const local = (
+    await getDb().groupMember.findMany({
+      where: { groupId: ctx.groupId },
+      select: { platformUserId: true },
+    })
+  ).map((m) => m.platformUserId);
+  const remoteSet = new Set(remote);
+  const localSet = new Set(local);
+  const gatewayOnly = remote.filter((id) => !localSet.has(id)).sort();
+  const localOnly = local.filter((id) => !remoteSet.has(id)).sort();
+  if (gatewayOnly.length === 0 && localOnly.length === 0) return;
+  await recordLeaveInconsistency(
+    ctx,
+    LEAVE_ALL_INCONSISTENCY_KINDS.membersMismatch,
+    `leave-all 收尾对账：网关多出 ${gatewayOnly.length} 个成员、本地多出 ${localOnly.length} 个成员`,
+    { gatewayGroupId, gatewayOnly, localOnly },
+  );
+}
+
+async function recordLeaveInconsistency(
+  ctx: LeaveCtx,
+  kind: string,
+  message: string,
+  extra: Prisma.InputJsonObject,
+): Promise<void> {
+  const ref = ctx.job.id;
+  await getDb().$transaction(async (tx) => {
+    const row = await tx.inconsistency.create({
+      data: {
+        kind,
+        ref,
+        message,
+        payload: { jobId: ctx.job.id, groupId: ctx.groupId, ...extra },
+      },
+    });
+    await emitWsEvent(tx, "inconsistency", {
+      inconsistencyId: row.id,
+      kind,
+      ref,
+      message,
+    });
+  });
+  ctx.deps.log?.warn(
+    { jobId: ctx.job.id, groupId: ctx.groupId, kind, ...extra },
+    message,
+  );
 }

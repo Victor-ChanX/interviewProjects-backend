@@ -107,8 +107,10 @@ const kickSchema = z.object({
 });
 
 const leaveSchema = z.object({
-  /** true = leave 返回 500（没退成） */
+  /** true = 所有 leave 返回 500（没退成） */
   fail: z.boolean(),
+  /** 只让这些 accountId 的 leave 返回 500（其余照常）；与 fail 任一命中即 500 */
+  failAccountIds: z.array(z.string()),
 });
 
 const sendSchema = z.object({
@@ -166,7 +168,7 @@ export function defaultScenario(): Scenario {
     invite: { readyAfterMs: { min: 0, max: 0 }, expiresAfterMs: null },
     join: { delayMs: { min: 100, max: 1500 }, neverJoin: false },
     kick: { responseDelayMs: { min: 1000, max: 5000 }, timeout: null },
-    leave: { fail: false },
+    leave: { fail: false, failAccountIds: [] },
     send: {
       acceptDelayMs: { min: 0, max: 0 },
       eventDelayMs: { min: 50, max: 2000 },

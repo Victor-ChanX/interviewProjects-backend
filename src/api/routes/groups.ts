@@ -6,6 +6,8 @@
 // src/workers/job-worker.ts 按 src/services/group-job-service.ts 的状态机做，进度在 GET /api/jobs/:jobId。
 // 拒绝：形状错（≥ 1 个成员、不含群主、不重复）400 VALIDATION_ERROR（zod）、账号不 online 422 ACCOUNT_NOT_ONLINE、
 // 群不存在 404 GROUP_NOT_FOUND —— 都由 service throw，信封由 src/app.ts 统一产出。
+// POST /:id/leave-all（#16）同样 202 { jobId }：leave_all job 落库，由同一个 worker 按「非群主先、群主最后」退；
+// 拒绝：404 GROUP_NOT_FOUND / 409 GROUP_ALREADY_LEFT / 409 GROUP_NOT_READY / 409 JOB_ALREADY_RUNNING。
 // 同前缀的 /:id/messages（#9）与 /:id/send（#7）在各自的路由文件里。
 import type { FastifyInstance } from "fastify";
 import type { ZodTypeProvider } from "fastify-type-provider-zod";
@@ -16,10 +18,12 @@ import {
   GroupIdParams,
   GroupList,
   GroupRead,
+  LeaveAllResponse,
   PatchGroupRequest,
 } from "../../schemas/group.js";
 import {
   createGroupJob,
+  createLeaveAllJob,
   getGroup,
   listGroups,
   patchGroup,
@@ -90,5 +94,24 @@ export default async function groupRoutes(app: FastifyInstance): Promise<void> {
       },
     },
     async (req) => patchGroup(req.params.id, req.body, { log: req.log }),
+  );
+
+  r.post(
+    "/:id/leave-all",
+    {
+      preHandler: [requireUser, requireRole("admin")],
+      schema: {
+        summary: "群里所有服务账号退群：非群主先、群主最后（异步 job，202）",
+        tags: ["groups"],
+        params: GroupIdParams,
+        response: { 202: LeaveAllResponse },
+      },
+    },
+    async (req, reply) => {
+      const { jobId } = await createLeaveAllJob(req.params.id, {
+        log: req.log,
+      });
+      return reply.code(202).send({ jobId });
+    },
   );
 }

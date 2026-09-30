@@ -1,15 +1,18 @@
 // issue #11：两个 job worker 实例并发领取不重复（FOR UPDATE SKIP LOCKED），没到点的不领。
+// issue #16：同群并发两次 leave-all 恰好一个成功（部分唯一索引 jobs_one_running_per_group 撞 P2002 → 409）。
 // 多连接真并行：每个 claimJobs 各自一个 $transaction（交互式事务各占一条池连接），Promise.all 同时发出 ——
 // 同一事务里串行是测不出互斥的。
 // 变异自检：把 claimJobs 的 SKIP LOCKED 去掉 —— 第一个用例仍绿（Postgres 在锁等待后重查 claimed_by IS NULL，
 // 不会重复领取，只是串行），第二个用例红：别的事务锁着一行时，领取会等到交互式事务超时而不是跳过它。
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 
+import { Conflict } from "../src/core/errors.js";
 import { closeDb, getDb } from "../src/db/client.js";
 import {
   claimJobs,
   initialCreateGroupState,
 } from "../src/services/group-job-service.js";
+import { createLeaveAllJob } from "../src/services/group-service.js";
 import { makeAccount, makeGroup } from "./factories.js";
 import { truncateAll } from "./setup.js";
 
@@ -101,5 +104,32 @@ describe("job：并发领取", () => {
     );
     const row = await getDb().job.findUniqueOrThrow({ where: { id: locked } });
     expect(row.claimedBy).toBeNull();
+  });
+
+  // ---- #16：同群至多一个 running 的 job（部分唯一索引）。两次调用各自一个 $transaction = 两条连接真并行；
+  // 变异自检：删掉迁移里的 jobs_one_running_per_group → 两个都 fulfilled。
+  it("并发两次 leave-all：恰好一个 202、另一个 409 JOB_ALREADY_RUNNING；结束后可再建", async () => {
+    const group = await makeGroup({ gatewayGroupId: `g-${Date.now()}` });
+    const results = await Promise.allSettled([
+      createLeaveAllJob(group.id),
+      createLeaveAllJob(group.id),
+    ]);
+    const ok = results.filter((r) => r.status === "fulfilled");
+    const bad = results.filter((r) => r.status === "rejected");
+    expect(ok).toHaveLength(1);
+    expect(bad).toHaveLength(1);
+    const err = (bad[0] as PromiseRejectedResult).reason as Conflict;
+    expect(err).toBeInstanceOf(Conflict);
+    expect(err.code).toBe("JOB_ALREADY_RUNNING");
+    expect(await getDb().job.count({ where: { groupId: group.id } })).toBe(1);
+
+    // 第一个结束（failed 也算终态）后索引不再拦
+    await getDb().job.updateMany({
+      where: { groupId: group.id },
+      data: { status: "failed" },
+    });
+    const again = await createLeaveAllJob(group.id);
+    expect(again.groupId).toBe(group.id);
+    expect(await getDb().job.count({ where: { groupId: group.id } })).toBe(2);
   });
 });

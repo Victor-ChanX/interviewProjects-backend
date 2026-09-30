@@ -273,7 +273,30 @@ export async function kick(
   return { kicked: true };
 }
 
+/** leave：每次调用都记账（含被拒绝的）：GET /_sim/state 的 leaveCalls 供测试断言顺序与次数 */
 export function leave(
+  ctx: GatewayContext,
+  groupId: string,
+  accountId: string,
+): Record<string, never> {
+  try {
+    const result = leaveInner(ctx, groupId, accountId);
+    ctx.leaveCalls.push({ groupId, accountId, status: 200, code: null });
+    return result;
+  } catch (err) {
+    if (err instanceof GatewayError) {
+      ctx.leaveCalls.push({
+        groupId,
+        accountId,
+        status: err.statusCode,
+        code: err.code,
+      });
+    }
+    throw err;
+  }
+}
+
+function leaveInner(
   ctx: GatewayContext,
   groupId: string,
   accountId: string,
@@ -287,7 +310,10 @@ export function leave(
       `账号 ${accountId} 不在群 ${groupId} 里`,
     );
   }
-  if (ctx.scenario.leave.fail) {
+  if (
+    ctx.scenario.leave.fail ||
+    ctx.scenario.leave.failAccountIds.includes(accountId)
+  ) {
     throw new GatewayError(500, "INTERNAL", "leave 失败（场景：没退成）");
   }
   group.members.delete(account.platformUserId);

@@ -35,7 +35,7 @@ export type GatewayClient = {
     clientMsgId: string,
   ): Promise<GatewayMessageLanding | null>;
 
-  // ---- 群与成员（题目 2.1「群与成员」；建群 job #11。kick / leave 由 #12 / #16 往下加）----
+  // ---- 群与成员（题目 2.1「群与成员」；建群 job #11、kick #12、leave #16）----
   /** POST /groups { creatorAccountId } → { groupId }：创建者即群主与成员，网关不为它推 member_joined。 */
   createGroup(input: {
     creatorAccountId: string;
@@ -74,6 +74,12 @@ export type GatewayClient = {
     groupId: string,
     input: { byAccountId: string; targetPlatformUserId: string },
   ): Promise<{ kicked: true }>;
+  /**
+   * POST /groups/:groupId/leave { accountId } → 200 {}，随后推 member_left（leave-all job，#16）。
+   * 500（没退成，账号仍是成员）与 409 ACCOUNT_OFFLINE 都按 GatewayResponseError 抛，由 job 记 errors；
+   * 连不上 / 超时是 GatewayUnreachableError（结果未知：job 先看成员列表再决定要不要重发）。
+   */
+  leave(groupId: string, input: { accountId: string }): Promise<void>;
 };
 
 /** 邀请链接：readyAfterMs 是网关说的「多久后才可用」（可能为 0） */
@@ -311,6 +317,13 @@ export function createGatewayClient(
       );
       return { kicked: true };
     },
+    async leave(groupId, input) {
+      await request(
+        "POST",
+        `/groups/${encodeURIComponent(groupId)}/leave`,
+        input,
+      );
+    },
   };
 }
 
@@ -463,5 +476,6 @@ export function gatewayClientFromConfig(): GatewayClient {
     promote: (groupId, input) => resolve().promote(groupId, input),
     listMembers: (groupId) => resolve().listMembers(groupId),
     kick: (groupId, input) => resolve().kick(groupId, input),
+    leave: (groupId, input) => resolve().leave(groupId, input),
   };
 }

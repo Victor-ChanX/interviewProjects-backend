@@ -281,6 +281,8 @@ enum JobStepKind {
   @@map("job_step_kind")
 }
 
+/// 约束见 20260930131540_jobs_one_running_per_group：部分唯一索引 (group_id) WHERE status = 'running'
+/// （同群同一时刻至多一个 running 的 job；#16 leave-all 撞它 → 409 JOB_ALREADY_RUNNING）
 model Job {
   id         String       @id @default(uuid(7))
   kind       JobKind

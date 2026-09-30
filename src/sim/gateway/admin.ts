@@ -113,6 +113,7 @@ export function snapshot(ctx: GatewayContext): Record<string, unknown> {
     messages: ctx.messages,
     sendCalls: ctx.sendCalls,
     promoteCalls: ctx.promoteCalls,
+    leaveCalls: ctx.leaveCalls,
     events: {
       count: ctx.events.length,
       lastEventId: ctx.eventSeq,

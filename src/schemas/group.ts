@@ -100,3 +100,14 @@ export const PatchGroupRequest = z.object({
   autoKickEnabled: z.boolean().optional(),
 });
 export type PatchGroupRequest = z.infer<typeof PatchGroupRequest>;
+
+/**
+ * 题目 2.3 `POST /api/groups/:id/leave-all` → 202 `{ jobId }`（#16）：leave_all job 已落库（running），
+ * 进度在 GET /api/jobs/:jobId（step 形如 `leave:<accountId>`）。
+ */
+export const LeaveAllResponse = z
+  .object({
+    jobId: z.string(),
+  })
+  .meta({ id: "LeaveAllResponse" });
+export type LeaveAllResponse = z.infer<typeof LeaveAllResponse>;

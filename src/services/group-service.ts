@@ -5,7 +5,9 @@
 //    202 只保证「记录已落库」，网关调用全在 src/services/group-job-service.ts 的状态机里由 job worker 做）、
 //    listGroups / getGroup（题目形状，members 从 group_members 读，activeSequenceRunId / activeAgentRunId
 //    查 running 的运行）、patchGroup（开关，同事务写 ws_events group_settings_changed）、getJob（题目形状，
-//    errors[].step 由 (stepKind, accountId) 拼回 `join:<accountId>`）。leave-all（#16）复用同一套 job 表与 worker。
+//    errors[].step 由 (stepKind, accountId) 拼回 `join:<accountId>`）。
+// 3. #16：createLeaveAllJob（POST /api/groups/:id/leave-all：校验 + 落一条 leave_all job，202；退群全在
+//    group-job-service 的状态机里由同一个 job worker 做）。
 //
 // 数据范围：只有 admin / viewer 两种角色，登录用户都可看全部群，没有归属键；群 / job 不存在 → 404。
 //
@@ -20,14 +22,14 @@
 //   计数 agentRunsRunning 返回给调用方（api.side-effect-count）。
 // - 账号状态不变（题目原文）。
 import { type Clock, systemClock } from "../core/clock.js";
-import { Invalid, NotFound } from "../core/errors.js";
+import { Conflict, Invalid, NotFound } from "../core/errors.js";
 import type { Logger } from "../core/logger.js";
 import { getDb } from "../db/client.js";
-import type {
-  Group,
-  GroupMember,
-  JobError,
-  JobStepKind,
+import {
+  type Group,
+  type GroupMember,
+  type JobError,
+  type JobStepKind,
   Prisma,
 } from "../db/generated/client.js";
 import type { GroupRead } from "../schemas/group.js";
@@ -35,6 +37,7 @@ import type { JobRead } from "../schemas/job.js";
 import {
   type CreateGroupJobInput,
   initialCreateGroupState,
+  initialLeaveAllState,
 } from "./group-job-service.js";
 import { emitWsEvent } from "./ws-events.js";
 
@@ -227,6 +230,101 @@ export async function createGroupJob(
     "建群 job 已创建",
   );
   return result;
+}
+
+// ---- leave-all（#16）-----------------------------------------------------------------
+
+export type CreateLeaveAllJobResult = { jobId: string; groupId: string };
+
+/**
+ * POST /api/groups/:id/leave-all（题目 2.3 + B2）：落一条 leave_all job（running、step = leave），返回 jobId；
+ * 退群顺序（非群主先、群主最后）、失败处理、群 → left 与成员清理全在 src/services/group-job-service.ts 的
+ * 状态机里，202 只保证记录已落库。
+ *
+ * 允许的群状态：active 与 unreachable（题目没限制；unreachable 只是「不可写消息」，退群仍有意义 ——
+ * 这正是操作员想把账号从坏群里撤出来的时候）。拒绝：
+ * - 群不存在 → 404 GROUP_NOT_FOUND；
+ * - 已是 left → 409 GROUP_ALREADY_LEFT（成员早已清空，没有可退的；等状态变不了，请求本身没错，所以是 409 不是 422）；
+ * - gatewayGroupId 为空（建群 job 的 create 步还没做完或已失败）→ 409 GROUP_NOT_READY；
+ * - 该群已有 running 的 job（建群还在跑 / 另一个 leave-all 在跑）→ 409 JOB_ALREADY_RUNNING：靠部分唯一索引
+ *   jobs_one_running_per_group 撞 P2002，不靠先查后插（两个请求同时查都查不到）。撞在事务里等于整个事务作废，
+ *   这里正是要作废（不在同一事务里改走别的路，见 background-workers 的已知陷阱）。
+ *
+ * 要退的非群主账号在这里快照进 state / input：成员表里 accountId 非空（服务账号；外部用户没法替他们退）
+ * 且 role ≠ creator，按入群顺序。
+ */
+export async function createLeaveAllJob(
+  groupId: string,
+  deps: GroupServiceDeps = {},
+): Promise<CreateLeaveAllJobResult> {
+  const result = await getDb().$transaction(async (tx) => {
+    const group = await tx.group.findUnique({
+      where: { id: groupId },
+      include: membersInclude(),
+    });
+    if (!group) throw new NotFound("GROUP_NOT_FOUND", "群不存在或已被删除");
+    if (group.status === "left") {
+      throw new Conflict(
+        "GROUP_ALREADY_LEFT",
+        "该群的服务账号已全部退出，不能再退",
+      );
+    }
+    if (group.gatewayGroupId === null) {
+      throw new Conflict(
+        "GROUP_NOT_READY",
+        "该群在网关里还没建成（建群任务未完成或已失败），没有可退的群",
+      );
+    }
+    const input: CreateGroupJobInput = {
+      creatorAccountId: group.creatorAccountId,
+      memberAccountIds: group.members.flatMap((m) =>
+        m.accountId !== null && m.role !== "creator" ? [m.accountId] : [],
+      ),
+    };
+    let job: { id: string };
+    try {
+      job = await tx.job.create({
+        data: {
+          kind: "leave_all",
+          status: "running",
+          groupId: group.id,
+          step: "leave",
+          input,
+          state: initialLeaveAllState(input),
+          nextRunAt: null,
+        },
+        select: { id: true },
+      });
+    } catch (err) {
+      if (
+        err instanceof Prisma.PrismaClientKnownRequestError &&
+        err.code === "P2002"
+      ) {
+        throw new Conflict(
+          "JOB_ALREADY_RUNNING",
+          "该群已有正在执行的任务（建群或退群），等它结束后再试",
+        );
+      }
+      throw err;
+    }
+    await emitWsEvent(tx, "job", {
+      jobId: job.id,
+      groupId: group.id,
+      kind: "leave_all",
+      status: "running",
+      step: "leave",
+    });
+    return {
+      jobId: job.id,
+      groupId: group.id,
+      members: input.memberAccountIds,
+    };
+  });
+  deps.log?.info(
+    { jobId: result.jobId, groupId, memberAccountIds: result.members },
+    "leave-all job 已创建",
+  );
+  return { jobId: result.jobId, groupId: result.groupId };
 }
 
 // ---- 读 --------------------------------------------------------------------------

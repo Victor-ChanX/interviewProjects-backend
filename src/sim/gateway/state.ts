@@ -121,6 +121,14 @@ export interface PromoteCall {
   code: string | null;
 }
 
+/** 每次 leave 的记录（leave-all job 的「非群主先、群主最后、重启不重复」靠它断言） */
+export interface LeaveCall {
+  groupId: string;
+  accountId: string;
+  status: number;
+  code: string | null;
+}
+
 export interface SendCall {
   accountId: string;
   groupId: string;
@@ -168,6 +176,7 @@ export interface GatewayContext {
   messages: StoredMessage[];
   sendCalls: SendCall[];
   promoteCalls: PromoteCall[];
+  leaveCalls: LeaveCall[];
   media: Map<string, Media>;
   events: GatewayEvent[];
   eventSeq: number;
@@ -191,6 +200,7 @@ export function createContext(opts: {
     messages: [],
     sendCalls: [],
     promoteCalls: [],
+    leaveCalls: [],
     media: new Map(),
     events: [],
     eventSeq: 0,
@@ -208,6 +218,7 @@ export function resetContext(ctx: GatewayContext): void {
   ctx.messages.length = 0;
   ctx.sendCalls.length = 0;
   ctx.promoteCalls.length = 0;
+  ctx.leaveCalls.length = 0;
   ctx.media.clear();
   ctx.events.length = 0;
   ctx.eventSeq = 0;
