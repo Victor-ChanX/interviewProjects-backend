@@ -42,7 +42,6 @@ import {
   abortableSleep,
   consumeOnce,
   createCursorPosition,
-  CURSOR_SETTLE_MS,
   startInboundWorker,
 } from "../src/workers/inbound-worker.js";
 import {
@@ -890,25 +889,25 @@ describe("ingest", () => {
 
     it("位置：连号逐帧前进；跳号的先到者不推进游标，缺的那条到了再一起前进", () => {
       const p = createCursorPosition(99);
-      expect(p.received(101, 0)).toBeNull();
-      expect(p.received(100, 10)).toBe(101);
-      expect(p.received(102, 20)).toBe(102);
-      expect(p.received(101, 30)).toBeNull(); // 重复
+      expect(p.received(101)).toBeNull();
+      expect(p.received(100)).toBe(101);
+      expect(p.received(102)).toBe(102);
+      expect(p.received(101)).toBeNull(); // 重复
     });
 
-    it("位置：id 有空洞时靠沉淀 —— 同一条流上收到后又过了 CURSOR_SETTLE_MS 且流还在送事件，才越过它", () => {
-      const p = createCursorPosition(10);
-      expect(p.received(20, 0)).toBeNull();
-      expect(p.received(30, CURSOR_SETTLE_MS - 1)).toBeNull();
-      expect(p.received(40, CURSOR_SETTLE_MS)).toBe(20);
-      expect(p.received(50, CURSOR_SETTLE_MS * 2)).toBe(40);
+    it("位置：有空洞就不越过，无论过了多久 —— 慢处理期间晚到的小 id 可能还在缓冲里没读", () => {
+      // 105 处理了 2 秒；这期间 106 先于 104 进了 socket 缓冲。读到 106 时 104 还没读 —— 游标不能到 106
+      const p = createCursorPosition(103);
+      expect(p.received(105)).toBeNull();
+      expect(p.received(106)).toBeNull();
+      expect(p.received(104)).toBe(106);
     });
 
-    it("位置：首次连接没有游标（since = null）：先沉淀出一个起点，再按连号接上", () => {
+    it("位置：首次连接没有游标（since = null）：以收到的第一条为起点，之后按连号前进", () => {
       const p = createCursorPosition(null);
-      expect(p.received(5, 0)).toBeNull();
-      expect(p.received(6, 100)).toBeNull();
-      expect(p.received(7, CURSOR_SETTLE_MS)).toBe(7);
+      expect(p.received(5)).toBe(5);
+      expect(p.received(7)).toBeNull();
+      expect(p.received(6)).toBe(7);
     });
 
     it("乱序 + 断流：先到的 101 不推进游标；重连从旧游标补拉，还在路上的 100 不丢", async () => {
