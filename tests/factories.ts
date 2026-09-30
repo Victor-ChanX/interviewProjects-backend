@@ -309,3 +309,29 @@ export async function publishWsEvent(
   if (published.seq === null) throw new Error(`ws_events ${row.id} 没排上号`);
   return { ...published, seq: published.seq };
 }
+
+// ---- 故障注入 --------------------------------------------------------------------------
+
+/**
+ * 在 fn 执行期间，让 table 上满足 when（触发器的 WHEN 条件，引用 NEW）的 UPDATE 抛错：模拟事务中途的库错误，
+ * 验证「要么都生效，要么都不生效」。结束后删掉触发器。表在测试的临时 schema 里（search_path）。
+ */
+export async function withFailingUpdates<T>(
+  table: string,
+  when: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const db = getDb();
+  await db.$executeRawUnsafe(
+    `CREATE FUNCTION injected_failure() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'injected failure'; END $$ LANGUAGE plpgsql`,
+  );
+  await db.$executeRawUnsafe(
+    `CREATE TRIGGER injected_failure BEFORE UPDATE ON ${table} FOR EACH ROW WHEN (${when}) EXECUTE FUNCTION injected_failure()`,
+  );
+  try {
+    return await fn();
+  } finally {
+    await db.$executeRawUnsafe(`DROP TRIGGER injected_failure ON ${table}`);
+    await db.$executeRawUnsafe(`DROP FUNCTION injected_failure()`);
+  }
+}

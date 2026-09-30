@@ -34,10 +34,14 @@ import type {
   Prisma,
 } from "../db/generated/client.js";
 import {
+  cancelQueuedSends,
   DEFAULT_RATE_LIMIT_SECONDS,
   enterRateLimited,
   enterTerminal,
+  enterTerminalInTx,
   isTerminal,
+  logTransition,
+  type TerminalStatus,
   terminalFromGatewayError,
 } from "./account-service.js";
 import {
@@ -45,7 +49,11 @@ import {
   GatewayResponseError,
   GatewayUnreachableError,
 } from "./gateway-client.js";
-import { markGroupUnreachable } from "./group-service.js";
+import {
+  logGroupUnreachable,
+  markGroupUnreachable,
+  markGroupUnreachableInTx,
+} from "./group-service.js";
 import { onOutboundSettled } from "./sequence-service.js";
 import { emitWsEvent } from "./ws-events.js";
 
@@ -459,44 +467,69 @@ export async function recordFailed(
   deps: OutboxDeps = {},
 ): Promise<boolean> {
   const now = (deps.clock ?? systemClock).now();
-  const row = await getDb().$transaction(async (tx) => {
-    await finishAttempt(tx, messageId, now, {
-      httpStatus: opts.httpStatus ?? null,
-      errorCode: code,
-    });
-    return settle(
-      tx,
-      messageId,
-      workerId,
-      opts.from ?? ["queued", "accepted", "unknown"],
-      { deliveryStatus: "failed", failCode: code, lastError: code },
-      now,
-    );
+  return getDb().$transaction((tx) =>
+    recordFailedInTx(tx, messageId, workerId, code, opts, now),
+  );
+}
+
+async function recordFailedInTx(
+  tx: Tx,
+  messageId: string,
+  workerId: string | null,
+  code: string,
+  opts: { httpStatus?: number | null; from?: DeliveryStatus[] },
+  now: Date,
+): Promise<boolean> {
+  await finishAttempt(tx, messageId, now, {
+    httpStatus: opts.httpStatus ?? null,
+    errorCode: code,
   });
+  const row = await settle(
+    tx,
+    messageId,
+    workerId,
+    opts.from ?? ["queued", "accepted", "unknown"],
+    { deliveryStatus: "failed", failCode: code, lastError: code },
+    now,
+  );
   return row !== null;
 }
 
-/** 账号被网关判终态：该行 cancelled + failCode = 网关码（其余 queued 行由账号级联置 cancelled / ACCOUNT_TERMINAL）。 */
-export async function recordCancelled(
-  messageId: string,
-  workerId: string,
-  code: string,
-  httpStatus: number,
-  deps: OutboxDeps = {},
-): Promise<boolean> {
+/**
+ * 发送被网关判账号终态（ACCOUNT_SUSPENDED / SESSION_EXPIRED）：账号进终态与这条的记账**一个事务**（A1：
+ * 状态和后果要么都生效，要么都不生效；无论来源结果都一样）。这条此刻仍是 queued（被本 worker 领着），
+ * 由终态级联和其余排队的一样 cancelled / ACCOUNT_TERMINAL、序列步骤 skipped；网关给的码留在 outbound_attempts
+ * 与 lastError 里。账号早已是终态（重复进入被忽略、级联不跑）时 cancelQueuedSends 收掉它。
+ * 锁序：先账号（enterTerminalInTx 的 FOR UPDATE）再消息，与级联一致。
+ */
+async function recordTerminalSendError(
+  msg: ClaimedMessage,
+  terminal: TerminalStatus,
+  err: GatewayResponseError,
+  deps: DispatchDeps,
+): Promise<void> {
   const now = (deps.clock ?? systemClock).now();
-  const row = await getDb().$transaction(async (tx) => {
-    await finishAttempt(tx, messageId, now, { httpStatus, errorCode: code });
-    return settle(
+  const result = await getDb().$transaction(async (tx) => {
+    const entered = await enterTerminalInTx(
       tx,
-      messageId,
-      workerId,
-      ["queued"],
-      { deliveryStatus: "cancelled", failCode: code, lastError: code },
+      msg.accountId,
+      terminal,
+      "send_error",
       now,
     );
+    if (!entered.changed) await cancelQueuedSends(tx, msg.accountId, now);
+    await finishAttempt(tx, msg.id, now, {
+      httpStatus: err.status,
+      errorCode: err.code,
+      detail: err.body,
+    });
+    await tx.message.updateMany({
+      where: { id: msg.id, claimedBy: deps.workerId },
+      data: { claimedBy: null, lockedAt: null, lastError: err.code },
+    });
+    return entered;
   });
-  return row !== null;
+  logTransition(msg.accountId, terminal, "send_error", result, deps.log);
 }
 
 /** 结果不明（504 / 客户端超时 / 连接重置）：→ unknown + unknownSince，由 resolveUnknown 按 by-client-id 落定。 */
@@ -735,27 +768,34 @@ async function handleSendError(
       return "requeued";
     }
 
-    // 403 ACCOUNT_SUSPENDED / 401 SESSION_EXPIRED：该行 cancelled + 账号进终态（级联其余 queued 行）
+    // 403 ACCOUNT_SUSPENDED / 401 SESSION_EXPIRED：账号进终态，这条随级联 cancelled（一个事务）
     const terminal = terminalFromGatewayError(err);
     if (terminal) {
-      await recordCancelled(msg.id, workerId, err.code, err.status, deps);
-      await enterTerminal(msg.accountId, terminal, "send_error", {
-        clock,
-        log,
-      });
+      await recordTerminalSendError(msg, terminal, err, deps);
       log?.warn({ ...ctx, terminal }, "网关判账号终态，出站消息 cancelled");
       return "cancelled";
     }
 
+    // 群不可写：群 unreachable（级联）与这条 failed 一个事务；先群行再消息行
     if (err.code === "GROUP_WRITE_FORBIDDEN") {
-      await recordFailed(
-        msg.id,
-        workerId,
-        err.code,
-        { httpStatus: err.status, from: ["queued"] },
-        deps,
-      );
-      await markGroupUnreachable(msg.groupId, err.code, { clock, log });
+      const group = await getDb().$transaction(async (tx) => {
+        const marked = await markGroupUnreachableInTx(
+          tx,
+          msg.groupId,
+          err.code,
+          now,
+        );
+        await recordFailedInTx(
+          tx,
+          msg.id,
+          workerId,
+          err.code,
+          { httpStatus: err.status, from: ["queued"] },
+          now,
+        );
+        return marked;
+      });
+      logGroupUnreachable(msg.groupId, err.code, group, log);
       log?.warn(ctx, "群不可写，出站消息 failed，群已 unreachable");
       return "failed";
     }

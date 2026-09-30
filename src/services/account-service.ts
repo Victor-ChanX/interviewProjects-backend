@@ -1,12 +1,13 @@
 // 账号状态机（题目 A1 + 2.3 的 accounts 端点，issue #6）。
 //
-// 三条硬规则，全部落在 transition() 一个函数、一个 $transaction 里：
+// 三条硬规则，全部落在 transitionInTx() 一个事务体里（操作员走 transition() 自己的事务；网关事件 / 发送错误走
+// enterTerminalInTx()，与它们各自的记账同一个事务）：
 // 1. 转移表 TRANSITIONS 是唯一的合法性来源：表外（含同状态到同状态）→ 409 ILLEGAL_TRANSITION。
 // 2. CAS：调用方声明 expectedFrom；当前状态不是它 → 409 CAS_CONFLICT。写入用 `updateMany where { id, version }`
 //    （accounts.version 每次写 +1），并发两次改同一账号时后提交的那次 count = 0 → CAS_CONFLICT，不能后写覆盖先写。
 // 3. 终态级联（suspended / session_expired）与状态写入同一事务：移出所有群成员行、排队中的出站消息 → cancelled
 //    （failCode = ACCOUNT_TERMINAL）、对应序列步骤 → skipped、写 account_terminal 事件。要么都生效，要么都不生效。
-//    无论来源是操作员、网关事件还是发送错误（TransitionSource），都走这一个函数，结果一样。
+//    无论来源是操作员、网关事件还是发送错误（TransitionSource），都走这一个事务体，结果一样。
 //    重复进入同一终态静默忽略：返回当前状态，不报错、不再级联、不再发事件。
 //
 // 每次成功转移在同一事务里写一行 ws_events（account_status_changed { accountId, from, to }）：
@@ -25,6 +26,7 @@ import {
   GatewayResponseError,
   GatewayUnreachableError,
 } from "./gateway-client.js";
+import { emitWsEvent } from "./ws-events.js";
 
 // ---- 转移表（题目 A1：行 = 当前状态，列 = 目标状态）----------------------------------
 
@@ -160,122 +162,126 @@ export async function transition(
   deps: TransitionDeps = {},
 ): Promise<TransitionResult> {
   const clock = deps.clock ?? systemClock;
-  const db = getDb();
-
-  const result = await db.$transaction(async (tx) => {
-    const row = await findAccountOrThrow(tx, accountId);
-
-    // 重复进入同一终态：静默忽略（不看 expectedFrom —— 网关事件 / 发送错误 / 操作员各自读到的
-    // 旧状态可能不同，但目的都已达成；再判 CAS 只会让后到的来源无谓报错）。
-    if (isTerminal(input.to) && row.status === input.to) {
-      return {
-        account: row,
-        from: row.status,
-        changed: false,
-        cascade: NO_CASCADE,
-      } satisfies TransitionResult;
-    }
-
-    if (!canTransition(input.expectedFrom, input.to)) {
-      throw new Conflict(
-        "ILLEGAL_TRANSITION",
-        `账号不能从 ${input.expectedFrom} 转到 ${input.to}`,
-        { accountId, from: input.expectedFrom, to: input.to },
-      );
-    }
-    if (row.status !== input.expectedFrom) {
-      throw casConflict(accountId, input.expectedFrom, row.status);
-    }
-    if (
-      input.expectedVersion !== undefined &&
-      row.version !== input.expectedVersion
-    ) {
-      throw casConflict(accountId, input.expectedFrom, row.status);
-    }
-    if (input.to === "rate_limited" && input.rateLimitSeconds === undefined) {
-      throw new Error("transition 到 rate_limited 必须给 rateLimitSeconds");
-    }
-    const now = clock.now();
-
-    // CAS 写入：where 带 version，并发下只有一个 count = 1。
-    const written = await tx.account.updateMany({
-      where: { id: accountId, version: row.version },
-      data: {
-        status: input.to,
-        version: { increment: 1 },
-        rateLimitedUntil:
-          input.to === "rate_limited"
-            ? new Date(now.getTime() + (input.rateLimitSeconds ?? 0) * 1000)
-            : null,
-        ...(input.platformUserId !== undefined
-          ? { platformUserId: input.platformUserId }
-          : {}),
-      },
-    });
-    if (written.count === 0) {
-      throw casConflict(accountId, input.expectedFrom, row.status);
-    }
-
-    const cascade = isTerminal(input.to)
-      ? await cascadeTerminal(tx, accountId, now)
-      : NO_CASCADE;
-
-    await tx.wsEvent.create({
-      data: {
-        type: "account_status_changed",
-        payload: { accountId, from: row.status, to: input.to },
-      },
-    });
-    if (isTerminal(input.to)) {
-      await tx.wsEvent.create({
-        data: {
-          type: "account_terminal",
-          payload: { accountId, status: input.to },
-        },
-      });
-    }
-
-    const account = await tx.account.findUniqueOrThrow({
-      where: { id: accountId },
-    });
-    return {
-      account,
-      from: row.status,
-      changed: true,
-      cascade,
-    } satisfies TransitionResult;
-  });
+  const result = await getDb().$transaction((tx) =>
+    transitionInTx(tx, accountId, input, clock.now()),
+  );
 
   // commit 之后才记业务日志 / 做外部副作用
+  logTransition(accountId, input.to, input.source, result, deps.log);
+  if (result.changed && deps.gateway && OFFLINE_TARGETS.includes(input.to)) {
+    try {
+      await deps.gateway.disconnect(accountId);
+    } catch (err) {
+      // 本地已下线即生效；网关侧断不开只影响网关那边的在线标记，下次 connect 会覆盖。
+      deps.log?.warn(
+        { err, accountId, to: input.to },
+        "网关 disconnect 失败，本地状态已生效",
+      );
+    }
+  }
+  return result;
+}
+
+/** 转移的事务体（见文件头三条硬规则）：状态写入、终态级联、ws 事件在调用方的同一个事务里。 */
+async function transitionInTx(
+  tx: Prisma.TransactionClient,
+  accountId: string,
+  input: TransitionInput,
+  now: Date,
+): Promise<TransitionResult> {
+  const row = await findAccountOrThrow(tx, accountId);
+
+  // 重复进入同一终态：静默忽略（不看 expectedFrom —— 网关事件 / 发送错误 / 操作员各自读到的
+  // 旧状态可能不同，但目的都已达成；再判 CAS 只会让后到的来源无谓报错）。
+  if (isTerminal(input.to) && row.status === input.to) {
+    return {
+      account: row,
+      from: row.status,
+      changed: false,
+      cascade: NO_CASCADE,
+    };
+  }
+
+  if (!canTransition(input.expectedFrom, input.to)) {
+    throw new Conflict(
+      "ILLEGAL_TRANSITION",
+      `账号不能从 ${input.expectedFrom} 转到 ${input.to}`,
+      { accountId, from: input.expectedFrom, to: input.to },
+    );
+  }
+  if (row.status !== input.expectedFrom) {
+    throw casConflict(accountId, input.expectedFrom, row.status);
+  }
+  if (
+    input.expectedVersion !== undefined &&
+    row.version !== input.expectedVersion
+  ) {
+    throw casConflict(accountId, input.expectedFrom, row.status);
+  }
+  if (input.to === "rate_limited" && input.rateLimitSeconds === undefined) {
+    throw new Error("transition 到 rate_limited 必须给 rateLimitSeconds");
+  }
+
+  // CAS 写入：where 带 version，并发下只有一个 count = 1。
+  const written = await tx.account.updateMany({
+    where: { id: accountId, version: row.version },
+    data: {
+      status: input.to,
+      version: { increment: 1 },
+      rateLimitedUntil:
+        input.to === "rate_limited"
+          ? new Date(now.getTime() + (input.rateLimitSeconds ?? 0) * 1000)
+          : null,
+      ...(input.platformUserId !== undefined
+        ? { platformUserId: input.platformUserId }
+        : {}),
+    },
+  });
+  if (written.count === 0) {
+    throw casConflict(accountId, input.expectedFrom, row.status);
+  }
+
+  const cascade = isTerminal(input.to)
+    ? await cascadeTerminal(tx, accountId, now)
+    : NO_CASCADE;
+
+  await emitWsEvent(tx, "account_status_changed", {
+    accountId,
+    from: row.status,
+    to: input.to,
+  });
+  if (isTerminal(input.to)) {
+    await emitWsEvent(tx, "account_terminal", { accountId, status: input.to });
+  }
+
+  const account = await tx.account.findUniqueOrThrow({
+    where: { id: accountId },
+  });
+  return { account, from: row.status, changed: true, cascade };
+}
+
+/**
+ * 转移的业务日志：调用方在**事务 commit 之后**调（transition / enterTerminal 自己调；在别人的事务里用
+ * enterTerminalInTx 的调用方 commit 后自己调）。
+ */
+export function logTransition(
+  accountId: string,
+  to: AccountStatus,
+  source: TransitionSource,
+  result: TransitionResult,
+  log: TransitionDeps["log"],
+): void {
   if (result.changed) {
-    deps.log?.info(
-      {
-        accountId,
-        from: result.from,
-        to: input.to,
-        source: input.source,
-        ...result.cascade,
-      },
+    log?.info(
+      { accountId, from: result.from, to, source, ...result.cascade },
       "账号状态已转移",
     );
-    if (deps.gateway && OFFLINE_TARGETS.includes(input.to)) {
-      try {
-        await deps.gateway.disconnect(accountId);
-      } catch (err) {
-        // 本地已下线即生效；网关侧断不开只影响网关那边的在线标记，下次 connect 会覆盖。
-        deps.log?.warn(
-          { err, accountId, to: input.to },
-          "网关 disconnect 失败，本地状态已生效",
-        );
-      }
-    }
   } else {
-    deps.log?.info(
-      { accountId, status: input.to, source: input.source },
+    log?.info(
+      { accountId, status: to, source },
       "账号已在该终态，重复进入被忽略",
     );
   }
-  return result;
 }
 
 function casConflict(
@@ -293,12 +299,8 @@ function casConflict(
 /**
  * 终态级联（与状态写入同一事务）：
  * - group_members 里该账号的成员行全部删除（网关那边也会把它移出所有群并推 member_left，事件到了是空操作）；
- * - 该账号 deliveryStatus = queued 的出站消息 → cancelled + failCode = ACCOUNT_TERMINAL。
- *   只取 queued：accepted 已被网关收下、unknown 还在按 by-client-id 确认（A2 要求 5 秒内落定），两者的
- *   终局由出站 worker 按网关的真实结果记账，这里改了反而会和 message_sent 打架；
- * - 这些消息对应的 sequence_run_steps（clientMsgId 指向它们）→ skipped。还没入队的 pending 步没有消息，
- *   由序列 worker 在选账号时自己看账号状态；
- * - 事件 account_terminal 由调用方（transition）写在同一事务里。
+ * - 该账号排队中的发送 → cancelled / skipped（cancelQueuedSends）；
+ * - 事件 account_terminal 由调用方（transitionInTx）写在同一事务里。
  */
 async function cascadeTerminal(
   tx: Prisma.TransactionClient,
@@ -306,21 +308,44 @@ async function cascadeTerminal(
   now: Date,
 ): Promise<CascadeCounts> {
   const members = await tx.groupMember.deleteMany({ where: { accountId } });
+  const sends = await cancelQueuedSends(tx, accountId, now);
+  return { membersRemoved: members.count, ...sends };
+}
 
+/**
+ * 终态账号排队中的发送（A1）：deliveryStatus = queued 的出站消息 → cancelled + failCode = ACCOUNT_TERMINAL
+ * （含已被 worker 领取、正在调网关的那条：网关随后若说已发出，message_sent 照样能把它改成 sent），
+ * 每条推一次 ws message；对应的 sequence_run_steps（clientMsgId 指向它们）→ skipped，序列 worker 据 skippedAt
+ * 排下一步。还没入队的 pending 步没有消息，由序列 worker 在选账号时自己看账号状态。
+ * 只取 queued：accepted 已被网关收下、unknown 还在按 by-client-id 确认（A2 要求 5 秒内落定），两者的
+ * 终局由出站 worker 按网关的真实结果记账，这里改了反而会和 message_sent 打架。
+ * 进终态时由级联调；账号**已是**终态时（重复进入被忽略）调用方也可以直接调它收掉漏网的行，幂等。
+ */
+export async function cancelQueuedSends(
+  tx: Prisma.TransactionClient,
+  accountId: string,
+  now: Date,
+): Promise<Omit<CascadeCounts, "membersRemoved">> {
   const queued = await tx.message.findMany({
     where: { accountId, deliveryStatus: "queued" },
-    select: { id: true, clientMsgId: true },
+    select: { id: true, groupId: true, msgId: true, clientMsgId: true },
   });
-  const messages =
-    queued.length === 0
-      ? { count: 0 }
-      : await tx.message.updateMany({
-          where: { id: { in: queued.map((m) => m.id) } },
-          data: {
-            deliveryStatus: "cancelled",
-            failCode: ACCOUNT_TERMINAL_FAIL_CODE,
-          },
-        });
+  if (queued.length === 0) return { messagesCancelled: 0, stepsSkipped: 0 };
+
+  const messages = await tx.message.updateMany({
+    where: { id: { in: queued.map((m) => m.id) }, deliveryStatus: "queued" },
+    data: { deliveryStatus: "cancelled", failCode: ACCOUNT_TERMINAL_FAIL_CODE },
+  });
+  for (const m of queued) {
+    await emitWsEvent(tx, "message", {
+      groupId: m.groupId,
+      msgId: m.msgId,
+      clientMsgId: m.clientMsgId,
+      isOwn: true,
+      deliveryStatus: "cancelled",
+      failCode: ACCOUNT_TERMINAL_FAIL_CODE,
+    });
+  }
 
   const clientMsgIds = queued
     .map((m) => m.clientMsgId)
@@ -340,11 +365,7 @@ async function cascadeTerminal(
           },
         });
 
-  return {
-    membersRemoved: members.count,
-    messagesCancelled: messages.count,
-    stepsSkipped: steps.count,
-  };
+  return { messagesCancelled: messages.count, stepsSkipped: steps.count };
 }
 
 /** 读 → 按当前状态转移；撞 CAS_CONFLICT（别人刚改过）就重读再试，最多 attempts 次。 */
@@ -369,9 +390,9 @@ async function withCasRetry<T>(
 }
 
 /**
- * 进终态的统一入口：网关事件（account_status）、发送错误（ACCOUNT_SUSPENDED / SESSION_EXPIRED）、
- * connect 被拒都从这里进 transition —— 它们没有「操作员看到的旧状态」，expectedFrom 取当前状态；
- * 已在该终态时 transition 静默返回 changed = false。
+ * 进终态的统一入口：网关事件（account_status / message_failed）、发送错误（ACCOUNT_SUSPENDED / SESSION_EXPIRED）、
+ * connect 被拒都从这里进 —— 它们没有「操作员看到的旧状态」，expectedFrom 取当前状态；
+ * 已在该终态时静默返回 changed = false。
  */
 export async function enterTerminal(
   accountId: string,
@@ -379,14 +400,35 @@ export async function enterTerminal(
   source: Exclude<TransitionSource, "rate_limit_worker">,
   deps: TransitionDeps = {},
 ): Promise<TransitionResult> {
-  return withCasRetry(3, async () => {
-    const row = await findAccountOrThrow(getDb(), accountId);
-    return transition(
-      accountId,
-      { to: status, expectedFrom: row.status, source },
-      deps,
-    );
-  });
+  const clock = deps.clock ?? systemClock;
+  const result = await getDb().$transaction((tx) =>
+    enterTerminalInTx(tx, accountId, status, source, clock.now()),
+  );
+  logTransition(accountId, status, source, result, deps.log);
+  return result;
+}
+
+/**
+ * enterTerminal 的事务体，给「终态与自己的记账必须同生共死」的调用方（出站派发、入站事件）在它们的事务里调；
+ * commit 之后由调用方 logTransition。
+ * 先锁账号行（FOR UPDATE）再读当前状态：并发的转移在锁上排队，不会 CAS_CONFLICT，也就不需要重试。
+ * 锁序：调用方要在碰这个账号的出站消息行**之前**调它（账号 → 消息，与级联的顺序一致），否则会和级联互等。
+ */
+export async function enterTerminalInTx(
+  tx: Prisma.TransactionClient,
+  accountId: string,
+  status: TerminalStatus,
+  source: Exclude<TransitionSource, "rate_limit_worker">,
+  now: Date,
+): Promise<TransitionResult> {
+  await tx.$queryRaw`SELECT id FROM accounts WHERE id = ${accountId} FOR UPDATE`;
+  const row = await findAccountOrThrow(tx, accountId);
+  return transitionInTx(
+    tx,
+    accountId,
+    { to: status, expectedFrom: row.status, source },
+    now,
+  );
 }
 
 // ---- 限流 -------------------------------------------------------------------------

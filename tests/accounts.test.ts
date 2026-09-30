@@ -480,8 +480,20 @@ describe("accounts", () => {
         [2, "skipped", "ACCOUNT_TERMINAL"],
       ]);
       expect(steps[1]?.skippedAt).not.toBeNull();
-      // 事件：状态事件 + account_terminal，都对应已保存的状态
+      // 事件：被取消那条的 message（时间线跟着变）+ 状态事件 + account_terminal，都对应已保存的状态
+      const cancelled = messages.find((m) => m.clientMsgId === "c-queued");
       expect((await wsEvents()).map((e) => [e.type, e.payload])).toEqual([
+        [
+          "message",
+          {
+            groupId: cancelled?.groupId,
+            msgId: null,
+            clientMsgId: "c-queued",
+            isOwn: true,
+            deliveryStatus: "cancelled",
+            failCode: "ACCOUNT_TERMINAL",
+          },
+        ],
         ["account_status_changed", { accountId, from: "online", to: status }],
         ["account_terminal", { accountId, status }],
       ]);
@@ -531,7 +543,7 @@ describe("accounts", () => {
       const { account, g1 } = await stage();
       await enterTerminal(account.id, "suspended", "send_error");
       const eventsBefore = await wsEvents();
-      expect(eventsBefore).toHaveLength(2);
+      expect(eventsBefore).toHaveLength(3);
       // 期间又有新的成员行进来（比如网关的 member_joined 晚到）：重复进入不会再动它
       await getDb().groupMember.create({
         data: {

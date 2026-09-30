@@ -32,7 +32,12 @@ import {
 } from "../src/services/outbox-service.js";
 import { buildGatewayApp } from "../src/sim/gateway/app.js";
 import { runOutboxTick } from "../src/workers/outbox-worker.js";
-import { loginAs, makeAccount, makeGroup } from "./factories.js";
+import {
+  loginAs,
+  makeAccount,
+  makeGroup,
+  withFailingUpdates,
+} from "./factories.js";
 import { truncateAll } from "./setup.js";
 
 type Json = Record<string, unknown>;
@@ -935,6 +940,40 @@ describe("outbox（#7）", () => {
       ]);
     });
 
+    it("进终态中途出错（级联里库抛错）：账号、这条消息、投递记录一起回滚 —— 不会出现「该条已 cancelled、账号还 online」", async () => {
+      const { group } = await stageGroup();
+      const victim = await addMember(group);
+      await scenario({
+        send: {
+          responses: [
+            {
+              status: 403,
+              code: "ACCOUNT_SUSPENDED",
+              match: { accountId: victim.id },
+            },
+          ],
+        },
+      });
+      const m1 = await enqueue(group, victim, "v-1");
+      // 注入故障：账号一改成 suspended 就抛（模拟级联事务里的库错误）
+      const s1 = await withFailingUpdates(
+        "accounts",
+        "NEW.status = 'suspended'",
+        () => tick(),
+      );
+      expect(s1.outcomes.cancelled).toBe(0);
+      expect((await account(victim.id)).status).toBe("online");
+      expect(await row(m1.messageId)).toMatchObject({
+        deliveryStatus: "queued",
+        failCode: null,
+      });
+      expect(
+        await getDb().outboundAttempt.count({
+          where: { messageId: m1.messageId, finishedAt: { not: null } },
+        }),
+      ).toBe(0);
+    });
+
     it("SENDER_NOT_IN_GROUP / ACCOUNT_OFFLINE → 该条 failed（同名 failCode）；账号、群状态不变；不重试", async () => {
       const { group } = await stageGroup();
       const notInGroup = await addMember(group, { gatewayMember: false });
@@ -978,7 +1017,7 @@ describe("outbox（#7）", () => {
         terminal: "session_expired",
       },
     ])(
-      "$code → 该条 cancelled（failCode = $code）+ 账号 $terminal 级联：其余 queued → cancelled ACCOUNT_TERMINAL、移出群",
+      "$code → 账号 $terminal 级联（一个事务）：该条与其余 queued 一样 cancelled ACCOUNT_TERMINAL（网关码留在 lastError / 投递记录）、移出群",
       async ({ status, code, terminal }) => {
         const { group, creator } = await stageGroup();
         const victim = await addMember(group);
@@ -1000,11 +1039,20 @@ describe("outbox（#7）", () => {
 
         const s = await tick();
         expect(s.outcomes).toMatchObject({ cancelled: 1, accepted: 1 });
+        // A1：无论从哪个来源进终态结果都一样 —— 触发的这条也是「排队中的发送」
         expect(await row(m1.messageId)).toMatchObject({
           deliveryStatus: "cancelled",
-          failCode: code,
+          failCode: "ACCOUNT_TERMINAL",
+          lastError: code,
           claimedBy: null,
         });
+        expect(
+          (
+            await getDb().outboundAttempt.findMany({
+              where: { messageId: m1.messageId },
+            })
+          ).map((a) => [a.httpStatus, a.errorCode]),
+        ).toEqual([[status, code]]);
         expect(await row(m2.messageId)).toMatchObject({
           deliveryStatus: "cancelled",
           failCode: "ACCOUNT_TERMINAL",

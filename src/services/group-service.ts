@@ -59,98 +59,117 @@ export type MarkUnreachableResult = {
   agentRunsRunning: number;
 };
 
-/**
- * 网关说该群不可写（GROUP_WRITE_FORBIDDEN）：群 → unreachable + 级联，一个事务。
- * reason 只进日志与事件 payload（同步错误 / message_failed 两个来源结果一样）。
- */
+/** markGroupUnreachableInTx 自己开一个事务（message_failed 事件的记账还不在入站事务里时用）。 */
 export async function markGroupUnreachable(
   groupId: string,
   reason: string,
   deps: GroupServiceDeps = {},
 ): Promise<MarkUnreachableResult> {
   const clock = deps.clock ?? systemClock;
-  const result = await getDb().$transaction(async (tx) => {
-    const now = clock.now();
-    const flipped = await tx.group.updateMany({
-      where: { id: groupId, status: "active" },
-      data: { status: "unreachable" },
-    });
-    if (flipped.count === 0) {
-      return {
-        changed: false,
-        sequenceRunsStopped: 0,
-        messagesCancelled: 0,
-        agentRunsRunning: 0,
-      } satisfies MarkUnreachableResult;
-    }
+  const result = await getDb().$transaction((tx) =>
+    markGroupUnreachableInTx(tx, groupId, reason, clock.now()),
+  );
+  logGroupUnreachable(groupId, reason, result, deps.log);
+  return result;
+}
 
-    const runs = await tx.sequenceRun.findMany({
-      where: { groupId, status: "running" },
-      select: { id: true, currentStepIndex: true },
-    });
-    if (runs.length > 0) {
-      await tx.sequenceRun.updateMany({
-        where: { id: { in: runs.map((r) => r.id) } },
-        data: { status: "stopped", finishedAt: now },
-      });
-      for (const run of runs) {
-        await emitWsEvent(tx, "sequence_run", {
-          runId: run.id,
-          groupId,
-          status: "stopped",
-          currentStepIndex: run.currentStepIndex,
-        });
-      }
-    }
+/** markGroupUnreachableInTx 的业务日志：调用方在 commit 之后调。 */
+export function logGroupUnreachable(
+  groupId: string,
+  reason: string,
+  result: MarkUnreachableResult,
+  log: GroupServiceDeps["log"],
+): void {
+  if (result.changed) {
+    log?.warn({ groupId, reason, ...result }, "群已标为 unreachable");
+  }
+}
 
-    const queued = await tx.message.findMany({
-      where: { groupId, deliveryStatus: "queued", claimedBy: null },
-      select: { id: true, clientMsgId: true },
-    });
-    if (queued.length > 0) {
-      await tx.message.updateMany({
-        where: { id: { in: queued.map((m) => m.id) } },
-        data: {
-          deliveryStatus: "cancelled",
-          failCode: GROUP_UNREACHABLE_FAIL_CODE,
-        },
-      });
-      for (const m of queued) {
-        await emitWsEvent(tx, "message", {
-          groupId,
-          msgId: null,
-          clientMsgId: m.clientMsgId,
-          isOwn: true,
-          deliveryStatus: "cancelled",
-          failCode: GROUP_UNREACHABLE_FAIL_CODE,
-        });
-      }
-    }
-
-    const agentRunsRunning = await tx.agentRun.count({
-      where: { groupId, status: "running" },
-    });
-
-    await emitWsEvent(tx, "group_status_changed", {
-      groupId,
-      from: "active",
-      to: "unreachable",
-      reason,
-    });
-
+/**
+ * 网关说该群不可写（GROUP_WRITE_FORBIDDEN）：群 → unreachable + 级联（序列运行 stopped、未领取的 queued 消息
+ * cancelled、事件）。在调用方的事务里跑 —— 群不可写与调用方自己的记账（出站派发的那条 failed、message_failed
+ * 事件的 processedAt）同生共死；commit 之后调用方调 logGroupUnreachable。先改群行（行锁）再碰消息行。
+ * reason 只进日志与事件 payload（同步错误 / message_failed 两个来源结果一样）。
+ */
+export async function markGroupUnreachableInTx(
+  tx: Prisma.TransactionClient,
+  groupId: string,
+  reason: string,
+  now: Date,
+): Promise<MarkUnreachableResult> {
+  const flipped = await tx.group.updateMany({
+    where: { id: groupId, status: "active" },
+    data: { status: "unreachable" },
+  });
+  if (flipped.count === 0) {
     return {
-      changed: true,
-      sequenceRunsStopped: runs.length,
-      messagesCancelled: queued.length,
-      agentRunsRunning,
+      changed: false,
+      sequenceRunsStopped: 0,
+      messagesCancelled: 0,
+      agentRunsRunning: 0,
     } satisfies MarkUnreachableResult;
+  }
+
+  const runs = await tx.sequenceRun.findMany({
+    where: { groupId, status: "running" },
+    select: { id: true, currentStepIndex: true },
+  });
+  if (runs.length > 0) {
+    await tx.sequenceRun.updateMany({
+      where: { id: { in: runs.map((r) => r.id) } },
+      data: { status: "stopped", finishedAt: now },
+    });
+    for (const run of runs) {
+      await emitWsEvent(tx, "sequence_run", {
+        runId: run.id,
+        groupId,
+        status: "stopped",
+        currentStepIndex: run.currentStepIndex,
+      });
+    }
+  }
+
+  const queued = await tx.message.findMany({
+    where: { groupId, deliveryStatus: "queued", claimedBy: null },
+    select: { id: true, clientMsgId: true },
+  });
+  if (queued.length > 0) {
+    await tx.message.updateMany({
+      where: { id: { in: queued.map((m) => m.id) } },
+      data: {
+        deliveryStatus: "cancelled",
+        failCode: GROUP_UNREACHABLE_FAIL_CODE,
+      },
+    });
+    for (const m of queued) {
+      await emitWsEvent(tx, "message", {
+        groupId,
+        msgId: null,
+        clientMsgId: m.clientMsgId,
+        isOwn: true,
+        deliveryStatus: "cancelled",
+        failCode: GROUP_UNREACHABLE_FAIL_CODE,
+      });
+    }
+  }
+
+  const agentRunsRunning = await tx.agentRun.count({
+    where: { groupId, status: "running" },
   });
 
-  // commit 之后才记业务日志
-  if (result.changed) {
-    deps.log?.warn({ groupId, reason, ...result }, "群已标为 unreachable");
-  }
-  return result;
+  await emitWsEvent(tx, "group_status_changed", {
+    groupId,
+    from: "active",
+    to: "unreachable",
+    reason,
+  });
+
+  return {
+    changed: true,
+    sequenceRunsStopped: runs.length,
+    messagesCancelled: queued.length,
+    agentRunsRunning,
+  } satisfies MarkUnreachableResult;
 }
 
 // ============================================================================
