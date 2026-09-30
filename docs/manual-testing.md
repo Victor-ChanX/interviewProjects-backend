@@ -82,7 +82,7 @@ G=<网关群 ID，如 g_5ffed3d96722>
 | # | 步骤 | 预期 / 在哪看 |
 | --- | --- | --- |
 | 2.1 | 账号管理页：acc-1、acc-2、acc-3 点「重连」 | 变「在线」并显示平台用户 ID；按钮变成「标记离线」「释放账号」（只显示当前状态下合法的转移） |
-| 2.2 | acc-3 点「标记离线」，再点「重连」 | 在线 → 离线 → 在线；每次状态变化实时生效，不用刷新 |
+| 2.2 | acc-3 点「标记离线」，再点「重连」 | 在线 → 已离线 → 在线（「离线」页签里也能筛出它）；每次状态变化实时生效，不用刷新 |
 | 2.3 | **并发冲突**：开两个浏览器标签打开账号页，都停在 acc-2「在线」；标签 A 点「标记离线」，标签 B 点「释放账号」 | 只有一个成功；另一个提示「状态已变化」并刷新列表（`409 CAS_CONFLICT`） |
 | 2.4 | **终态级联**（需要先有群，见第 3 节）：`curl -s -X POST $GW/_sim/push -H 'content-type: application/json' -d '{"kind":"account_status","accountId":"acc-3","status":"suspended"}'` | 账号页 acc-3 变「已停用（终态）」且没有任何按钮；群详情里 acc-3 从成员中消失；工作台 / 实时动态出现「账号被停用」 |
 | 2.5 | 对 acc-3 再推一次同样的事件 | 什么都不变（重复进入同一终态静默忽略） |
@@ -120,7 +120,7 @@ G=<网关群 ID，如 g_5ffed3d96722>
 | 5.4 | **504 两次都没发出** | `-d '{"send":{"responses":[{"status":504,"landAfterMs":null},{"status":504,"landAfterMs":null}]}}'`，发一条 | 最终「发送失败」，原因 `NETWORK_TIMEOUT`；网关里没有这条 |
 | 5.5 | **群不可写** | `-d "{\"groups\":{\"writeForbidden\":[\"$G\"]}}"`，发一条 | 这条「发送失败 GROUP_WRITE_FORBIDDEN」；群状态变「不可写」；该群进行中的序列变「已停止」，Agent 不再触发 |
 | 5.6 | **账号被停用（发送时发现）** | `-d '{"send":{"responses":[{"status":403,"code":"ACCOUNT_SUSPENDED","match":{"accountId":"acc-3"}}]}}'`，用 acc-3 发一条 | acc-3 变「已停用（终态）」，从所有群移除；它排队中的消息变「已取消 ACCOUNT_TERMINAL」 |
-| 5.7 | **离线账号发送** | 账号页把 acc-2 标记离线，再到群详情用 acc-2 发 | 发送框直接报「账号不可用」（`409 ACCOUNT_UNAVAILABLE`），不会发到网关 |
+| 5.7 | **离线账号发送** | 账号页把 acc-2 标记离线，再到群详情用 acc-2 发 | 弹出提示「账号不可用」（`409 ACCOUNT_UNAVAILABLE`），不会发到网关 |
 | 5.8 | **事件流断开** | `curl -s -X POST $GW/_sim/streams/disconnect`，紧接着推 2 条外部消息 | 后端自动重连并带 `since` 补拉，2 条都出现、不重复 |
 | 5.9 | **后端停机期间的事件** | 停掉后端 → 推 3 条外部消息、再推一个 `member_joined`（`{"kind":"member_joined","groupId":"$G","platformUserId":"ext-carol"}`）→ 启动后端 | 3 条消息与新成员都出现（停机期间的事件恢复后全部处理） |
 
@@ -147,8 +147,8 @@ G=<网关群 ID，如 g_5ffed3d96722>
 
 | # | 步骤 | 预期 / 在哪看 |
 | --- | --- | --- |
-| 7.1 | 定时序列页新建：第 1 步 admin「`{event} 将于 {time} 开始，请提前准备`」延迟 5 秒；第 2 步 member「`提醒：{event} 的资料已上传到 {location}`」延迟 5 秒 | 保存成功 |
-| 7.2 | **S8 预检失败**：在群里启动，只填 `vars`：`event`、`time`，不填 `location` | 预检弹窗把第 2 步的 `location` 标红，启动按钮不可点；直接调接口得 `422 UNRESOLVED_PLACEHOLDER`，`stepIndex = 2`、`key = location`；网关收不到任何消息 |
+| 7.1 | 定时序列页点「新建序列」：第 1 步 admin「`{event} 将于 {time} 开始，请提前准备`」延迟 5 秒；第 2 步 member「`提醒：{event} 的资料已上传到 {location}`」延迟 5 秒，点「创建序列」 | 列表里出现这个序列 |
+| 7.2 | **S8 预检失败**：在定时序列页这一行点「在群启动」→ 选群（进入该群的序列运行页，序列已选好），只填 `vars`：`event`、`time`，不填 `location`，点预检 | 预检弹窗把第 2 步的 `location` 标红，启动按钮不可点；直接调接口得 `422 UNRESOLVED_PLACEHOLDER`，`stepIndex = 2`、`key = location`；网关收不到任何消息 |
 | 7.3 | `stepVars` 第 2 步填 `location = 共享盘/第二季度`，再预检 | 每步每个 key 的取值与来源（`default` / `step:2`）；启动后第 1 步约 5 秒后由管理员账号发出，第 2 步在第 1 步**发出后**再过 5 秒由成员账号发出；进度实时变化 |
 | 7.4 | **S7 并发启动**：同一群、同一序列，同时发两次启动请求（`curl ... & curl ... & wait`） | 恰好一个 `201`、一个 `409 SEQUENCE_ALREADY_RUNNING` |
 | 7.5 | **没有匹配账号**：把群里 member 角色的账号都标记离线再启动 | member 那步「已跳过」并有时间戳，序列继续推进 |
