@@ -1,8 +1,9 @@
-// 健康检查：无闸门（要在地图脚本 PUBLIC_ENDPOINTS 里登记 "GET /api/health"）。
+// 健康检查：无闸门（在地图脚本 PUBLIC_ENDPOINTS 里登记了 "GET /api/health"）。
 import type { FastifyInstance } from "fastify";
 import type { ZodTypeProvider } from "fastify-type-provider-zod";
 
 import { HealthRead } from "../../schemas/health.js";
+import { getSchemaVersion } from "../../services/health-service.js";
 
 export default async function healthRoutes(
   app: FastifyInstance,
@@ -16,6 +17,6 @@ export default async function healthRoutes(
         response: { 200: HealthRead },
       },
     },
-    async () => ({ status: "ok" as const, time: new Date().toISOString() }),
+    async () => ({ ok: true as const, schemaVersion: getSchemaVersion() }),
   );
 }

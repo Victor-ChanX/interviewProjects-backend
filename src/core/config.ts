@@ -8,10 +8,22 @@ export type Config = {
   /** PostgreSQL 连接串；生成地图 / 导 openapi 时可以没有 */
   databaseUrl: string | undefined;
   /**
+   * 消息网关（题目 2.1）的 base url，如 http://localhost:8100。调网关的 service 从
+   * src/services/gateway-client.ts 拿客户端；缺了在第一次调网关时报错而不是启动即失败：
+   * 模拟器与生成脚本也 import 本文件，测试则把假网关的 url 注入进去。
+   */
+  gatewayUrl: string | undefined;
+  /**
    * 生成 project-map / openapi 时由脚本置 "1"：
    * buildApp 不连库、main 不启 worker，保证生成物与环境无关。
    */
   projectMapBuild: boolean;
+  /**
+   * access token 的 HS256 签名密钥（src/core/jwt.ts）。HTTP 服务必填：buildApp 在非
+   * PROJECT_MAP_BUILD 下缺了就拒绝构建；这里不直接抛是因为模拟器（src/sim）也 import 本文件，
+   * 它们不签发 token。生成地图 / 导 openapi 时同样允许缺。
+   */
+  jwtSecret: string | undefined;
   /** Agent 服务模拟器（src/sim/agent，`npm run sim:agent`）的监听端口 */
   simAgentPort: number;
   /** 消息网关模拟器（src/sim/gateway，`npm run sim:gateway`）的监听端口 */
@@ -32,5 +44,7 @@ export const config: Readonly<Config> = Object.freeze({
   simAgentPort: readPort(process.env.SIM_AGENT_PORT, 8200),
   simGatewayPort: readPort(process.env.SIM_GATEWAY_PORT, 8100),
   databaseUrl: process.env.DATABASE_URL || undefined,
+  gatewayUrl: process.env.GATEWAY_URL || undefined,
+  jwtSecret: process.env.JWT_SECRET || undefined,
   projectMapBuild: process.env.PROJECT_MAP_BUILD === "1",
 });

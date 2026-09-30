@@ -1,6 +1,8 @@
 // 领域异常：services 用 throw 表达「拒绝」，src/app.ts 的 setErrorHandler
 // 统一映射成错误信封 { error: { code, message, requestId, ...extra } }。
 // 路由里不许手写 reply.code(4xx).send(...)。
+// 请求形状错（zod 校验失败）不是领域异常：setErrorHandler 直接出 400 VALIDATION_ERROR（题目 2.3）；
+// 这里的 Invalid（422）留给「形状对、业务上不成立」的拒绝。
 //
 // ErrorCode 是联合类型：新增机器码必须在这里登记，tsc 保证不会有漏网的字面量。
 
@@ -9,8 +11,13 @@ export type ErrorCode =
   | "FORBIDDEN"
   | "VALIDATION_ERROR"
   | "INTERNAL"
-  | "EXAMPLE_NOT_FOUND"
-  | "EXAMPLE_NAME_TAKEN";
+  // ---- 账号（#6，题目 2.3 accounts 端点 + A1）----
+  | "ACCOUNT_NOT_FOUND"
+  | "ILLEGAL_TRANSITION"
+  | "CAS_CONFLICT"
+  | "ACCOUNT_UNAVAILABLE"
+  // 网关整体不可用 / 网络错（502）：不是业务拒绝，前端按它提示「稍后再试」
+  | "GATEWAY_ERROR";
 
 export type ErrorExtra = Record<string, unknown>;
 
@@ -69,7 +76,7 @@ export class Conflict extends DomainError {
   }
 }
 
-/** 422：输入本身在语义上不成立（格式对但业务上不合法） */
+/** 422：输入本身在语义上不成立（格式对但业务上不合法；纯形状错是 400，由 setErrorHandler 处理） */
 export class Invalid extends DomainError {
   constructor(
     code: ErrorCode = "VALIDATION_ERROR",
@@ -77,5 +84,19 @@ export class Invalid extends DomainError {
     extra?: ErrorExtra,
   ) {
     super(422, code, message, extra);
+  }
+}
+
+/**
+ * 502：请求本身没问题，是依赖的外部服务（消息网关 / Agent 服务）不可用或回了不可理解的东西。
+ * 不是业务拒绝，前端按它提示「稍后再试」；结果未知的外部调用不在这里翻译，走 outbox 的 unknown。
+ */
+export class BadGateway extends DomainError {
+  constructor(
+    code: ErrorCode = "GATEWAY_ERROR",
+    message = "外部服务暂时不可用，请稍后再试",
+    extra?: ErrorExtra,
+  ) {
+    super(502, code, message, extra);
   }
 }

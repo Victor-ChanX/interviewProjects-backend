@@ -52,6 +52,10 @@ setGlobalDispatcher(agent);
 // ---- 2. 临时 schema ----
 const BASE_URL = process.env.TEST_DATABASE_URL ?? process.env.DATABASE_URL;
 
+// access token 签名密钥：buildApp 缺了拒绝构建（src/core/config.ts）。测试不依赖开发者的 shell 有没有
+// 导出它，这里给一个测试专用值；显式设了的（CI）沿用。
+process.env.JWT_SECRET ??= "test-only-jwt-secret-0123456789abcdef";
+
 if (!BASE_URL) {
   throw new Error(
     "测试需要真实 PostgreSQL：设置 TEST_DATABASE_URL（或 DATABASE_URL），例如 postgresql://ci:ci@localhost:5432/ci",

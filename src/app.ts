@@ -16,11 +16,16 @@ import {
   type ZodTypeProvider,
 } from "fastify-type-provider-zod";
 
-import exampleRoutes from "./api/routes/example.js";
+import accountRoutes from "./api/routes/accounts.js";
+import authRoutes from "./api/routes/auth.js";
 import healthRoutes from "./api/routes/health.js";
+import { config } from "./core/config.js";
 import { DomainError, type ErrorCode } from "./core/errors.js";
+import { assertJwtSecretConfigured } from "./core/jwt.js";
+import type { GatewayClient } from "./services/gateway-client.js";
 // 副作用 import：让 .meta({ id }) 的 schema 在 app.swagger() 之前已进 z.globalRegistry
-import "./schemas/example.js";
+import "./schemas/account.js";
+import "./schemas/auth.js";
 import "./schemas/health.js";
 
 export type ErrorEnvelope = {
@@ -42,16 +47,33 @@ export type BuildAppOptions = {
    * 之后再挂 onRoute 已经晚了；只有在 register 之前挂上才收得到。
    */
   onRoute?: onRouteHookHandler;
+  /**
+   * 消息网关客户端（#6）。不给则各路由用 GATEWAY_URL（gatewayClientFromConfig，惰性）。
+   * 测试把 src/sim/gateway 起在 listen(0) 上后经这里注入 —— 不能事后 app.decorate：
+   * 本函数是 async、返回 Fastify 实例，await 时 thenable 已把路由插件装载完。
+   */
+  gateway?: GatewayClient;
 };
 
 export async function buildApp(
   opts: BuildAppOptions = {},
 ): Promise<FastifyInstance> {
+  // 必填配置在这里查而不是 config.ts：模拟器（src/sim）也 import config，但只有 HTTP 服务签 token。
+  // 生成地图 / 导 openapi 时不签不验，允许缺。
+  if (!config.projectMapBuild) assertJwtSecretConfigured();
+
   const app = Fastify({
     logger: opts.logger !== false,
     // 不自动给 GET 配 HEAD：让 onRoute 收到的路由与 openapi 的 paths×methods 一一对应
     exposeHeadRoutes: false,
+    // 网关传了 x-request-id 就沿用（错误信封与日志里的 requestId 都是 request.id），没传才自生成
+    requestIdHeader: "x-request-id",
   }).withTypeProvider<ZodTypeProvider>();
+
+  // 响应也带上 requestId：客户端拿着它就能对上服务端日志
+  app.addHook("onSend", async (req, reply) => {
+    reply.header("x-request-id", req.id);
+  });
 
   if (opts.onRoute) {
     app.addHook("onRoute", opts.onRoute);
@@ -89,8 +111,9 @@ export async function buildApp(
       envelope(err.statusCode, err.code, err.message, err.extra);
       return;
     }
+    // 请求体 / 参数形状错：题目 2.3 约定 400 VALIDATION_ERROR（业务规则不合法仍是 Invalid → 422）
     if (hasZodFastifySchemaValidationErrors(err)) {
-      envelope(422, "VALIDATION_ERROR", "请求参数不合法", {
+      envelope(400, "VALIDATION_ERROR", "请求参数不合法", {
         issues: err.validation.map((v) => ({
           path: v.instancePath,
           message: v.message,
@@ -109,7 +132,11 @@ export async function buildApp(
 
   // 不 await：路由插件排队到 app.ready() 再装载（onRoute 已在上面挂好）。
   void app.register(healthRoutes);
-  void app.register(exampleRoutes, { prefix: "/api/examples" });
+  void app.register(authRoutes);
+  void app.register(accountRoutes, {
+    prefix: "/api/accounts",
+    gateway: opts.gateway,
+  });
 
   return app;
 }
