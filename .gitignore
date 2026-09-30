@@ -5,3 +5,6 @@ coverage/
 src/db/generated/
 .env
 .env.*
+
+# 示例配置要进仓
+!.env.example
