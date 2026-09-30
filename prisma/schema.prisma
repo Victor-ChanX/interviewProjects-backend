@@ -1,0 +1,31 @@
+// 数据模型（Prisma 7）。只描述结构，不写查询（查询在 src/services）。
+// 改这里之后必须 npm run db:migrate（prisma migrate dev --create-only），读生成的 migration.sql，
+// 与本文件同 commit。约定：表名用 @@map 的 snake_case；列名用 @map；枚举用 enum；
+// 时间列 @db.Timestamptz（Prisma 默认 timestamp(3) 不带时区）。
+// Prisma schema 表达不了的约束（部分唯一索引、CHECK）：用 --create-only 生成空迁移后手写 SQL，
+// 并在对应 model 上加注释指向那个迁移目录。
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/db/generated"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum ExampleStatus {
+  active
+  archived
+
+  @@map("example_status")
+}
+
+model Example {
+  id        Int           @id @default(autoincrement())
+  name      String        @unique
+  status    ExampleStatus @default(active)
+  createdAt DateTime      @default(now()) @map("created_at") @db.Timestamptz
+
+  @@map("examples")
+}

@@ -1,0 +1,7 @@
+node_modules
+dist/
+coverage/
+# prisma generate 的产物：npm install 的 postinstall / CI 的 db:generate 重新生成，不进 git
+src/db/generated/
+.env
+.env.*

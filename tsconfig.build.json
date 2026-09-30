@@ -1,0 +1,13 @@
+{
+  // 构建（npm run build = tsc -p tsconfig.build.json）：只编 src，测试与脚本不进 dist。
+  // 继承 tsconfig.json 的语言选项，只改输出相关的几项。
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "rootDir": "src",
+    "outDir": "dist",
+    "sourceMap": true
+  },
+  "include": ["src"],
+  "exclude": ["src/**/*.test.ts"]
+}

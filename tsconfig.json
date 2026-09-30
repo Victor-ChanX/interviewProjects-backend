@@ -1,0 +1,27 @@
+{
+  // 仓根 tsconfig.json：tsc --noEmit 的范围 = src + tests + scripts + 根目录的 *.ts / *.mts
+  // （vitest.config.mts、prisma.config.ts —— eslint 的 projectService 要求每个被 lint 的 TS 文件
+  // 都在某个 tsconfig 的 include 里）。构建产物由 tsconfig.build.json 单独管（只编 src）。
+  // src/db/generated（prisma generate 的 TS 源码）**不能 exclude**：services import 它的类型，
+  // 它随 src 一起编译进 dist；只是 eslint / prettier 忽略它。
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    // NodeNext：按 package.json 的 "type": "module" 走 ESM，相对导入必须带 .js 后缀
+    // （`import x from "./x.js"`，tsc 不会替你补）。verbatimModuleSyntax 要求类型导入写
+    // `import type`，运行时不会留下多余的 import。
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "verbatimModuleSyntax": true,
+    "types": ["node"],
+    "strict": true,
+    // 索引访问结果带 undefined：`rows[0]` 必须判空，$queryRaw 的结果数组最容易漏。
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "noEmit": true
+  },
+  "include": ["src", "tests", "scripts", "*.ts", "*.mts"]
+}

@@ -1,0 +1,17 @@
+# Prettier 门禁范围 = 全仓（`npm run format:check` 即 `prettier --check .`），
+# 另外自动跳过 .gitignore 里的东西（node_modules、dist、coverage …）。下面是刻意排除的：
+
+# 结构地图、ER 图、openapi 快照：脚本生成，--check 比对的是脚本自己的输出
+# 构建产物与覆盖率报告（.gitignore 里也有，写在这里是为了没有 .gitignore 的环境）
+dist
+coverage
+# prisma migrate 生成的 migration.sql：格式由 Prisma 定（db:check 用 migrate diff 比对的是语义，
+# 不是文本），格式化只会让下次生成的 diff 变脏
+prisma/migrations
+# prisma generate 的产物：不进 git，每次 npm install 重生成
+src/db/generated
+# npm 自己维护
+package-lock.json
+# Markdown 不纳入：中文表格会被整表重排、`4~5` 这类写法会被改成 `~~` 渲染成删除线，
+# 噪音远大于收益。改 md 只动自己那几行。
+*.md
