@@ -13,12 +13,22 @@ export const DeliveryStatus = z
 export type DeliveryStatus = z.infer<typeof DeliveryStatus>;
 
 /**
+ * 附件状态：downloading（排着 / 正在下载，含重试中）· ready（已在本地）· expired（网关 404，已过期）·
+ * failed（放弃：重试耗尽 / 不可信地址 / 太大 / 写盘失败）· purged（超过保留期已删）。
+ */
+export const MediaStatus = z
+  .enum(["downloading", "ready", "expired", "failed", "purged"])
+  .meta({ id: "MediaStatus" });
+export type MediaStatus = z.infer<typeof MediaStatus>;
+
+/**
  * 题目 2.3：`{ msgId, clientMsgId, senderPlatformUserId, isOwn, text, sentAt, deliveryStatus, failCode }`。
  * - msgId：网关的消息 id；自己发的消息在 message_sent 之前为 null（从 queued 起就在列表里）。
  * - clientMsgId：出站幂等键；入站行为 null。
  * - deliveryStatus / failCode：仅出站行有值。
  * - sentAt：时间线排序键；出站行先是受理时刻，发出后改为网关的 sentAt。
  * - mediaUrl / localFilePath（题目 C1）：网关给的附件地址；下载到本地后的路径（没下载 / 下载放弃 / 已过保留期被清理为 null）。
+ * - mediaStatus（后端 #59）：附件现在的状态，没有附件为 null；ready 时文件经 GET /api/groups/:id/messages/:msgId/media 取。
  */
 export const MessageRead = z
   .object({
@@ -32,12 +42,18 @@ export const MessageRead = z
     failCode: z.string().nullable(),
     mediaUrl: z.string().nullable(),
     localFilePath: z.string().nullable(),
+    mediaStatus: MediaStatus.nullable(),
   })
   .meta({ id: "MessageRead" });
 export type MessageRead = z.infer<typeof MessageRead>;
 
 export const GroupIdParams = z.object({
   id: z.string().min(1),
+});
+
+export const GroupMessageParams = z.object({
+  id: z.string().min(1),
+  msgId: z.string().min(1),
 });
 
 /** 题目 2.3：`?before=&limit=50`。before 是上一页返回的 nextCursor（不透明字符串），limit 上限 200。 */

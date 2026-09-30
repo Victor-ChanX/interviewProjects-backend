@@ -64,6 +64,8 @@ export type ErrorCode =
   | "SIM_CONTROLS_DISABLED"
   // ---- 就绪检查（#57，GET /api/health/ready）：数据库 / schema / 调度器心跳有一项不行（503）----
   | "NOT_READY"
+  // ---- 媒体文件（#59，GET /api/groups/:id/messages/:msgId/media）：消息不存在 / 没有附件 / 还没下好 / 已清理（404）----
+  | "MEDIA_NOT_AVAILABLE"
   // 指定的发送者是本平台托管的账号（422：外部成员发言不能冒用自己的账号，自己发走 /send）
   | "SIM_SENDER_IS_MANAGED"
   /** 没有这个接口（未匹配的路由） */

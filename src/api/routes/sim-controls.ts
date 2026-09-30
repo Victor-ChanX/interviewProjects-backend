@@ -51,6 +51,8 @@ export default async function simControlRoutes(
     "/api/groups/:id/simulate-inbound",
     {
       onRequest: [requireUser, requireRole("admin")],
+      // 可带一张 ≤ 1 MB 的图片（base64 后约 1.4 MB），默认 1 MB 的请求体上限不够
+      bodyLimit: 2 * 1024 * 1024,
       schema: {
         summary:
           "演示用：以外部成员身份往群里推一条消息（经网关模拟器，随后照常进入时间线并可触发 Agent）",

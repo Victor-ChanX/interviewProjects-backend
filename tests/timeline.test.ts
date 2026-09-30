@@ -115,6 +115,7 @@ describe("GET /api/groups/:id/messages", () => {
       failCode: null,
       mediaUrl: null,
       localFilePath: null,
+      mediaStatus: null,
     });
     expect(body.items[2]).toEqual({
       msgId: "gw-1",
@@ -127,6 +128,7 @@ describe("GET /api/groups/:id/messages", () => {
       failCode: null,
       mediaUrl: null,
       localFilePath: null,
+      mediaStatus: null,
     });
     expect(body.items[0]).toMatchObject({
       deliveryStatus: "failed",

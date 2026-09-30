@@ -28,6 +28,7 @@ export type SimControlClient = {
     gatewayGroupId: string;
     senderPlatformUserId: string;
     text: string;
+    media?: { contentType: string; base64: string };
   }): Promise<void>;
 };
 
@@ -51,6 +52,7 @@ export function createSimControlClient(opts: {
             groupId: input.gatewayGroupId,
             senderPlatformUserId: input.senderPlatformUserId,
             text: input.text,
+            ...(input.media ? { media: input.media } : {}),
           }),
           signal: AbortSignal.timeout(SIM_TIMEOUT_MS),
         });
@@ -136,6 +138,7 @@ export async function simulateInbound(
     gatewayGroupId: group.gatewayGroupId,
     senderPlatformUserId: input.senderPlatformUserId,
     text: input.text,
+    ...(input.media ? { media: input.media } : {}),
   });
   deps.log?.info(
     {

@@ -102,6 +102,38 @@ describe("模拟外部成员发言（#46）", () => {
     ]);
   });
 
+  it("可带一张图片：模拟器收下的消息带 mediaUrl（随后走 C1 下载链路）；超过 1 MB / 不支持的类型 400", async () => {
+    const { group, gatewayGroupId } = await activeGroup();
+    const png = Buffer.from("89504e470d0a1a0a", "hex");
+    const res = await push(app, group.id, {
+      senderPlatformUserId: "ext-alice",
+      text: "看图",
+      media: { contentType: "image/png", base64: png.toString("base64") },
+    });
+    expect(res.statusCode).toBe(202);
+    const [m] = (
+      await gateway.inject({ method: "GET", url: "/_sim/state" })
+    ).json<{ messages: { groupId: string; mediaUrl?: string }[] }>().messages;
+    expect(m).toMatchObject({ groupId: gatewayGroupId });
+    expect(m?.mediaUrl).toMatch(/\/media\//);
+
+    const big = await push(app, group.id, {
+      senderPlatformUserId: "ext-alice",
+      text: "大图",
+      media: {
+        contentType: "image/png",
+        base64: Buffer.alloc(1024 * 1024 + 10).toString("base64"),
+      },
+    });
+    expect(big.statusCode).toBe(400);
+    const pdf = await push(app, group.id, {
+      senderPlatformUserId: "ext-alice",
+      text: "文档",
+      media: { contentType: "application/pdf", base64: "AAAA" },
+    });
+    expect(pdf.statusCode).toBe(400);
+  });
+
   it("开关：GET /api/sim-controls 按注入的客户端回 enabled；关着时代推 409 SIM_CONTROLS_DISABLED、不碰模拟器", async () => {
     const on = await app.inject({
       method: "GET",

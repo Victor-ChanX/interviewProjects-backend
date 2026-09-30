@@ -9,7 +9,7 @@ async function main(): Promise<void> {
   const stateFile = config.simGatewayStateFile;
   const app = await buildGatewayApp({
     logger: true,
-    publicUrl: `http://localhost:${port}`,
+    publicUrl: config.simGatewayPublicUrl ?? `http://localhost:${port}`,
     stateFile,
   });
 

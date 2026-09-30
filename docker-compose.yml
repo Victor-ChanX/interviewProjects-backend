@@ -41,6 +41,8 @@ services:
       <<: *server-env
       SIM_GATEWAY_PORT: "8100"
       SIM_GATEWAY_STATE_FILE: /data/gateway-sim.json
+      # mediaUrl 的前缀要与 backend 的 GATEWAY_URL 同源（后端只下载网关自己的地址，题目 C1）
+      SIM_GATEWAY_PUBLIC_URL: http://gateway-sim:8100
     volumes:
       - gateway-data:/data
     expose:

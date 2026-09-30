@@ -59,6 +59,7 @@ curl -s localhost:8000/api/health/ready  # 就绪：数据库 / schema / worker 
 | `CORS_ORIGINS` | 不设（不开 CORS） | 允许跨域调用的来源，逗号分隔；控制台走同源反代，用不到 |
 | `LLM_AGENT_ADMIN_TOKEN` 等 | — | 真实 LLM 版 Agent 的配置，见下文「接入真实 LLM」 |
 | `SIM_GATEWAY_PORT` / `SIM_AGENT_PORT` | 8100 / 8200 | 两个模拟器的端口 |
+| `SIM_GATEWAY_PUBLIC_URL` | `http://localhost:<SIM_GATEWAY_PORT>` | 网关模拟器生成 mediaUrl 的前缀，要与后端的 `GATEWAY_URL` 同源（后端只下载网关自己的地址） |
 | `SIM_GATEWAY_STATE_FILE` | 不设（纯内存） | 网关模拟器的状态文件：设了则重启不丢账号、群与事件历史（Docker Compose 部署设在 `gateway-data` 卷） |
 
 ### 常见问题
@@ -108,7 +109,10 @@ curl -s localhost:8000/api/groups/<id>/simulate-inbound -H "$H" -H 'content-type
   -d '{"senderPlatformUserId":"ext-alice","text":"请问活动几点开始？"}'        # 202；消息经事件流进入时间线
 ```
 
-群开着 `agentEnabled` 时会随之触发一次 agent run。不经后端、直接打模拟器也行：
+群开着 `agentEnabled` 时会随之触发一次 agent run。请求体可带一张图片
+`"media": { "contentType": "image/png", "base64": "…" }`（png / jpeg / gif / webp，大小上限见 `src/schemas/sim-control.ts` 的 SIMULATE_MEDIA_MAX_BYTES）：模拟器给这条消息生成 mediaUrl，
+后端按题目 C1 下载到本地，控制台时间线显示图片（`GET /api/groups/:id/messages/:msgId/media` 取文件，消息的 `mediaStatus`
+表示下载中 / 已就绪 / 已过期 / 失败 / 已清理）。不经后端、直接打模拟器也行：
 `curl -s -X POST localhost:8100/_sim/push -H 'content-type: application/json' -d '{"kind":"message","groupId":"<网关群 ID>","senderPlatformUserId":"ext-alice","text":"hi"}'`。
 
 ## 复现题目 2.4 的典型场景

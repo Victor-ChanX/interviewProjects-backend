@@ -17,6 +17,7 @@ import {
   it,
 } from "vitest";
 
+import { buildApp } from "../src/app.js";
 import type { Clock } from "../src/core/clock.js";
 import { logger } from "../src/core/logger.js";
 import { closeDb, getDb } from "../src/db/client.js";
@@ -39,7 +40,8 @@ import {
   purgeExpiredMedia,
 } from "../src/services/media-service.js";
 import { buildGatewayApp } from "../src/sim/gateway/app.js";
-import { makeAgentRun, makeGroup, makeMessage } from "./factories.js";
+import { mediaStatusOf } from "../src/services/message-service.js";
+import { loginAs, makeAgentRun, makeGroup, makeMessage } from "./factories.js";
 import { truncateAll } from "./setup.js";
 
 const silent = logger.child({}, { level: "silent" });
@@ -303,6 +305,89 @@ describe("媒体文件（C1）", () => {
     expect(names).toHaveLength(2);
     expect(names[0]).not.toBe(names[1]);
     expect(await readFile(first)).toEqual(PNG); // 第一份没被第二次覆盖 / 删除
+  });
+
+  describe("附件状态与控制台取文件（#59）", () => {
+    let app: FastifyInstance;
+    beforeAll(async () => {
+      app = await buildApp({ logger: false });
+      await app.ready();
+    });
+    afterAll(async () => {
+      await app.close();
+    });
+
+    const messageEvents = () =>
+      getDb().wsEvent.count({ where: { type: "message" } });
+
+    it("状态随下载推进：downloading → ready；状态变化同一事务推一条 message 事件（控制台据此重拉）", async () => {
+      const msg = await pushMedia();
+      expect(mediaStatusOf(msg)).toBe("downloading");
+      const before = await messageEvents();
+      await download();
+      expect(mediaStatusOf(await row(msg.id))).toBe("ready");
+      expect(await messageEvents()).toBe(before + 1);
+    });
+
+    it("放弃 / 过期 / 清理后的状态：failed / expired / purged；没有附件为 null", async () => {
+      expect(
+        mediaStatusOf({
+          mediaUrl: null,
+          localFilePath: null,
+          mediaPurgedAt: null,
+          mediaError: null,
+          mediaNextAttemptAt: null,
+        }),
+      ).toBeNull();
+      const expired = await pushMedia({ expiresAfterMs: 0 });
+      clock.advance(1);
+      await download();
+      expect(mediaStatusOf(await row(expired.id))).toBe("expired");
+
+      const tooBig = await pushMedia();
+      await downloadDueMedia({
+        clock,
+        gateway: client,
+        store,
+        log: silent,
+        maxBytes: 1,
+      });
+      expect(mediaStatusOf(await row(tooBig.id))).toBe("failed");
+
+      const old = await pushMedia();
+      await download();
+      clock.advance(31 * DAY_MS);
+      const before = await messageEvents();
+      await purge();
+      expect(mediaStatusOf(await row(old.id))).toBe("purged");
+      expect(await messageEvents()).toBeGreaterThan(before);
+    });
+
+    it("GET /api/groups/:id/messages/:msgId/media：下好了返回文件字节与 Content-Type；没下好 404 MEDIA_NOT_AVAILABLE；要登录", async () => {
+      const viewer = await loginAs(app, "viewer");
+      const msg = await pushMedia();
+      const url = `/api/groups/${group.id}/messages/${msg.msgId}/media`;
+
+      const notYet = await app.inject({ method: "GET", url, headers: viewer });
+      expect(notYet.statusCode).toBe(404);
+      expect(notYet.json()).toMatchObject({
+        error: { code: "MEDIA_NOT_AVAILABLE" },
+      });
+
+      await download();
+      const ok = await app.inject({ method: "GET", url, headers: viewer });
+      expect(ok.statusCode).toBe(200);
+      expect(ok.headers["content-type"]).toBe("image/png");
+      expect(ok.rawPayload).toEqual(PNG);
+
+      expect((await app.inject({ method: "GET", url })).statusCode).toBe(401);
+      const missing = await app.inject({
+        method: "GET",
+        url: `/api/groups/${group.id}/messages/m-nope/media`,
+        headers: viewer,
+      });
+      expect(missing.statusCode).toBe(404);
+    });
   });
 
   describe("清理", () => {

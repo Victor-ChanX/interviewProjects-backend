@@ -21,6 +21,7 @@ import { randomBytes } from "node:crypto";
 import {
   mkdir,
   readdir,
+  readFile,
   rename,
   stat,
   unlink,
@@ -30,14 +31,17 @@ import { extname, join } from "node:path";
 
 import { type Clock, systemClock } from "../core/clock.js";
 import { config } from "../core/config.js";
+import { NotFound } from "../core/errors.js";
 import type { Logger } from "../core/logger.js";
 import { getDb } from "../db/client.js";
+import type { Prisma } from "../db/generated/client.js";
 import {
   type GatewayClient,
   GatewayResponseError,
   MediaTooLargeError,
   UntrustedMediaUrlError,
 } from "./gateway-client.js";
+import { emitWsEvent } from "./ws-events.js";
 
 // ---- 常量 ------------------------------------------------------------------------------
 
@@ -283,14 +287,18 @@ async function downloadOne(
     deps.log?.error({ ...ctx, err, next }, "媒体文件写盘失败，稍后再试");
     return "retrying";
   }
-  const recorded = await getDb().message.updateMany({
-    where: { id: row.id, localFilePath: null },
-    data: {
-      localFilePath: path,
-      mediaFetchedAt: clock.now(),
-      mediaNextAttemptAt: null,
-      mediaError: null,
-    },
+  const recorded = await getDb().$transaction(async (tx) => {
+    const r = await tx.message.updateMany({
+      where: { id: row.id, localFilePath: null },
+      data: {
+        localFilePath: path,
+        mediaFetchedAt: clock.now(),
+        mediaNextAttemptAt: null,
+        mediaError: null,
+      },
+    });
+    if (r.count === 1) await announceMediaChange(tx, row.id);
+    return r;
   });
   if (recorded.count === 0) {
     // 别的副本抢先记好了（租约过期后被重新领取）：这份是多余的，删掉
@@ -306,12 +314,36 @@ async function abandon(
   code: string,
   err?: unknown,
 ): Promise<void> {
-  await getDb().message.updateMany({
-    where: { id: messageId, localFilePath: null },
-    data: {
-      mediaNextAttemptAt: null,
-      mediaError: err === undefined ? code : `${code}: ${describe(err)}`,
-    },
+  await getDb().$transaction(async (tx) => {
+    const r = await tx.message.updateMany({
+      where: { id: messageId, localFilePath: null },
+      data: {
+        mediaNextAttemptAt: null,
+        mediaError: err === undefined ? code : `${code}: ${describe(err)}`,
+      },
+    });
+    if (r.count === 1) await announceMediaChange(tx, messageId);
+  });
+}
+
+/**
+ * 附件状态变了（下载好 / 放弃 / 清理 / 文件丢了重排）：同一事务推一条 ws `message` 事件（与入站消息同形），
+ * 控制台据此重拉时间线、换掉「下载中」的占位（后端 #59）。
+ */
+async function announceMediaChange(
+  tx: Prisma.TransactionClient,
+  messageId: string,
+): Promise<void> {
+  const m = await tx.message.findUnique({
+    where: { id: messageId },
+    select: { groupId: true, msgId: true, isOwn: true, sentAt: true },
+  });
+  if (!m) return;
+  await emitWsEvent(tx, "message", {
+    groupId: m.groupId,
+    msgId: m.msgId,
+    isOwn: m.isOwn,
+    sentAt: m.sentAt.toISOString(),
   });
 }
 
@@ -364,7 +396,10 @@ export async function purgeExpiredMedia(
             SELECT 1 FROM agent_runs ar
             WHERE ar.group_id = m.group_id AND ar.status = 'running'
           )`;
-      if (count === 1) done.push(r.local_file_path);
+      if (count === 1) {
+        done.push(r.local_file_path);
+        await announceMediaChange(tx, r.id);
+      }
     }
     return done;
   });
@@ -409,6 +444,11 @@ export async function purgeExpiredMedia(
   }
 
   const missingRescheduled = missing.length;
+  if (missingRescheduled > 0) {
+    await db.$transaction(async (tx) => {
+      for (const m of missing) await announceMediaChange(tx, m.id);
+    });
+  }
   if (
     cleared.length > 0 ||
     orphansRemoved > 0 ||
@@ -431,4 +471,36 @@ export async function purgeExpiredMedia(
     orphansRemoved,
     missingRescheduled,
   };
+}
+
+/**
+ * 给控制台取一条消息已下载到本地的附件（后端 #59）：按群 + 网关 msgId 找消息，读 localFilePath 指向的文件。
+ * 没有这条消息 / 没有附件 / 还没下好 / 已清理 / 文件不在了，一律 404 MEDIA_NOT_AVAILABLE（控制台据 mediaStatus 显示原因）。
+ * Content-Type 按文件扩展名（下载时就是按网关给的 Content-Type 起的扩展名）。
+ */
+export async function readMessageMedia(
+  groupId: string,
+  msgId: string,
+): Promise<{ bytes: Buffer; contentType: string }> {
+  const unavailable = (): NotFound =>
+    new NotFound("MEDIA_NOT_AVAILABLE", "这条消息没有可查看的附件", {
+      groupId,
+      msgId,
+    });
+  const m = await getDb().message.findUnique({
+    where: { groupId_msgId: { groupId, msgId } },
+    select: { localFilePath: true },
+  });
+  if (!m?.localFilePath) throw unavailable();
+  let bytes: Buffer;
+  try {
+    bytes = await readFile(m.localFilePath);
+  } catch {
+    throw unavailable();
+  }
+  const ext = extname(m.localFilePath).toLowerCase();
+  const contentType =
+    Object.entries(EXTENSIONS).find(([, e]) => e === ext)?.[0] ??
+    "application/octet-stream";
+  return { bytes, contentType };
 }

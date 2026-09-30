@@ -16,7 +16,11 @@
 import { NotFound } from "../core/errors.js";
 import { getDb } from "../db/client.js";
 import type { Message, Prisma } from "../db/generated/client.js";
-import type { MessagePage, MessageRead } from "../schemas/message.js";
+import type {
+  MediaStatus,
+  MessagePage,
+  MessageRead,
+} from "../schemas/message.js";
 import {
   clampLimit,
   CURSOR_PAGE_DEFAULT_LIMIT,
@@ -48,7 +52,26 @@ export function toMessageRead(row: Message): MessageRead {
     failCode: row.failCode,
     mediaUrl: row.mediaUrl,
     localFilePath: row.localFilePath,
+    mediaStatus: mediaStatusOf(row),
   };
+}
+
+/** 附件状态（后端 #59）：从下载记账的几列推出来，见 schemas/message.ts 的 MediaStatus */
+export function mediaStatusOf(
+  row: Pick<
+    Message,
+    | "mediaUrl"
+    | "localFilePath"
+    | "mediaPurgedAt"
+    | "mediaError"
+    | "mediaNextAttemptAt"
+  >,
+): MediaStatus | null {
+  if (row.mediaUrl === null) return null;
+  if (row.localFilePath !== null) return "ready";
+  if (row.mediaPurgedAt !== null) return "purged";
+  if (row.mediaNextAttemptAt !== null) return "downloading";
+  return row.mediaError === "MEDIA_EXPIRED" ? "expired" : "failed";
 }
 
 export async function listMessages(
