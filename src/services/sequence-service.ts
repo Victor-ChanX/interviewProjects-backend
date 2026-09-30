@@ -22,7 +22,8 @@
 //   （skippedAt = now，视为此刻「发出」，下一步据此排期）；有账号 → 出站入队（outbox，source = sequence）→ 步骤 accepted
 //   + clientMsgId，同一事务。
 // - 「发出」= 收到 message_sent：outbox-service 的 settle 在消息进终局（sent / failed / cancelled）时调 onOutboundSettled，
-//   同一事务里把步骤改 sent（sentAt = 网关 sentAt）/ failed，并排下一步（sent 以 sentAt 为基准，failed 以此刻为基准）。
+//   同一事务里把步骤改 sent / failed，并排下一步。基准都是**此刻**（收到 message_sent / 确认落地的时刻，步骤的 sentAt
+//   也记它）：B1「发出」指收到 message_sent 的时刻，不是网关报的 sentAt —— 两边时钟有偏差、事件晚到时后者会让排期整体偏移。
 // - 群 unreachable → run stopped 由 group-service.markGroupUnreachable 做（同事务写 ws_events）；推进时发现群已不是
 //   active（例如 leave-all 后 left）→ run failed。
 //
@@ -187,11 +188,19 @@ export function extractPlaceholders(text: string): string[] {
   return keys;
 }
 
-/** 用最终取值替换 `{key}`；解析不到的原样保留（预检保证发送时不会出现）。 */
+/** 用最终取值替换 `{key}`；解析不到的原样保留（预检保证发送时不会出现）。只认自有属性（见 emptyMap）。 */
 export function renderTemplate(template: string, vars: VarMap): string {
   return template.replace(PLACEHOLDER_RE, (whole, key: string) =>
-    key in vars ? vars[key]! : whole,
+    Object.hasOwn(vars, key) ? (vars[key] ?? whole) : whole,
   );
+}
+
+/**
+ * 以占位符名为下标的取值表：不继承 Object.prototype。占位符名匹配 [A-Za-z0-9_]+，`{constructor}`、`{toString}`、
+ * `{__proto__}` 都合法；普通 `{}` 会从原型链上「取到」函数，预检误判为已解析、把函数源码发进群。
+ */
+function emptyMap(): Record<string, string> {
+  return Object.create(null) as Record<string, string>;
 }
 
 /**
@@ -203,8 +212,8 @@ export function resolveVars(
   vars: VarMap,
   stepVars: Record<string, VarMap>,
 ): ResolvedStep[] {
-  const current: Record<string, string> = {};
-  const source: Record<string, string> = {};
+  const current = emptyMap();
+  const source = emptyMap();
   for (const [key, value] of Object.entries(vars)) {
     // vars 里的 "" 视为未提供
     if (value === "") continue;
@@ -215,15 +224,17 @@ export function resolveVars(
   const ordered = [...steps].sort((a, b) => a.index - b.index);
   const out: ResolvedStep[] = [];
   for (const step of ordered) {
-    const overrides = stepVars[String(step.index)] ?? {};
+    const overrides = Object.hasOwn(stepVars, String(step.index))
+      ? (stepVars[String(step.index)] ?? {})
+      : {};
     for (const [key, value] of Object.entries(overrides)) {
       // stepVars 里的 "" 表示这一步不改
       if (value === "") continue;
       current[key] = value;
       source[key] = `step:${step.index}`;
     }
-    const resolvedVars: VarMap = {};
-    const varSources: VarSourceMap = {};
+    const resolvedVars: VarMap = emptyMap();
+    const varSources: VarSourceMap = emptyMap();
     for (const key of extractPlaceholders(step.text)) {
       const value = current[key];
       if (value === undefined) {
@@ -708,16 +719,13 @@ async function endRun(
 // ---- 出站消息终局 → 步骤（outbox-service.settle 在同一事务里调）------------------------------------
 
 /**
- * 消息进终局：sent → 步骤 sent（sentAt = 网关 sentAt），下一步以 sentAt 为基准排期；failed / cancelled → 步骤 failed
+ * 消息进终局：sent → 步骤 sent（sentAt = 此刻，即收到 message_sent 的时刻），下一步以此刻为基准排期；failed / cancelled → 步骤 failed
  * （failCode = 消息的 failCode），下一步以此刻为基准。幂等：步骤不是 accepted（已结 / 终态级联已改 skipped）就不动。
  * 锁 run 行（FOR UPDATE）与 worker 的领取互斥；run 已不是 running（群 unreachable → stopped）时只改步骤、不排下一步。
  */
 export async function onOutboundSettled(
   tx: Tx,
-  message: Pick<
-    Message,
-    "clientMsgId" | "deliveryStatus" | "sentAt" | "failCode"
-  >,
+  message: Pick<Message, "clientMsgId" | "deliveryStatus" | "failCode">,
   now: Date,
 ): Promise<boolean> {
   if (message.clientMsgId === null) return false;
@@ -742,7 +750,7 @@ export async function onOutboundSettled(
   await tx.sequenceRunStep.update({
     where: { id: step.id },
     data: sent
-      ? { status: "sent", sentAt: message.sentAt }
+      ? { status: "sent", sentAt: now }
       : {
           status: "failed",
           failCode: message.failCode ?? message.deliveryStatus,
@@ -752,7 +760,7 @@ export async function onOutboundSettled(
     where: { id: step.runId },
   });
   if (run.status === "running" && run.currentStepIndex === step.index) {
-    await scheduleNext(tx, run, step, sent ? message.sentAt : now, now);
+    await scheduleNext(tx, run, step, now, now);
   }
   return true;
 }

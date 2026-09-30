@@ -127,6 +127,16 @@ export async function markGroupUnreachableInTx(
         failCode: GROUP_UNREACHABLE_FAIL_CODE,
       },
     });
+    // 这些消息对应的序列步骤随之结掉：run 已 stopped，不会再有人结算它们，否则永远停在 accepted
+    const clientMsgIds = queued
+      .map((m) => m.clientMsgId)
+      .filter((id): id is string => id !== null);
+    if (clientMsgIds.length > 0) {
+      await tx.sequenceRunStep.updateMany({
+        where: { clientMsgId: { in: clientMsgIds }, status: "accepted" },
+        data: { status: "failed", failCode: GROUP_UNREACHABLE_FAIL_CODE },
+      });
+    }
     for (const m of queued) {
       await emitWsEvent(tx, "message", {
         groupId,

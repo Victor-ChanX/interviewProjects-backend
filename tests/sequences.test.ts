@@ -32,6 +32,7 @@ import {
   createSequence,
   NO_ACCOUNT_FAIL_CODE,
   RATE_LIMIT_RECHECK_MS,
+  renderTemplate,
   resolveVars,
   startRun,
 } from "../src/services/sequence-service.js";
@@ -157,6 +158,28 @@ describe("resolveVars（B1 取值规则）", () => {
     expect(out[1]!.resolvedVars.location).toBe("L1");
     expect(out[1]!.varSources.location).toBe("step:1");
     expect(out[2]!.varSources.location).toBe("step:1");
+  });
+
+  it("原型链上的名字不算有值：{constructor} / {toString} / {__proto__} 没提供就是解析不到；提供了照常取值", () => {
+    for (const key of ["constructor", "toString", "__proto__"]) {
+      const steps = [{ index: 1, text: `hi {${key}}` }];
+      expect(() => resolveVars(steps, {}, {})).toThrow(
+        expect.objectContaining({
+          code: "UNRESOLVED_PLACEHOLDER",
+          extra: { stepIndex: 1, key },
+        }),
+      );
+      const vars = JSON.parse(`{"${key}":"v-${key}"}`) as Record<
+        string,
+        string
+      >;
+      const [out] = resolveVars(steps, vars, {});
+      expect(out!.resolvedVars[key]).toBe(`v-${key}`);
+      expect(renderTemplate(steps[0]!.text, out!.resolvedVars)).toBe(
+        `hi v-${key}`,
+      );
+    }
+    expect(renderTemplate("hi {constructor}", {})).toBe("hi {constructor}");
   });
 
   it("解析不到 → Invalid UNRESOLVED_PLACEHOLDER，extra 带 stepIndex 与 key（按步序报第一个）", () => {
@@ -618,7 +641,6 @@ describe("定时序列（#15）", () => {
       const { group, creator } = await _stageGroup();
       const member = await _addMember(group, { id: "acc-m-only" });
       const runId = await _start(group);
-      const t0 = clock.now();
 
       // 没到点：不动
       clock.advance(sec(10) - 1);
@@ -655,10 +677,11 @@ describe("定时序列（#15）", () => {
       ]);
       expect((await run(runId)).currentStepIndex).toBe(1);
 
-      // message_sent：第 1 步 sent（sentAt = 网关的）；第 2 步排到 sentAt + 5s；进度到 2
-      const sentAt1 = new Date(t0.getTime() + sec(12));
+      // message_sent：第 1 步 sent；「发出」= 收到 message_sent 的时刻（B1），不是网关报的 sentAt ——
+      // 这里网关时钟慢 1 秒；第 2 步排到收到时刻 + 5s；进度到 2
       clock.advance(sec(2));
-      await sent(s1.clientMsgId!, sentAt1);
+      const sentAt1 = clock.now();
+      await sent(s1.clientMsgId!, new Date(sentAt1.getTime() - sec(1)));
       let r = await run(runId);
       expect(r.currentStepIndex).toBe(2);
       expect(r.steps[0]).toMatchObject({ status: "sent", sentAt: sentAt1 });
@@ -981,6 +1004,28 @@ describe("定时序列（#15）", () => {
         headers: viewer,
       });
       expect(detail.json()).toMatchObject({ activeSequenceRunId: null });
+    });
+
+    it("群不可写时步骤的消息还在排队：消息 cancelled，步骤随之 failed GROUP_UNREACHABLE（不停在 accepted）", async () => {
+      const { group } = await _stageGroup();
+      const runId = await _start(group);
+      clock.advance(sec(10));
+      await tick();
+      const s1 = await stepOf(runId, 1);
+      expect(s1.status).toBe("accepted");
+      await getDb().$transaction((tx) =>
+        markGroupUnreachableInTx(
+          tx,
+          group.id,
+          "GROUP_WRITE_FORBIDDEN",
+          clock.now(),
+        ),
+      );
+      expect(await stepOf(runId, 1)).toMatchObject({
+        status: "failed",
+        failCode: "GROUP_UNREACHABLE",
+      });
+      expect((await run(runId)).status).toBe("stopped");
     });
 
     it("推进时群已 left（leave-all 之后）→ run failed", async () => {
