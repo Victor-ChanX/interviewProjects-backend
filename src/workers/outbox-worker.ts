@@ -1,7 +1,12 @@
 // 出站派发循环（issue #7）。只编排，不写业务判断：业务全在 src/services/outbox-service.ts。
 //
-// tick = 回收过期领取 → 确认 unknown（by-client-id；确认未发出的回 queued）→ 领取一批（SKIP LOCKED）→ 逐条
-// 调网关并记账。先确认再领取，让「确认未发出 → 重发」落在同一个 tick 里（A2：收到 504 起 5 秒内定态）。
+// 两个循环：
+// - 派发（runDispatchTick）= 领取一批（SKIP LOCKED，每个账号至多一条）→ **并发**调网关并记账。
+//   一批里的消息分属不同账号，互不影响；逐条串行的话一次 send 最慢要十几秒，后面的全被拖住。
+// - 确认（runConfirmTick）= 回收过期领取（领取者死了 → unknown）→ unknown 按 by-client-id 确认（确认未发出的回
+//   queued）。单独一个循环：派发时一次 send
+//   可能挂十几秒，确认不能排在它后面等（A2：收到 504 起 5 秒内定态）。
+// runOutboxTick = 确认 + 派发，按顺序跑一遍（测试直接 await 它，不起循环）；「确认未发出 → 重发」落在同一个 tick 里。
 // 写法是 while + 可打断的 sleep 而不是 setInterval：tick 慢于间隔时不会叠着跑（同一批被领两次的来源之一），
 // stop() 立即打断等待、等在途 tick 完成后返回（优雅停机：不在外部调用中途退出，那正是制造 unknown 的方法）。
 // 排期本身在库里（messages.nextAttemptAt / unknownSince / lockedAt），定时器只是「多久看一次」；
@@ -51,40 +56,68 @@ export function defaultWorkerId(): string {
   return `${hostname()}-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-/** 一个 tick 的全部工作。每一步各自 try/catch：一条坏消息不能让整个 tick 停掉。 */
+/** 确认 + 派发按顺序跑一遍（测试用）。每一步各自 try/catch：一条坏消息不能让整个 tick 停掉。 */
 export async function runOutboxTick(
   deps: OutboxTickDeps,
 ): Promise<OutboxTickStats> {
+  const confirmed = await runConfirmTick(deps);
+  const stats = await runDispatchTick(deps);
+  return { ...stats, ...confirmed };
+}
+
+function serviceDepsOf(deps: OutboxTickDeps) {
   const log =
     deps.log ?? logger.child({ worker: "outbox", workerId: deps.workerId });
-  const stats: OutboxTickStats = {
-    recovered: 0,
-    unknownChecked: 0,
-    claimed: 0,
-    outcomes: { accepted: 0, failed: 0, cancelled: 0, unknown: 0, requeued: 0 },
-  };
-  const serviceDeps = {
+  return {
     clock: deps.clock,
     log,
     gateway: deps.gateway,
     workerId: deps.workerId,
   };
+}
 
+/** 回收过期领取 → unknown 按 by-client-id 确认；返回回收了几条、查了几条。 */
+export async function runConfirmTick(
+  deps: OutboxTickDeps,
+): Promise<{ recovered: number; unknownChecked: number }> {
+  const serviceDeps = serviceDepsOf(deps);
+  const result = { recovered: 0, unknownChecked: 0 };
   try {
-    stats.recovered = await recoverStaleClaims(deps.clock.now(), serviceDeps);
+    result.recovered = await recoverStaleClaims(deps.clock.now(), serviceDeps);
   } catch (err) {
-    log.error({ err }, "回收过期领取失败");
+    serviceDeps.log.error({ err }, "回收过期领取失败");
   }
-
   try {
     const r = await resolveUnknown(
       serviceDeps,
       deps.batchSize ?? DEFAULT_BATCH_SIZE,
     );
-    stats.unknownChecked = r.checked;
+    result.unknownChecked = r.checked;
   } catch (err) {
-    log.error({ err }, "确认 unknown 失败");
+    serviceDeps.log.error({ err }, "确认 unknown 失败");
   }
+  return result;
+}
+
+/** 领取一批 → 并发派发（一批里每个账号至多一条，互不影响）。 */
+export async function runDispatchTick(
+  deps: OutboxTickDeps,
+): Promise<OutboxTickStats> {
+  const serviceDeps = serviceDepsOf(deps);
+  const { log } = serviceDeps;
+  const stats: OutboxTickStats = {
+    recovered: 0,
+    unknownChecked: 0,
+    claimed: 0,
+    outcomes: {
+      accepted: 0,
+      failed: 0,
+      cancelled: 0,
+      unknown: 0,
+      requeued: 0,
+      lost: 0,
+    },
+  };
 
   let claimed: Awaited<ReturnType<typeof claimBatch>> = [];
   try {
@@ -98,18 +131,20 @@ export async function runOutboxTick(
   }
   stats.claimed = claimed.length;
 
-  for (const msg of claimed) {
-    try {
-      const outcome = await dispatchOne(msg, serviceDeps);
-      stats.outcomes[outcome] += 1;
-    } catch (err) {
-      // dispatchOne 自己兜底了记账；到这里的是记账本身抛了（库不可用）。行留着 claimedBy，由回收步骤处理。
-      log.error(
-        { err, messageId: msg.id, clientMsgId: msg.clientMsgId },
-        "派发记账失败",
-      );
-    }
-  }
+  await Promise.all(
+    claimed.map(async (msg) => {
+      try {
+        const outcome = await dispatchOne(msg, serviceDeps);
+        stats.outcomes[outcome] += 1;
+      } catch (err) {
+        // dispatchOne 自己兜底了记账；到这里的是记账本身抛了（库不可用）。行留着 claimedBy，由回收步骤处理。
+        log.error(
+          { err, messageId: msg.id, clientMsgId: msg.clientMsgId },
+          "派发记账失败",
+        );
+      }
+    }),
+  );
   return stats;
 }
 
@@ -133,32 +168,46 @@ export function startOutboxWorker(deps: OutboxWorkerDeps): OutboxWorkerHandle {
     deps.log ?? logger.child({ worker: "outbox", workerId: deps.workerId });
   const sleep = deps.sleep ?? defaultSleep;
   let stopped = false;
-  let pending: { cancel: () => void } | undefined;
+  const pending = new Set<{ cancel: () => void }>();
 
-  const loop = (async () => {
+  const every = async (tick: () => Promise<void>): Promise<void> => {
     while (!stopped) {
-      try {
-        const stats = await runOutboxTick({ ...deps, log });
-        if (stats.claimed > 0 || stats.recovered > 0) {
-          log.info(stats, "outbox tick");
-        }
-      } catch (err) {
-        log.error({ err }, "outbox tick 失败");
-      }
+      await tick();
       if (stopped) break;
       const s = sleep(deps.intervalMs);
-      pending = s;
+      pending.add(s);
       await s.promise;
-      pending = undefined;
+      pending.delete(s);
     }
-  })();
+  };
+
+  const dispatchLoop = every(async () => {
+    try {
+      const stats = await runDispatchTick({ ...deps, log });
+      if (stats.claimed > 0) {
+        log.info(stats, "outbox 派发");
+      }
+    } catch (err) {
+      log.error({ err }, "outbox 派发 tick 失败");
+    }
+  });
+  const confirmLoop = every(async () => {
+    try {
+      const r = await runConfirmTick({ ...deps, log });
+      if (r.recovered > 0 || r.unknownChecked > 0) {
+        log.info(r, "outbox 回收 / 确认 unknown");
+      }
+    } catch (err) {
+      log.error({ err }, "outbox 确认 tick 失败");
+    }
+  });
 
   return {
     // 优雅停机：不再开始新 tick → 打断等待 → 等在途 tick 完成
     async stop() {
       stopped = true;
-      pending?.cancel();
-      await loop;
+      for (const s of pending) s.cancel();
+      await Promise.all([dispatchLoop, confirmLoop]);
     },
   };
 }

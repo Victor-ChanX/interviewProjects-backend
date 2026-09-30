@@ -20,14 +20,26 @@ import type {
   AccountStatus,
   Group,
 } from "../src/db/generated/client.js";
-import { recoverRateLimited } from "../src/services/account-service.js";
+import {
+  enterTerminalInTx,
+  recoverRateLimited,
+} from "../src/services/account-service.js";
 import {
   createGatewayClient,
   type GatewayClient,
 } from "../src/services/gateway-client.js";
-import { claimBatch, enqueueMessage } from "../src/services/outbox-service.js";
+import {
+  claimBatch,
+  dispatchOne,
+  enqueueMessage,
+  STALE_CLAIM_MS,
+} from "../src/services/outbox-service.js";
 import { buildGatewayApp } from "../src/sim/gateway/app.js";
-import { runOutboxTick } from "../src/workers/outbox-worker.js";
+import {
+  runConfirmTick,
+  runDispatchTick,
+  runOutboxTick,
+} from "../src/workers/outbox-worker.js";
 import {
   deliverGatewayReceipt,
   loginAs,
@@ -1152,6 +1164,131 @@ describe("outbox（#7）", () => {
   // ---- 领取顺序 / 回收 ---------------------------------------------------------------------
 
   describe("领取与回收", () => {
+    it("领取后被别的副本按过期回收（→ unknown）：原 worker 调网关前发现领取已丢，不发；确认未发出后只重发一次", async () => {
+      const { group, creator } = await stageGroup();
+      const { clientMsgId, messageId } = await enqueue(group, creator);
+      const [snapshot] = await claimBatch("w1", clock.now(), 10);
+      expect(snapshot).toBeDefined();
+      // w1 卡住（一批里前面的慢请求）超过回收阈值：w2 把它回收成 unknown
+      clock.advance(STALE_CLAIM_MS + 1);
+      const w2 = { clock, gateway: gatewayClient, workerId: "w2", log: silent };
+      expect((await runConfirmTick(w2)).recovered).toBe(1);
+      expect((await row(messageId)).deliveryStatus).toBe("unknown");
+      // w1 终于轮到它：按领取时的快照照发就是第二条 —— 现在调网关前先续约，发现不在手上就不发
+      const outcome = await dispatchOne(snapshot!, {
+        clock,
+        gateway: gatewayClient,
+        workerId: "w1",
+        log: silent,
+      });
+      expect(outcome).toBe("lost");
+      expect((await simState()).sendCalls).toHaveLength(0);
+      // w2 确认没发出（404 满 2 秒）后重发一次：网关恰好一条
+      clock.advance(CONFIRM_WINDOW_MS + 1);
+      await tick("w2");
+      expect(
+        (await simState()).sendCalls.map((c) => [c.clientMsgId, c.status]),
+      ).toEqual([[clientMsgId, 202]]);
+    });
+
+    it("一批里的不同账号并发派发：一个账号的慢 send 不挡别的账号", async () => {
+      const { group, creator } = await stageGroup();
+      const other = await addMember(group);
+      await enqueue(group, creator, "c-1");
+      await enqueue(group, other, "o-1");
+      // 第一个 send 要等第二个 send 也开始了才放行：串行派发会一直等下去
+      let started = 0;
+      let bothStarted!: () => void;
+      const barrier = new Promise<void>((resolve) => {
+        bothStarted = resolve;
+      });
+      const gated: GatewayClient = {
+        ...gatewayClient,
+        async send(input) {
+          started += 1;
+          if (started === 2) bothStarted();
+          // 串行派发时第一个 send 永远等不到第二个开始：用例超时变红
+          await barrier;
+          return gatewayClient.send(input);
+        },
+      };
+      const stats = await runDispatchTick({
+        clock,
+        gateway: gated,
+        workerId: "w1",
+        log: silent,
+      });
+      expect(stats.claimed).toBe(2);
+      expect(stats.outcomes.accepted).toBe(2);
+    });
+
+    it("入队与终态级联互斥：级联进行中入队要等它提交，读到终态就拒绝 —— 不留终态账号的 queued", async () => {
+      const { group } = await stageGroup();
+      const victim = await addMember(group);
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let markLocked!: () => void;
+      const locked = new Promise<void>((resolve) => {
+        markLocked = resolve;
+      });
+      // 进终态的事务先锁住账号行、停在中途
+      const cascade = getDb().$transaction(
+        async (tx) => {
+          await tx.$queryRaw`SELECT id FROM accounts WHERE id = ${victim.id} FOR UPDATE`;
+          markLocked();
+          await gate;
+          await enterTerminalInTx(
+            tx,
+            victim.id,
+            "suspended",
+            "operator",
+            clock.now(),
+          );
+        },
+        { timeout: 10_000 },
+      );
+      await locked;
+      const enqueued = enqueue(group, victim, "racing").then(
+        () => "enqueued",
+        (err: { code?: string }) => err.code,
+      );
+      await sleepMs(100);
+      release();
+      await cascade;
+      expect(await enqueued).toBe("ACCOUNT_UNAVAILABLE");
+      expect(
+        await getDb().message.count({
+          where: { accountId: victim.id, deliveryStatus: "queued" },
+        }),
+      ).toBe(0);
+    });
+
+    it("同账号有一条 unknown 时后面的不领：确认没发出后先重发它、再发后面的（顺序不乱）", async () => {
+      const { group, creator } = await stageGroup();
+      await scenario({
+        send: { responses: [{ status: 504, landAfterMs: null }] },
+      });
+      const m1 = await enqueue(group, creator, "m1");
+      clock.advance(1);
+      const m2 = await enqueue(group, creator, "m2");
+      await tick(); // m1 → 504 → unknown
+      expect((await row(m1.messageId)).deliveryStatus).toBe("unknown");
+      const blocked = await tick();
+      expect(blocked.claimed).toBe(0);
+      expect((await row(m2.messageId)).deliveryStatus).toBe("queued");
+
+      clock.advance(CONFIRM_WINDOW_MS + 1);
+      await tick(); // 确认没发出 → m1 回 queued 并重发
+      await tick(); // 然后才轮到 m2
+      expect((await simState()).sendCalls.map((c) => c.clientMsgId)).toEqual([
+        m1.clientMsgId,
+        m1.clientMsgId,
+        m2.clientMsgId,
+      ]);
+    });
+
     it("同一账号同一时刻只在途一条（顺序发出）；不同账号同一 tick 各发各的", async () => {
       const { group, creator: a } = await stageGroup();
       const b = await addMember(group);
@@ -1242,7 +1379,7 @@ describe("outbox（#7）", () => {
       ]);
     });
 
-    it("级联在途中把行置 cancelled：网关 202 回来不覆盖，只释放领取标记", async () => {
+    it("级联在途中把行置 cancelled（领取之后、调网关之前）：不再发，释放领取标记、投递记录收尾", async () => {
       const { group, creator } = await stageGroup();
       const { messageId } = await enqueue(group, creator);
       const claimed = await claimBatch("w1", clock.now(), 10);
@@ -1259,13 +1396,19 @@ describe("outbox（#7）", () => {
         workerId: "w1",
         log: silent,
       });
-      expect(outcome).toBe("accepted");
+      expect(outcome).toBe("lost");
       expect(await row(messageId)).toMatchObject({
         deliveryStatus: "cancelled",
         failCode: "ACCOUNT_TERMINAL",
         claimedBy: null,
         lockedAt: null,
       });
+      expect((await simState()).sendCalls).toHaveLength(0);
+      expect(
+        (await getDb().outboundAttempt.findMany({ where: { messageId } })).map(
+          (a) => [a.errorCode, a.finishedAt !== null],
+        ),
+      ).toEqual([["NOT_DISPATCHED", true]]);
     });
   });
 });

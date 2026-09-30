@@ -73,6 +73,8 @@ export const DEFAULT_BATCH_SIZE = 20;
 export const NETWORK_TIMEOUT_CODE = "NETWORK_TIMEOUT";
 /** outbound_attempts.errorCode：领取者死了、这次投递没有响应 */
 export const CLAIM_LOST_CODE = "CLAIM_LOST";
+/** outbound_attempts.errorCode：调网关前发现这条已不是 queued（被级联取消等），没有发 */
+export const NOT_DISPATCHED_CODE = "NOT_DISPATCHED";
 export const GATEWAY_UNAVAILABLE_FAIL_CODE = "GATEWAY_UNAVAILABLE";
 
 // ---- 类型 ------------------------------------------------------------------------------
@@ -113,9 +115,12 @@ export type DispatchDeps = OutboxDeps & {
   workerId: string;
 };
 
-/** dispatchOne 的结果：这条消息在本次投递后进了哪个状态（requeued = 回 queued 稍后再试） */
+/**
+ * dispatchOne 的结果：这条消息在本次投递后进了哪个状态（requeued = 回 queued 稍后再试；lost = 调网关前发现
+ * 领取已不在本 worker 手上 / 行已被级联改掉，没有发）
+ */
 export type DispatchOutcome =
-  "accepted" | "failed" | "cancelled" | "unknown" | "requeued";
+  "accepted" | "failed" | "cancelled" | "unknown" | "requeued" | "lost";
 
 export type GatewayDeliveryInput = {
   clientMsgId: string;
@@ -211,6 +216,10 @@ export async function enqueueMessageInTx(
     where: { groupId: input.groupId, accountId: input.accountId },
     select: { accountId: true },
   });
+  // 锁住账号行（共享锁）再判状态：终态级联（先改账号行、再取消它排队的消息）要等本事务提交才动，于是一定
+  // 看得见这里新入队的行；反过来级联先提交，这里读到的就是终态、直接拒绝。不锁的话，「读到 online → 级联提交 →
+  // 本行提交」会留下一条终态账号的 queued，级联永远看不到它（A1）。
+  await tx.$queryRaw`SELECT id FROM accounts WHERE id = ${input.accountId} FOR SHARE`;
   if (!member) {
     throw new Conflict(
       "ACCOUNT_NOT_IN_GROUP",
@@ -263,8 +272,9 @@ export async function enqueueMessageInTx(
  * 一条语句领一批（交互式事务里 $queryRaw 标签模板，Prisma 查询 API 没有 FOR UPDATE）：
  * - queued、未被领、到点（next_attempt_at 空或 ≤ now）；
  * - 账号不在限流期（status = rate_limited 且 rate_limited_until > now 的一条都不领）；
- * - 该账号没有在途的一条（claimed_by 非空），且它是该账号最早的一条 queued —— 顺序发出：排在前面的
- *   还没到点（429 回 queued 的 next_attempt_at 可能比账号的限流截止晚几毫秒、503 退避）时后面的也等着；
+ * - 该账号没有在途的一条（queued 且 claimed_by 非空，或 unknown —— 结果未定的那条确认没发出后要按原位置重发），
+ *   且它是该账号最早的一条 queued —— 顺序发出：排在前面的还没到点（429 回 queued 的 next_attempt_at 可能比
+ *   账号的限流截止晚几毫秒、503 退避）或还在确认时，后面的也等着；
  * - `FOR UPDATE OF m, a SKIP LOCKED`：别的副本正在领同一账号（锁着 accounts 行）时跳过该账号的行，
  *   两个副本不会同时各拿一条同账号的消息；commit 后靠 claimed_by 继续互斥。
  * 一批里同一账号只取最早一条（其余留在 queued，下个 tick 再看），然后标 claimedBy / lockedAt、attempts + 1、
@@ -294,8 +304,10 @@ export async function claimBatch(
         AND NOT EXISTS (
           SELECT 1 FROM messages f
           WHERE f.account_id = m.account_id
-            AND f.delivery_status = 'queued'
-            AND f.claimed_by IS NOT NULL
+            AND (
+              (f.delivery_status = 'queued' AND f.claimed_by IS NOT NULL)
+              OR f.delivery_status = 'unknown'
+            )
         )
         AND NOT EXISTS (
           SELECT 1 FROM messages e
@@ -714,6 +726,30 @@ export async function dispatchOne(
     await recordFailed(msg.id, workerId, "GROUP_UNREACHABLE", {}, deps);
     log?.warn(ctx, "群没有网关 groupId，出站消息 failed");
     return "failed";
+  }
+
+  // 调网关前续约并确认领取还在手上：领取之后这条可能已被别的副本按过期领取回收成 unknown（它会按 by-client-id
+  // 确认后重发），或被级联取消。领取时的快照不作数 —— 照发就是「一条记录对应两条消息」。
+  const renewed = await getDb().message.updateMany({
+    where: { id: msg.id, claimedBy: workerId, deliveryStatus: "queued" },
+    data: { lockedAt: (deps.clock ?? systemClock).now() },
+  });
+  if (renewed.count === 0) {
+    // 还挂着本 worker 的领取标记（行被级联取消）就释放它、给这次投递记录收尾；已被别的副本回收的，回收步骤收过尾了
+    await getDb().$transaction(async (tx) => {
+      const released = await tx.message.updateMany({
+        where: { id: msg.id, claimedBy: workerId },
+        data: { claimedBy: null, lockedAt: null },
+      });
+      if (released.count > 0) {
+        await finishAttempt(tx, msg.id, (deps.clock ?? systemClock).now(), {
+          httpStatus: null,
+          errorCode: NOT_DISPATCHED_CODE,
+        });
+      }
+    });
+    log?.warn(ctx, "领取已不在本 worker 手上（被回收 / 被取消），不发");
+    return "lost";
   }
 
   try {
