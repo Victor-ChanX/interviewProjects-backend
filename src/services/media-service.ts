@@ -56,6 +56,7 @@ export const MEDIA_ERRORS = Object.freeze({
   expired: "MEDIA_EXPIRED",
   unavailable: "MEDIA_UNAVAILABLE",
   untrusted: "MEDIA_URL_UNTRUSTED",
+  writeFailed: "MEDIA_WRITE_FAILED",
 });
 
 // ---- 存储 ------------------------------------------------------------------------------
@@ -242,10 +243,29 @@ async function downloadOne(
     return "retrying";
   }
 
-  const path = await deps.store.write(
-    fileNameFor(row.id, row.media_url, file.contentType),
-    file.bytes,
-  );
+  let path: string;
+  try {
+    path = await deps.store.write(
+      fileNameFor(row.id, row.media_url, file.contentType),
+      file.bytes,
+    );
+  } catch (err) {
+    // 写盘失败（盘满 / 权限）：和下载失败一样按次数退避、有上限，不中断这一批里的其他文件
+    if (row.media_attempts >= MEDIA_MAX_ATTEMPTS) {
+      await abandon(row.id, MEDIA_ERRORS.writeFailed, err);
+      deps.log?.error({ ...ctx, err }, "媒体文件写盘重试耗尽，放弃");
+      return "abandoned";
+    }
+    const next = new Date(
+      clock.now().getTime() + retryDelay(row.media_attempts),
+    );
+    await getDb().message.updateMany({
+      where: { id: row.id, localFilePath: null },
+      data: { mediaNextAttemptAt: next, mediaError: describe(err) },
+    });
+    deps.log?.error({ ...ctx, err, next }, "媒体文件写盘失败，稍后再试");
+    return "retrying";
+  }
   const recorded = await getDb().message.updateMany({
     where: { id: row.id, localFilePath: null },
     data: {
@@ -306,32 +326,32 @@ export async function purgeExpiredMedia(
   const cutoff = new Date(now.getTime() - deps.retentionDays * 86_400_000);
   const db = getDb();
 
-  const expired = await db.$queryRaw<
-    { id: string; local_file_path: string; in_use: boolean }[]
-  >`
-    SELECT m.id, m.local_file_path,
-      EXISTS (
-        SELECT 1 FROM agent_runs r WHERE r.group_id = m.group_id AND r.status = 'running'
-      ) AS in_use
+  const expired = await db.$queryRaw<{ id: string; local_file_path: string }[]>`
+    SELECT m.id, m.local_file_path
     FROM messages m
     WHERE m.local_file_path IS NOT NULL AND m.media_fetched_at < ${cutoff}
     ORDER BY m.media_fetched_at, m.id
     LIMIT ${PURGE_BATCH}`;
-  const toPurge = expired.filter((r) => !r.in_use);
-  const keptForAgent = expired.length - toPurge.length;
 
-  // 1. 先清记录（条件更新：只清仍指向这个文件的行），commit 之后再删文件
+  // 1. 先清记录，commit 之后再删文件。「在用」只在清记录的这一条语句里判：仍指向这个文件、且所在群此刻没有运行中的
+  //    agent run —— 判断与删除原子，上面的查询之后才启动的 run，它用到的文件同样不删
   const cleared = await db.$transaction(async (tx) => {
     const done: string[] = [];
-    for (const r of toPurge) {
-      const { count } = await tx.message.updateMany({
-        where: { id: r.id, localFilePath: r.local_file_path },
-        data: { localFilePath: null, mediaPurgedAt: now },
-      });
+    for (const r of expired) {
+      const count = await tx.$executeRaw`
+        UPDATE messages m
+        SET local_file_path = NULL, media_purged_at = ${now}
+        WHERE m.id = ${r.id}
+          AND m.local_file_path = ${r.local_file_path}
+          AND NOT EXISTS (
+            SELECT 1 FROM agent_runs ar
+            WHERE ar.group_id = m.group_id AND ar.status = 'running'
+          )`;
       if (count === 1) done.push(r.local_file_path);
     }
     return done;
   });
+  const keptForAgent = expired.length - cleared.length;
   for (const path of cleared) await deps.store.remove(path);
 
   // 2. 孤儿：目录里没有任何记录指向、且足够旧的文件（崩在「清记录」与「删文件」之间，或「写盘」与「记账」之间留下的）

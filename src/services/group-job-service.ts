@@ -11,7 +11,8 @@
 //            （网关已经说了多久后可用，等到再 join，不白打一次）。
 //   join     每个成员一步（step = join，state.currentAccountId 记账号；API 拼成 join:<accountId>）：
 //            pending → POST join：202 → accepted（acceptedAt）；ALREADY_MEMBER → 视为已入群（成员表自己写一行，
-//            网关不会再推 member_joined）；INVITE_NOT_READY → nextRunAt = max(readyAt, now + 250ms) 再试（不 sleep）；
+//            网关不会再推 member_joined）；INVITE_NOT_READY → nextRunAt = max(readyAt, now + 250ms) 再试（不 sleep），
+//            同一成员 30 秒内一直未就绪就记 errors（不无限重试）；
 //            INVITE_EXPIRED → 重新申请链接后重试一次（每个成员各一次：转回 invite，该成员 inviteRetries + 1），
 //            同一成员再过期记 errors；其他 4xx 记 errors。
 //            accepted → 每 tick 查 group_members（入站 worker #8 收到 member_joined 会写行）；出现 → joined。
@@ -78,6 +79,8 @@ export const JOIN_TIMEOUT_MS = 10_000;
 export const JOIN_POLL_MS = 200;
 /** INVITE_NOT_READY 时至少等这么久再试（readyAt 已过仍 NOT_READY = 两边时钟有偏差） */
 export const INVITE_NOT_READY_MIN_WAIT_MS = 250;
+/** 同一个成员一直收到 INVITE_NOT_READY 最多等这么久（题目说 readyAfterMs「可能是几秒」），之后记 errors */
+export const INVITE_NOT_READY_MAX_WAIT_MS = 30_000;
 /** 题目 B2：INVITE_EXPIRED → 重新申请链接后重试一次 */
 export const INVITE_EXPIRED_MAX_RETRIES = 1;
 /** 题目 A2：对 promote 的调用总数 ≤ 2 */
@@ -129,6 +132,8 @@ const joinProgressSchema = z.object({
   acceptedAt: z.string().nullable(),
   /** 这个成员 join 时因 INVITE_EXPIRED 重新申请过几次链接（题目 B2：每次重试一次） */
   inviteRetries: z.number().int().default(0),
+  /** 第一次收到 INVITE_NOT_READY 的时刻（ISO）；等了 INVITE_NOT_READY_MAX_WAIT_MS 还没就绪就放弃这个成员 */
+  notReadySince: z.string().nullable().default(null),
 });
 export type JoinProgress = z.infer<typeof joinProgressSchema>;
 
@@ -168,6 +173,7 @@ export function initialCreateGroupState(
           status: "pending",
           acceptedAt: null,
           inviteRetries: 0,
+          notReadySince: null,
         } satisfies JoinProgress,
       ]),
     ),
@@ -693,6 +699,32 @@ async function joinRequest(
           // 题目 B2：视为成功。网关不会再推 member_joined，成员行自己写
           return markJoined(ctx, accountId, { viaAlreadyMember: true });
         case "INVITE_NOT_READY": {
+          const progress = state.joins[accountId];
+          const since = progress?.notReadySince
+            ? new Date(progress.notReadySince)
+            : now;
+          if (now.getTime() - since.getTime() > INVITE_NOT_READY_MAX_WAIT_MS) {
+            return memberFailed(
+              ctx,
+              accountId,
+              err.code,
+              `邀请链接 ${INVITE_NOT_READY_MAX_WAIT_MS / 1000} 秒内一直未就绪`,
+            );
+          }
+          if (progress && progress.notReadySince === null) {
+            await persist(ctx, {
+              state: {
+                ...state,
+                joins: {
+                  ...state.joins,
+                  [accountId]: {
+                    ...progress,
+                    notReadySince: now.toISOString(),
+                  },
+                },
+              },
+            });
+          }
           const readyAt = state.invite.readyAt
             ? new Date(state.invite.readyAt)
             : now;

@@ -32,6 +32,7 @@ import {
   downloadDueMedia,
   localMediaStore,
   MEDIA_ERRORS,
+  MEDIA_MAX_ATTEMPTS,
   MEDIA_RETRY_BASE_MS,
   type MediaStore,
   ORPHAN_GRACE_MS,
@@ -211,6 +212,43 @@ describe("媒体文件（C1）", () => {
       expect(await download(flaky)).toMatchObject({ downloaded: 1 });
       expect((await row(msg.id)).localFilePath).not.toBeNull();
     });
+  });
+
+  it("写盘失败（盘满 / 权限）：按次数退避、不中断这一批里的其他文件；次数用完放弃（MEDIA_WRITE_FAILED）", async () => {
+    const bad = await pushMedia();
+    const good = await pushMedia();
+    const brokenOnce: MediaStore = {
+      ...store,
+      async write(name, bytes) {
+        if (name.startsWith(bad.id)) throw new Error("ENOSPC");
+        return store.write(name, bytes);
+      },
+    };
+    const first = await downloadDueMedia({
+      clock,
+      gateway: client,
+      store: brokenOnce,
+      log: silent,
+    });
+    expect(first).toMatchObject({ claimed: 2, downloaded: 1, retrying: 1 });
+    expect((await row(good.id)).localFilePath).not.toBeNull();
+    expect((await row(bad.id)).mediaNextAttemptAt!.getTime()).toBeGreaterThan(
+      clock.now().getTime(),
+    );
+    for (let i = 0; i < MEDIA_MAX_ATTEMPTS; i += 1) {
+      clock.advance(DAY_MS);
+      await downloadDueMedia({
+        clock,
+        gateway: client,
+        store: brokenOnce,
+        log: silent,
+      });
+    }
+    expect(await row(bad.id)).toMatchObject({
+      localFilePath: null,
+      mediaNextAttemptAt: null,
+    });
+    expect((await row(bad.id)).mediaError).toContain(MEDIA_ERRORS.writeFailed);
   });
 
   describe("清理", () => {

@@ -530,6 +530,32 @@ describe("建群 job（#11）", () => {
     ]);
   });
 
+  it("INVITE_NOT_READY 有上限：链接一直不就绪，等过 INVITE_NOT_READY_MAX_WAIT_MS 就记 errors，不无限重试", async () => {
+    const { members, jobId } = await createJob(1);
+    const neverReady: GatewayClient = {
+      ...gatewayClient,
+      async joinGroup() {
+        throw new GatewayResponseError("POST", "/join", 409, {
+          code: "INVITE_NOT_READY",
+        });
+      },
+    };
+    for (let i = 0; i < 20; i += 1) {
+      await tick({ gateway: neverReady });
+      if ((await readJob(jobId)).status !== "running") break;
+      clock.advance(5_000);
+    }
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/jobs/${jobId}`,
+      headers: admin,
+    });
+    expect(briefErrors(res.json<JobBody>())).toEqual([
+      { step: `join:${members[0]}`, code: "INVITE_NOT_READY" },
+    ]);
+    expect((await readJob(jobId)).status).toBe("failed");
+  });
+
   // ---- join 等待 ------------------------------------------------------------------------
 
   describe("join 与 member_joined", () => {
