@@ -2,6 +2,9 @@
 # 控制台（前端）是另一个独立部署的服务，见前端仓 README「部署」：它把 /api、/ws 转发到这里的 backend。
 # 对外只需要给 backend 配域名（端口 8000）；其余服务只在 compose 内网里互相访问（expose，不映射到宿主机）。
 # 变量从同目录 .env 读（Dokploy 的 Environment 页面写的就是它），清单见 .env.deploy.example。
+# 数据库不在这个文件里：线上是 Dokploy 单独创建的 Postgres，DATABASE_URL 填它的 Internal Connection URL
+# （Dokploy 给配了域名的 backend 同时挂 dokploy-network，那个主机名在上面可解析）。
+# 本机跑没有 Dokploy 数据库：`docker compose --profile local-db up`，启动下面 local-db profile 里的 postgres。
 
 x-server: &server
   build:
@@ -12,17 +15,19 @@ x-server: &server
     NODE_ENV: production
 
 services:
+  # 只给本机用（--profile local-db）：不对外、口令固定，DATABASE_URL 写 postgresql://gmp:gmp@postgres:5432/gmp
   postgres:
+    profiles: ["local-db"]
     image: postgres:17-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-gmp}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?在 .env 里设置 POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB:-group_message_platform}
+      POSTGRES_USER: gmp
+      POSTGRES_PASSWORD: gmp
+      POSTGRES_DB: gmp
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      test: ["CMD-SHELL", "pg_isready -U gmp -d gmp"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -78,7 +83,7 @@ services:
     environment:
       <<: *server-env
       PORT: "8000"
-      DATABASE_URL: postgresql://${POSTGRES_USER:-gmp}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-group_message_platform}
+      DATABASE_URL: ${DATABASE_URL:?在 .env 里设置 DATABASE_URL（Dokploy 数据库的 Internal Connection URL）}
       JWT_SECRET: ${JWT_SECRET:?在 .env 里设置 JWT_SECRET}
       GATEWAY_URL: http://gateway-sim:8100
       AGENT_URL: ${AGENT_URL:-http://agent-sim:8200}
@@ -93,8 +98,10 @@ services:
     expose:
       - "8000"
     depends_on:
+      # 线上没有这个服务（库在 Dokploy 里），required: false 让它缺席时不报错；本机 --profile local-db 时照样等它健康
       postgres:
         condition: service_healthy
+        required: false
       gateway-sim:
         condition: service_healthy
       agent-sim:

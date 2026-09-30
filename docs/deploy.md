@@ -7,10 +7,10 @@
                    │  /api、/ws 转发（BACKEND_URL）
                    ▼
                  后端（Dokploy Compose，本仓 docker-compose.yml）
-                   backend ─┬─ postgres
-                            ├─ gateway-sim   消息网关模拟器
+                   backend ─┬─ gateway-sim   消息网关模拟器
                             ├─ agent-sim     Agent 服务模拟器（默认）
-                            └─ llm-agent     真实 LLM 版 Agent（Claude / Gemini）
+                            ├─ llm-agent     真实 LLM 版 Agent（Claude / Gemini）
+                            └─ dokploy-network ─▶ Postgres（Dokploy Database，单独创建）
 ```
 
 浏览器只和前端域名同源通信（前端的 nginx 把 `/api`、`/ws` 转给后端域名），所以后端不用配 CORS，
@@ -21,21 +21,31 @@ refresh cookie 也落在前端域名下。后端域名同时可以直接调接�
 | 服务 | 作用 | 对外 |
 | --- | --- | --- |
 | `backend` | API + 全部 worker；启动时前滚迁移、跑幂等种子；媒体文件（C1）存 `media-data` 卷 | **配域名，端口 8000** |
-| `postgres` | 数据库（`postgres:17-alpine`），数据在 `pgdata` 卷 | 只在内网 |
 | `gateway-sim` | 消息网关模拟器（状态在内存） | 只在内网 |
 | `agent-sim` | Agent 服务模拟器，默认的 `AGENT_URL` | 只在内网 |
 | `llm-agent` | 真实 LLM 版 Agent，模型配置存 `llm-data` 卷 | 只在内网 |
 
 四个 Node 服务共用本仓 `Dockerfile` 构建的同一个镜像，只是启动命令不同；运行期是编译后的 `dist/`，不带开发依赖。
+数据库不在 compose 里，是 Dokploy 单独管理的 Postgres：与后端应用分开创建、分开删除，备份 / 重置在它自己的页面上做。
+
+## 0. 创建数据库（Dokploy Database）
+
+1. **Create Service → Database → PostgreSQL**，版本 17，密码留空让 Dokploy 生成。**Deploy**。
+2. 打开它的 **Connection** 页，复制 **Internal Connection URL**，形如
+   `postgresql://postgres:<密码>@<App Name>:5432/postgres` —— 主机名就是这个数据库的 App Name，只在 Dokploy 内网
+   （`dokploy-network`）上能解析。不用开 External Port，后端走内网连。
+
+> 这条 URL 带着明文口令，只粘进 Dokploy 的 Environment，不要写进仓库、issue 或聊天记录。
 
 ## 1. 部署后端（Dokploy Compose）
 
 1. **Create Service → Compose**，类型选 Docker Compose（不是 Stack：Stack 模式不支持 `build`）。
 2. **Provider**：Git / GitHub，仓库 `https://github.com/Victor-ChanX/interviewProjects-backend.git`，分支 `main`，
    Compose Path `./docker-compose.yml`。
-3. **Environment**：把 [`.env.deploy.example`](../.env.deploy.example) 的内容粘进去，改掉三个 `change-me`：
-   `POSTGRES_PASSWORD`、`JWT_SECRET`、`LLM_AGENT_ADMIN_TOKEN`（各自 `openssl rand -hex 32`，彼此不同）。
+3. **Environment**：把 [`.env.deploy.example`](../.env.deploy.example) 的内容粘进去：`DATABASE_URL` 换成上一步复制的
+   Internal Connection URL；`JWT_SECRET`、`LLM_AGENT_ADMIN_TOKEN` 各自 `openssl rand -hex 32`，彼此不同。
    缺任何一个，`docker compose` 会直接报错并指出是哪个变量。
+   **Advanced 里不要开 Isolated Deployment**：开了之后 Dokploy 不再给服务挂 `dokploy-network`，后端解析不到数据库的主机名。
 4. **Domains**：Add Domain → Service 选 `backend`，Container Port `8000`，填后端域名（如 `api.example.com`），
    HTTPS 选 Let's Encrypt。Dokploy 部署时自己加 Traefik 路由，compose 文件里不用写 labels。
 5. **Deploy**。首次要编译镜像，几分钟。验证：`curl https://api.example.com/api/health` → `{"ok":true,…}`。
@@ -82,29 +92,34 @@ AG=http://agent-sim:8200
 网关模拟器的状态在内存里，而后端把见过的事件编号记在库里，所以**两边要一起清**（原因见手册 0.2）：
 
 1. Dokploy 里 Stop 后端这个 Compose 应用。
-2. 删掉数据卷 `pgdata`（Dokploy 的 Volumes / Advanced 页面，或在服务器上 `docker volume rm <项目名>_pgdata`）。
-3. Deploy。新库由后端启动时的迁移和种子重建；模拟器随容器重启清空。前端不用动。
+2. 清空数据库：删掉 Dokploy 里那个 PostgreSQL 服务再按第 0 步建一个新的（`DATABASE_URL` 换成新的），
+   或在它的终端里 `psql -U postgres -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;'`（URL 不变）。
+3. Deploy 后端。新库由后端启动时的迁移和种子重建；模拟器随容器重启清空。前端不用动。
 
 `llm-data`（模型配置）不用删，除非想清掉 API Key。
-`media-data`（媒体文件，题目 C1）随 `pgdata` 一起删；只删了它、库还在也没关系 —— 后端的清理步骤会发现记录指向的文件
+`media-data`（媒体文件，题目 C1）随数据库一起删；只删了它、库还在也没关系 —— 后端的清理步骤会发现记录指向的文件
 不在了，清掉路径并重新下载（网关那边已过期的记 `MEDIA_EXPIRED`）。
 
 ## 用完后彻底清理
 
-数据全在三个命名卷里（`pgdata` 数据库、`llm-data` 模型配置与 API Key、`media-data` 媒体文件），容器和镜像之外不落任何东西：
+数据在 Dokploy 的 PostgreSQL 服务和后端的两个命名卷里（`llm-data` 模型配置与 API Key、`media-data` 媒体文件），
+容器和镜像之外不落任何东西：
 
-1. Dokploy：删除后端这个 Compose 应用时勾选删除卷（Delete volumes）；前端的 Application 直接删除（它没有数据）。
+1. Dokploy：删除后端这个 Compose 应用时勾选删除卷（Delete volumes）；删除第 0 步建的 PostgreSQL 服务（连同它的卷）；
+   前端的 Application 直接删除（它没有数据）。
    或在服务器上进到应用目录执行 `docker compose down -v --rmi local`（`-v` 删卷，`--rmi local` 删本地构建的镜像）。
-2. 确认没有残留：`docker volume ls | grep <项目名>` 为空。
+2. 确认没有残留：`docker volume ls | grep -e <后端项目名> -e <数据库 App Name>` 为空。
 3. 域名解析与 Dokploy 里配的域名一并删掉；控制台「模型设置」里填过的 API Key 随 `llm-data` 卷一起没了，
    如仍担心可在服务商后台吊销那把 Key。
 
 ## 本机用 Docker 跑
 
 ```bash
-# 后端：本机是 http，.env 里设 COOKIE_SECURE=0；backend 只 expose 了 8000，本机访问要临时加 ports: ["8000:8000"]
+# 后端：本机没有 Dokploy 数据库，用 local-db profile 里的 postgres；.env 里
+#   DATABASE_URL=postgresql://gmp:gmp@postgres:5432/gmp、COOKIE_SECURE=0（本机是 http）
+# backend 只 expose 了 8000，本机访问要临时加 ports: ["8000:8000"]
 cp .env.deploy.example .env
-docker compose up -d --build
+docker compose --profile local-db up -d --build
 
 # 前端（在前端仓）
 docker build -t gmp-web . && docker run --rm -p 8080:80 -e BACKEND_URL=http://host.docker.internal:8000 gmp-web
