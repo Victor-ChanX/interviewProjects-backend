@@ -9,9 +9,15 @@ coverage
 # 门禁脚本与测试：只在 CI 跑；镜像里没有 devDependencies，它们也跑不起来
 scripts
 tests
+# 文档与部署文件本身不进镜像
+docs
+Dockerfile
+docker-compose.yml
+.dockerignore
 # prisma/（schema + migrations）与 prisma.config.ts **要进镜像**：启动时 runMigrations 跑
-# prisma migrate deploy，读的就是它们；src/db/generated/ 也不要排除（构建层 prisma generate 产出，
-# 构建镜像时把 prisma 装成 dependency 或在多阶段构建的 builder 层生成再拷 dist）。
+# prisma migrate deploy，读的就是它们（prisma CLI 因此在 dependencies 里）。
+# 本地生成的 Prisma Client 不带进去：构建层 npm ci 的 postinstall（prisma generate）按镜像里的 schema 重新生成
+src/db/generated
 # 本地环境变量永远不进镜像
 .env
 .env.*

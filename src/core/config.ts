@@ -40,7 +40,8 @@ export type Config = {
   /**
    * refresh token cookie 是否带 Secure（issue #17）。NODE_ENV=production 时为 true：生产走 HTTPS，
    * 浏览器对 Secure cookie 只在 https 下回传；本地 http 开发与测试不带，否则 cookie 根本存不进去。
-   * 想在非 production 下也开（例如预发环境）设 COOKIE_SECURE=1。
+   * 显式设置优先：COOKIE_SECURE=1 在非 production 下也开（例如预发环境）；COOKIE_SECURE=0 在
+   * production 下也关（站点只有 http、还没配证书时，否则浏览器不保存 refresh cookie）。
    */
   cookieSecure: boolean;
   /** 真实 LLM 版 Agent 服务（src/llm-agent，`npm run llm-agent`，题目 C2）的监听端口，默认 8300 */
@@ -103,7 +104,9 @@ export const config: Readonly<Config> = Object.freeze({
     5_000,
   ),
   cookieSecure:
-    process.env.NODE_ENV === "production" || process.env.COOKIE_SECURE === "1",
+    process.env.COOKIE_SECURE === "1" ||
+    (process.env.COOKIE_SECURE !== "0" &&
+      process.env.NODE_ENV === "production"),
   llmAgentPort: readPort(process.env.LLM_AGENT_PORT, 8300),
   llmAgentAdminToken: process.env.LLM_AGENT_ADMIN_TOKEN || undefined,
   llmAgentConfigFile: process.env.LLM_AGENT_CONFIG_FILE || ".llm-agent.json",

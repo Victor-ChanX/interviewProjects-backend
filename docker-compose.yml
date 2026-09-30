@@ -1,0 +1,118 @@
+# 整套部署（Dokploy 的 Docker Compose 应用直接用这个文件；本机 docker compose up 也能跑）。
+# 对外只需要给 web 配域名（端口 80）：它托管控制台静态页，并把 /api、/ws 反代到 backend。
+# 其余服务只在 compose 内网里互相访问（expose，不映射到宿主机）。
+# 变量从同目录 .env 读（Dokploy 的 Environment 页面写的就是它），清单见 .env.deploy.example。
+
+x-server: &server
+  build:
+    context: .
+  image: group-message-platform-server:latest
+  restart: unless-stopped
+  environment: &server-env
+    NODE_ENV: production
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-gmp}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?在 .env 里设置 POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-group_message_platform}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # 消息网关模拟器（题目 2.1）：状态在内存里，重启即清空（与数据库要一起重置，见 docs/deploy.md）
+  gateway-sim:
+    <<: *server
+    command: ["node", "dist/sim/gateway/main.js"]
+    environment:
+      <<: *server-env
+      SIM_GATEWAY_PORT: "8100"
+    expose:
+      - "8100"
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8100/_sim/state"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # Agent 服务模拟器（题目 2.2）：默认的 AGENT_URL 指向它
+  agent-sim:
+    <<: *server
+    command: ["node", "dist/sim/agent/main.js"]
+    environment:
+      <<: *server-env
+      SIM_AGENT_PORT: "8200"
+    expose:
+      - "8200"
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8200/_sim/state"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # 真实 LLM 版 Agent 服务（题目 C2）：把 AGENT_URL 设成 http://llm-agent:8300 即切过去；
+  # 服务商 / API Key / 模型在控制台「模型设置」里填，存在 llm-data 卷里（不进镜像、不进 .env）
+  llm-agent:
+    <<: *server
+    command: ["node", "dist/llm-agent/main.js"]
+    environment:
+      <<: *server-env
+      LLM_AGENT_PORT: "8300"
+      LLM_AGENT_ADMIN_TOKEN: ${LLM_AGENT_ADMIN_TOKEN:?在 .env 里设置 LLM_AGENT_ADMIN_TOKEN}
+    volumes:
+      - llm-data:/data
+    expose:
+      - "8300"
+
+  # 后端 API + 全部 worker：启动时自己前滚迁移、跑幂等种子（预置 admin / viewer 与 acc-1…acc-5）
+  backend:
+    <<: *server
+    environment:
+      <<: *server-env
+      PORT: "8000"
+      DATABASE_URL: postgresql://${POSTGRES_USER:-gmp}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-group_message_platform}
+      JWT_SECRET: ${JWT_SECRET:?在 .env 里设置 JWT_SECRET}
+      GATEWAY_URL: http://gateway-sim:8100
+      AGENT_URL: ${AGENT_URL:-http://agent-sim:8200}
+      LLM_AGENT_ADMIN_TOKEN: ${LLM_AGENT_ADMIN_TOKEN}
+      # 站点没配 HTTPS 时设成 0，否则浏览器不保存 refresh cookie（刷新页面会掉登录）
+      COOKIE_SECURE: ${COOKIE_SECURE:-1}
+    expose:
+      - "8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      gateway-sim:
+        condition: service_healthy
+      agent-sim:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  # 控制台：从前端公开仓库直接构建（nginx 托管静态页 + 反代 /api、/ws）
+  web:
+    build:
+      context: ${FRONTEND_GIT_URL:-https://github.com/Victor-ChanX/interviewProjects-frontend.git#main}
+    restart: unless-stopped
+    environment:
+      BACKEND_UPSTREAM: backend:8000
+    expose:
+      - "80"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  llm-data:

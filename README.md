@@ -22,6 +22,8 @@ npm run dev                     # 后端 http://localhost:8000：启动时前滚
 启动即预置：账号 `acc-1` … `acc-5`（`idle`）、用户 `admin/admin`（全部权限）、`viewer/viewer`（只读）。
 健康：`GET /api/health` → `{ ok, schemaVersion }`。
 
+部署到服务器（Docker Compose / Dokploy）见 [docs/deploy.md](docs/deploy.md)。
+
 ## 一分钟走一遍
 
 ```bash
