@@ -1,3 +1,4 @@
+// Claude 上游（官方 @anthropic-ai/sdk，Messages API）。用法按 Anthropic 官方 TypeScript SDK 文档
 // （typescript/claude-api/README.md、tool-use.md、shared/tool-use-concepts.md、shared/model-migration.md、shared/models.md）。
 //
 // /agent/turn：题目 2.2 的请求本身就是 Anthropic tool use 形状 —— tools（input_schema 原样）与 messages 直通，
@@ -60,12 +61,12 @@ import {
 /** 官方端点，显式传给 SDK：SDK 没收到时会去读环境变量，这里不给环境变量改端点（把 key 带到别处）的机会 */
 const ANTHROPIC_API = "https://api.anthropic.com";
 
-/** 非流式请求的 max_tokens */
+/** 非流式请求的 max_tokens（官方文档：非流式请求建议约 16000；思考计入其中） */
 export const TURN_MAX_TOKENS = 16_000;
 /** 审计输出只有一个小 JSON，但思考同样计入 max_tokens，留足余量 */
 export const AUDIT_MAX_TOKENS = 4_096;
 
-/** 文档要求默认开启拒绝兜底的模型 */
+/** 文档要求默认开启拒绝兜底的模型（官方模型迁移指南中 Claude Fable 5.1 / Opus 5.5 / Sonnet 5.5 的说明） */
 export const FALLBACK_MODELS: ReadonlySet<string> = new Set([
   "claude-fable-5-1",
   "claude-opus-5-5",
@@ -342,7 +343,7 @@ export function createAnthropicClient(opts: AnthropicClientOptions): LlmClient {
 
     /**
      * Models API（自动翻页），只留本服务用得上的模型：adaptive 思考、low effort、结构化输出都支持
-     * 。顺序按 API 返回（新的在前）。
+     * （Models API：capabilities 每个叶子都有 supported）。顺序按 API 返回（新的在前）。
      */
     async listModels(apiKey, { timeoutMs }): Promise<ModelItem[]> {
       const items: ModelItem[] = [];

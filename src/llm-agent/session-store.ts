@@ -4,6 +4,7 @@
 // 为什么需要（题目 2.2 允许「Agent 服务按 runId 维护会话状态」）：2.2 的每轮响应恰好一个块，思考内容没有位置，
 // 后端传回来的历史里只剩 tool_use；而两家上游都要求多轮工具调用把思考状态原样带回：
 // - Claude：思考块要原样回传；中途删掉某个思考块会让它之后的思考块全部失效（新账号直接 400），
+//   从最前面删一段则允许（官方模型迁移指南 → preserved thinking）。
 // - Gemini 3：functionCall part 上的 thoughtSignature 缺了直接 400（Google 文档 Thought signatures）。
 // 两家「记不到」时各自怎么办见 anthropic.ts / gemini.ts。
 //

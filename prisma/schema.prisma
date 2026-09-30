@@ -162,6 +162,7 @@ model Message {
   /// 网关错误码，或 ACCOUNT_TERMINAL / GROUP_UNREACHABLE
   failCode             String?         @map("fail_code")
 
+  // ---- 以下仅出站行使用（outbox 机制）----
   /// 累计投递尝试次数（含首发）；每次的细节在 outbound_attempts
   attempts      Int       @default(0)
   /// 确认未发出后的重发次数，题目允许总共重发一次

@@ -54,7 +54,7 @@
 ## /agent/turn：Claude
 
 2.2 的请求本身就是 Anthropic tool use 形状，所以 `tools`（`input_schema` 原样）与 `messages` 直通，加系统提示词。
-参数按 claude-api skill 的 TypeScript 文档与模型迁移指南定：
+参数按 Anthropic 官方 TypeScript SDK 文档与模型迁移指南定：
 
 | 参数 | 值 | 依据 |
 | --- | --- | --- |
