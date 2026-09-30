@@ -28,7 +28,7 @@ curl -s localhost:8000/api/health  # {"ok":true,"schemaVersion":"…"}
 ```
 
 启动即预置：账号 `acc-1` … `acc-5`（`idle`）、用户 `admin/admin`（全部权限）、`viewer/viewer`（只读）。
-接口契约：`.ai/openapi.json`（OpenAPI 3，`npm run openapi` 从路由的 zod schema 导出，前端仓的类型由它生成）。
+接口：路由在 `src/api/routes/`，请求 / 响应的 zod schema 在 `src/schemas/`（错误一律 `{ error: { code, message, requestId } }`）。
 
 **控制台**：在前端仓 `cp .env.example .env && npm install && npm run dev`，打开 http://localhost:5173 用 `admin / admin` 登录
 （详见前端仓 README）。群详情右上角的「模拟外部发言」能以外部成员身份往群里推消息、触发 Agent（`.env.example` 里
@@ -176,8 +176,8 @@ npm test                        # 全量约 2 分钟（2026-09-30 实测）
 npm run test:coverage           # CI 跑这个；行覆盖率地板见 vitest.config.mts
 ```
 
-提交前的本地门禁（`.githooks/pre-commit`，`npm install` 时自动装上）：`tsc`、`eslint`、`prettier`、项目地图、openapi 快照、
-迁移漂移、规范检查；CI 另在干净 Postgres 上跑迁移链、全量测试与构建。
+CI 在干净的 Postgres 上跑：`tsc --noEmit`、`npm run lint`、`npm run format:check`、迁移链从零前滚（`prisma migrate deploy`）、
+`npm run test:coverage` 与 `npm run build`。
 
 浏览器端到端（Playwright：登录 → 群详情 → agent run 每一步）在前端仓：并排 checkout 两个仓后在前端仓跑它的 e2e 脚本，
 它会自己拉起本仓的两个模拟器与后端，见前端仓 README「端到端」。
