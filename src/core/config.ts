@@ -37,6 +37,12 @@ export type Config = {
   agentTurnTimeoutMs: number;
   /** /agent/audit 单次超时（题目没规定；审计最多 3 次、耗时计入 60 秒预算，所以不能太长），毫秒，默认 5000 */
   agentAuditTimeoutMs: number;
+  /**
+   * refresh token cookie 是否带 Secure（issue #17）。NODE_ENV=production 时为 true：生产走 HTTPS，
+   * 浏览器对 Secure cookie 只在 https 下回传；本地 http 开发与测试不带，否则 cookie 根本存不进去。
+   * 想在非 production 下也开（例如预发环境）设 COOKIE_SECURE=1。
+   */
+  cookieSecure: boolean;
 };
 
 function readMs(
@@ -80,4 +86,6 @@ export const config: Readonly<Config> = Object.freeze({
     "AGENT_AUDIT_TIMEOUT_MS",
     5_000,
   ),
+  cookieSecure:
+    process.env.NODE_ENV === "production" || process.env.COOKIE_SECURE === "1",
 });

@@ -12,6 +12,7 @@ import type { FastifyInstance } from "fastify";
 
 import { verifyAccessToken } from "../../core/jwt.js";
 import { WsClientFrame } from "../../schemas/ws.js";
+import { isSessionActive } from "../../services/auth-service.js";
 import type { WsHub, WsSink } from "../../services/ws-hub.js";
 
 export type WsRoutesOptions = {
@@ -91,6 +92,12 @@ export default async function wsRoutes(
           const result = verifyAccessToken(frame.data.accessToken);
           if (!result.ok) {
             req.log.info({ reason: result.reason }, "WebSocket 认证失败");
+            reject();
+            return;
+          }
+          // 与 requireUser 同一条规则（#17）：logout / 复用作废后的 access token 也不能开 WS
+          if (!(await isSessionActive(result.claims.sessionId))) {
+            req.log.info({ reason: "session_revoked" }, "WebSocket 认证失败");
             reject();
             return;
           }

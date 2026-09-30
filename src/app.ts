@@ -1,5 +1,6 @@
 // buildApp()：swagger / zod provider / 错误信封 / 路由插件。
 // 这里不连数据库：地图与 openapi 脚本会在 PROJECT_MAP_BUILD=1 下 import 本文件。
+import fastifyCookie from "@fastify/cookie";
 import fastifyCors from "@fastify/cors";
 import fastifySwagger from "@fastify/swagger";
 import fastifyWebsocket from "@fastify/websocket";
@@ -25,6 +26,8 @@ import groupSendRoutes from "./api/routes/group-send.js";
 import groupRoutes from "./api/routes/groups.js";
 import healthRoutes from "./api/routes/health.js";
 import jobRoutes from "./api/routes/jobs.js";
+import sequenceRunRoutes from "./api/routes/sequence-runs.js";
+import sequenceRoutes from "./api/routes/sequences.js";
 import wsRoutes from "./api/routes/ws.js";
 import { config } from "./core/config.js";
 import { DomainError, type ErrorCode } from "./core/errors.js";
@@ -39,6 +42,7 @@ import "./schemas/group.js";
 import "./schemas/health.js";
 import "./schemas/job.js";
 import "./schemas/message.js";
+import "./schemas/sequence.js";
 
 export type ErrorEnvelope = {
   error: {
@@ -100,6 +104,9 @@ export async function buildApp(
   app.setSerializerCompiler(serializerCompiler);
 
   await app.register(fastifyCors, { origin: true });
+  // refresh token cookie（#17）：解析 request.cookies、提供 reply.setCookie / clearCookie。不签名：值本身是随机 32 字节，
+  // 库里只存哈希，签名不增加什么。
+  await app.register(fastifyCookie);
   // WS /ws（#9）：升级握手由它接管；路由声明 websocket: true 即可
   await app.register(fastifyWebsocket);
   await app.register(fastifySwagger, {
@@ -162,6 +169,10 @@ export async function buildApp(
   void app.register(jobRoutes, { prefix: "/api/jobs" });
   // agent run 查询（#13）：两条路径前缀不同（/api/agent-runs 与 /api/groups/:id/agent-runs），路由文件写全路径
   void app.register(agentRunRoutes);
+  // 定时序列（#15）：POST /api/sequences 走 prefix；运行的两条路径前缀不同（/api/groups/:id/sequence-runs 与
+  // /api/sequence-runs/:id），路由文件写全路径
+  void app.register(sequenceRoutes, { prefix: "/api/sequences" });
+  void app.register(sequenceRunRoutes);
   void app.register(wsRoutes, { hub: opts.wsHub ?? createWsHub() });
 
   return app;

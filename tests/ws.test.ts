@@ -32,7 +32,7 @@ import {
   startWsBroadcastWorker,
   type WsBroadcastWorkerHandle,
 } from "../src/workers/ws-broadcast-worker.js";
-import { authHeaders, loginAs, tokenFrom } from "./factories.js";
+import { authHeaders, loginAs, logout, tokenFrom } from "./factories.js";
 import { truncateAll } from "./setup.js";
 
 type Frame = Record<string, unknown>;
@@ -168,7 +168,7 @@ describe("WS /ws", () => {
 
   it("auth 失败（伪造 / 过期 token）：回 success: false + UNAUTHORIZED 并关闭", async () => {
     const expired = tokenFrom(
-      authHeaders("u1", [], { clock: fakeClock(), ttlSeconds: -1 }),
+      await authHeaders("u1", [], { clock: fakeClock(), ttlSeconds: -1 }),
     );
     for (const bad of ["not-a-jwt", expired]) {
       const c = await connect(wsUrl);
@@ -179,6 +179,20 @@ describe("WS /ws", () => {
       ]);
       expect(c.closed?.code).toBe(4401);
     }
+    expect(hub.size).toBe(0);
+  });
+
+  it("logout 后同一 access token 不能再认证 WS（#17：会话检查与 requireUser 同一条规则）", async () => {
+    expect(
+      (await logout(app, { authorization: `Bearer ${token}` })).statusCode,
+    ).toBe(200);
+    const c = await connect(wsUrl);
+    c.send({ type: "auth", accessToken: token });
+    await vi.waitFor(() => expect(c.closed).not.toBeNull());
+    expect(c.frames).toEqual([
+      { type: "auth", success: false, code: "UNAUTHORIZED" },
+    ]);
+    expect(c.closed?.code).toBe(4401);
     expect(hub.size).toBe(0);
   });
 

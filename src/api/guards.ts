@@ -1,7 +1,8 @@
 // 闸门（preHandler）。地图只认这个文件导出的函数为闸门：
 // 路由的 preHandler 里没有任何一个来自这里 → endpoint-without-auth 告警。
 //
-// requireUser：Authorization: Bearer <access token> → 验签（src/core/jwt.ts）→ request.principal。
+// requireUser：Authorization: Bearer <access token> → 验签（src/core/jwt.ts）→ 按 sid 查会话未作废
+// （src/services/auth-service.ts 的 assertSessionActive，issue #17）→ request.principal。
 // requireRole(role)：在 requireUser 之后挂，身份不是该角色 → 403 FORBIDDEN。
 // 拒绝一律 throw 领域异常，信封由 src/app.ts 的 setErrorHandler 产出：
 // 401 = 不知道你是谁（没带 / 坏的 / 过期的 token），403 = 知道你是谁但这个操作不归你。
@@ -14,6 +15,7 @@ import {
   type VerifyFailure,
   verifyAccessToken,
 } from "../core/jwt.js";
+import { assertSessionActive } from "../services/auth-service.js";
 
 declare module "fastify" {
   interface FastifyRequest {
@@ -46,10 +48,14 @@ export async function requireUser(
       reason: result.reason,
     });
   }
+  // 签名对了还要看会话：logout / refresh 复用作废后，同族的 access token 在 15 分钟到期前就要失效（#17）。
+  // 副本 A 上 logout 的会话，副本 B 只有查库才知道。
+  await assertSessionActive(result.claims.sessionId);
   req.principal = {
     userId: result.claims.userId,
     username: result.claims.username,
     role: result.claims.role,
+    sessionId: result.claims.sessionId,
   };
 }
 

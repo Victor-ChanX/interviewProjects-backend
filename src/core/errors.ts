@@ -30,7 +30,22 @@ export type ErrorCode =
   | "ACCOUNT_NOT_ONLINE"
   | "JOB_NOT_FOUND"
   // ---- Agent run（#13，题目 2.3 GET /api/agent-runs/:id）----
-  | "AGENT_RUN_NOT_FOUND";
+  | "AGENT_RUN_NOT_FOUND"
+  // ---- leave-all job（#16，题目 2.3 POST /api/groups/:id/leave-all + B2）----
+  // 群已是 left：没有成员可退（409：状态不允许，请求本身没问题）
+  | "GROUP_ALREADY_LEFT"
+  // 群在网关里还没建成（gatewayGroupId 为空：建群 job 未完成或已失败），没有可退的群（409：等状态变）
+  | "GROUP_NOT_READY"
+  // 该群已有一个 running 的 job（建群还在跑 / 已有 leave-all 在跑）；部分唯一索引撞出的 P2002 → 409
+  | "JOB_ALREADY_RUNNING"
+  // ---- 定时序列（#15，题目 B1 + 2.3 sequences / sequence-runs 端点）----
+  // 请求体里的 sequenceId 不存在（422：换一个 id 就能过；不是路径资源，不用 404）
+  | "SEQUENCE_NOT_FOUND"
+  | "SEQUENCE_RUN_NOT_FOUND"
+  // 同群已有 running 的序列运行（409：部分唯一索引撞出来的，等它结束）
+  | "SEQUENCE_ALREADY_RUNNING"
+  // 预检：某步文本里的 {key} 解析不到（422；extra 带 stepIndex / key）
+  | "UNRESOLVED_PLACEHOLDER";
 
 export type ErrorExtra = Record<string, unknown>;
 

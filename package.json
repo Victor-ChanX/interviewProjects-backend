@@ -25,6 +25,7 @@
     "sim:agent": "tsx src/sim/agent/main.ts"
   },
   "dependencies": {
+    "@fastify/cookie": "^11.1.2",
     "@fastify/cors": "^11.3.0",
     "@fastify/swagger": "^9.9.0",
     "@fastify/websocket": "^11.3.1",

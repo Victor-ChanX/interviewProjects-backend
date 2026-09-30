@@ -23,6 +23,7 @@ import { startInboundWorker } from "./workers/inbound-worker.js";
 import { defaultJobWorkerId, startJobWorker } from "./workers/job-worker.js";
 import { defaultWorkerId, startOutboxWorker } from "./workers/outbox-worker.js";
 import { startRateLimitWorker } from "./workers/rate-limit-worker.js";
+import { startSequenceWorker } from "./workers/sequence-worker.js";
 import { startWsBroadcastWorker } from "./workers/ws-broadcast-worker.js";
 
 async function main(): Promise<void> {
@@ -78,6 +79,13 @@ async function main(): Promise<void> {
     intervalMs: 200,
   });
 
+  // 定时序列（#15）：排期在 sequence_run_steps.scheduledAt（以秒计），这里每秒看一眼；启动时刻即「重启时刻」，
+  // 停机期间过期的当前步只重排那一步（sequence-service.rescheduleStaleStep）
+  const sequenceWorker = startSequenceWorker({
+    clock: systemClock,
+    intervalMs: 1_000,
+  });
+
   const shutdown = async (signal: string): Promise<void> => {
     logger.info({ signal }, "收到停机信号，开始优雅停机");
     await Promise.all([
@@ -87,6 +95,7 @@ async function main(): Promise<void> {
       wsBroadcastWorker.stop(),
       jobWorker.stop(),
       agentWorker.stop(),
+      sequenceWorker.stop(),
     ]);
     // 先关 WS 连接再关 HTTP：客户端收到 1001 后按 sinceSeq 重连到别的副本
     await wsHub.stop();

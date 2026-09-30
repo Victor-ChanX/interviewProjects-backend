@@ -101,7 +101,7 @@ describe("auth", () => {
     it("过期的 token → 401 UNAUTHORIZED（reason: expired）", async () => {
       // 用假时钟把签发时刻拨到 TTL 之前一秒：签出来就是过期的
       const past = new Date(Date.now() - (ACCESS_TOKEN_TTL_SECONDS + 1) * 1000);
-      const headers = authHeaders("u1", ["admin"], {
+      const headers = await authHeaders("u1", ["admin"], {
         clock: { now: () => past },
       });
       const res = await app.inject({ method: "GET", url: PROBE_READ, headers });
@@ -115,13 +115,15 @@ describe("auth", () => {
       const almost = new Date(
         Date.now() - (ACCESS_TOKEN_TTL_SECONDS - 5) * 1000,
       );
-      const headers = authHeaders("u1", [], { clock: { now: () => almost } });
+      const headers = await authHeaders("u1", [], {
+        clock: { now: () => almost },
+      });
       const res = await app.inject({ method: "GET", url: PROBE_READ, headers });
       expect(res.statusCode).toBe(200);
     });
 
     it("签名被篡改 / 乱七八糟的 token → 401 UNAUTHORIZED", async () => {
-      const good = authHeaders("u1", ["admin"]).authorization!;
+      const good = (await authHeaders("u1", ["admin"])).authorization!;
       const tampered = good.slice(0, -2) + (good.endsWith("AA") ? "BB" : "AA");
       for (const authorization of [tampered, "Bearer not.a.jwt", "Bearer "]) {
         const res = await app.inject({
@@ -135,7 +137,7 @@ describe("auth", () => {
     });
 
     it("提升角色：篡改 payload 里的 role 后签名对不上 → 401", async () => {
-      const [, token] = authHeaders("u1", []).authorization!.split(" ");
+      const [, token] = (await authHeaders("u1", [])).authorization!.split(" ");
       const [h, p, s] = token!.split(".");
       const payload = JSON.parse(
         Buffer.from(p!, "base64url").toString(),

@@ -1,7 +1,8 @@
 // access token：HS256 JWT，node:crypto 的 HMAC，不加依赖（签 / 验各十几行，jose 之类的包在这里
 // 只多带一个 owner 决定）。密钥来自 src/core/config.ts 的 JWT_SECRET。
 //
-// claims：sub（用户 id）、username、role、jti（随机，refresh / logout 作废名单要用它 —— issue #17）、
+// claims：sub（用户 id）、username、role、jti（随机 token id）、sid（sessions 行 id —— issue #17：
+// 闸门验签后按它查该行是否 revokedAt，logout / refresh 复用作废后 access token 立即失效）、
 // iat、exp（签发后 15 分钟）。verify 只认 HS256、只认没过期的；任何格式 / 签名 / 过期问题都返回
 // 失败原因而不是抛错，由闸门（src/api/guards.ts）统一转成 401 UNAUTHORIZED。
 import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
@@ -17,6 +18,11 @@ export type Principal = {
   userId: string;
   username: string;
   role: Role;
+  /**
+   * 凭证所属的会话（sessions 表行 id，issue #17）。access token 里是 sid claim；
+   * requireUser 按它查会话是否已作废，logout 按它找到整个会话族。
+   */
+  sessionId: string;
 };
 
 export type AccessTokenClaims = Principal & {
@@ -66,6 +72,7 @@ export function signAccessToken(
     userId: principal.userId,
     username: principal.username,
     role: principal.role,
+    sessionId: principal.sessionId,
     jti: randomUUID(),
     iat,
     exp: iat + (opts.ttlSeconds ?? ACCESS_TOKEN_TTL_SECONDS),
@@ -76,6 +83,7 @@ export function signAccessToken(
       sub: claims.userId,
       username: claims.username,
       role: claims.role,
+      sid: claims.sessionId,
       jti: claims.jti,
       iat: claims.iat,
       exp: claims.exp,
@@ -102,6 +110,7 @@ function decodePayload(raw: string): AccessTokenClaims | null {
     typeof p.sub !== "string" ||
     typeof p.username !== "string" ||
     !isRole(p.role) ||
+    typeof p.sid !== "string" ||
     typeof p.jti !== "string" ||
     typeof p.iat !== "number" ||
     typeof p.exp !== "number"
@@ -112,6 +121,7 @@ function decodePayload(raw: string): AccessTokenClaims | null {
     userId: p.sub,
     username: p.username,
     role: p.role,
+    sessionId: p.sid,
     jti: p.jti,
     iat: p.iat,
     exp: p.exp,
