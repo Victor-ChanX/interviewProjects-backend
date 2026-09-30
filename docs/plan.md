@@ -49,52 +49,52 @@ backend/ (Fastify + Prisma + PostgreSQL)
 
 ## 4. 里程碑与拆分
 
-每个里程碑结束时：`main` 可运行、README 可照着跑、对应场景测试绿。任务按 GitHub issue 拆，编号在下表「#」列（创建后回填）。
+每个里程碑结束时：`main` 可运行、README 可照着跑、对应场景测试绿。任务按 GitHub issue 拆（后端仓 `#N`；前端仓标「前端 #N」），编号在下表「#」列；B4 的页面 4 / 5 是前端 #5 / #6。
 
 ### M0 · 骨架与模拟器（第 1 个半天）
 
 | # | 任务 | 验收 |
 |---|---|---|
-| | 单仓骨架：backend / frontend 起仓、CI、README 启动说明 | `npm run dev` 两端都起得来 |
-| | 网关模拟器：账号 connect/disconnect、群/成员/邀请、send 的全部同步错误码、SSE 事件流（at-least-once + ≤1s 乱序 + 补投）、by-client-id 查询、`503` 整体不可用；**行为可按场景脚本化**（S1–S8 都能复现） | 模拟器自带用例 |
-| | Agent 模拟器：`/agent/turn` 合法响应 + 六类坏行为、`/agent/audit` 的 500 / 坏 JSON / 慢响应 | 模拟器自带用例 |
-| | Prisma 模型（第 3 节全部表）+ 初始迁移 + 种子（账号、admin/viewer） | 空库 `migrate deploy` 通过；schema 落后拒绝启动 |
+| #1 | 骨架：backend / frontend 各自起仓、CI、README 启动说明 | `npm run dev` 两端都起得来 |
+| #2 | 网关模拟器：账号 connect/disconnect、群/成员/邀请、send 的全部同步错误码、SSE 事件流（at-least-once + ≤1s 乱序 + 补投）、by-client-id 查询、`503` 整体不可用；**行为可按场景脚本化**（S1–S8 都能复现） | 模拟器自带用例 |
+| #3 | Agent 模拟器：`/agent/turn` 合法响应 + 六类坏行为、`/agent/audit` 的 500 / 坏 JSON / 慢响应 | 模拟器自带用例 |
+| #4 | Prisma 模型（第 3 节全部表）+ 初始迁移 + 种子（账号、admin/viewer） | 空库 `migrate deploy` 通过；schema 落后拒绝启动 |
 
 ### M1 · A0 + A1 + A2：账号、网关接入、时间线（第 1 天）
 
 | # | 任务 | 验收 |
 |---|---|---|
-| | 登录 / JWT / viewer 只读 403 / 错误信封 / `GET /api/health` | A0 |
-| | 账号状态机：转移表、`transition` 的 `expectedFrom` CAS、终态级联（移出成员、排队消息 cancelled、序列步骤 skipped、`account_terminal`）一个事务 | A1 用例 + 并发 CAS 用例 |
-| | 出站 outbox worker：`queued→accepted→sent/failed/unknown/cancelled`；429 → `rate_limited` 排队顺延、到期自动恢复；504 → `unknown` → by-client-id 确认 → 至多重发一次；`GROUP_WRITE_FORBIDDEN` → 群 `unreachable` 级联 | S1、S4、A2 错误表逐条 |
-| | 入站 SSE worker：游标落库、`since` 补拉、去重、乱序按 `sentAt`、自己消息回流 `isOwn`、写库失败 → `inconsistency` 不中断 | S2、S3 |
-| | 消息时间线游标分页（`before` 游标 = `(sentAt, msgId)`）+ WS 推送（`seq` 单调、认证帧） | A4 |
-| | **重启恢复用例**：worker 在「领取后 / 202 后记账前 / 记账后推进游标前」各停一次再启动，断言网关恰好一条 | 总则 |
+| #5 | 登录 / JWT / viewer 只读 403 / 错误信封 / `GET /api/health` | A0 |
+| #6 | 账号状态机：转移表、`transition` 的 `expectedFrom` CAS、终态级联（移出成员、排队消息 cancelled、序列步骤 skipped、`account_terminal`）一个事务 | A1 用例 + 并发 CAS 用例 |
+| #7 | 出站 outbox worker：`queued→accepted→sent/failed/unknown/cancelled`；429 → `rate_limited` 排队顺延、到期自动恢复；504 → `unknown` → by-client-id 确认 → 至多重发一次；`GROUP_WRITE_FORBIDDEN` → 群 `unreachable` 级联 | S1、S4、A2 错误表逐条 |
+| #8 | 入站 SSE worker：游标落库、`since` 补拉、去重、乱序按 `sentAt`、自己消息回流 `isOwn`、写库失败 → `inconsistency` 不中断 | S2、S3 |
+| #9 | 消息时间线游标分页（`before` 游标 = `(sentAt, msgId)`）+ WS 推送（`seq` 单调、认证帧） | A4 |
+| #10 | **重启恢复用例**：worker 在「领取后 / 202 后记账前 / 记账后推进游标前」各停一次再启动，断言网关恰好一条 | 总则 |
 
 ### M2 · A3 + A5：建群、Agent 接入（第 2 天上午）
 
 | # | 任务 | 验收 |
 |---|---|---|
-| | 建群 job：create → invite（`INVITE_NOT_READY` 等待、`INVITE_EXPIRED` 重申请一次）→ join（`ALREADY_MEMBER` 视为成功）→ 等 `member_joined`（10s → `JOIN_TIMEOUT`）→ promote（`NOT_MEMBER_YET` 重试，总数 ≤ 2） | A3、B2 前半 |
-| | Agent run 循环：触发（非自己消息 + `agentEnabled`）、部分唯一索引保证单 running、待处理消息合并进下一次 run、12 步 / 60s / 连续 3 次协议错、每轮 10–15s 超时、审计 3 次 → `blocked`、执行账号选择、`kick_user` 的 `POLICY_DENIED` / `OWNER_LEFT` / `NO_PERMISSION`、幂等键、tool_result 8KB 截断、`cancelled` 条件、**每步落库以便重启续跑** | S5、S6、A5 全部 |
-| | `GET /api/agent-runs/:id`、`GET /api/groups/:id/agent-runs`、WS `agent_run` 事件 | |
+| #11 | 建群 job：create → invite（`INVITE_NOT_READY` 等待、`INVITE_EXPIRED` 重申请一次）→ join（`ALREADY_MEMBER` 视为成功）→ 等 `member_joined`（10s → `JOIN_TIMEOUT`）→ promote（`NOT_MEMBER_YET` 重试，总数 ≤ 2） | A3、B2 前半 |
+| #12 | Agent run 循环：触发（非自己消息 + `agentEnabled`）、部分唯一索引保证单 running、待处理消息合并进下一次 run、12 步 / 60s / 连续 3 次协议错、每轮 10–15s 超时、审计 3 次 → `blocked`、执行账号选择、`kick_user` 的 `POLICY_DENIED` / `OWNER_LEFT` / `NO_PERMISSION`、幂等键、tool_result 8KB 截断、`cancelled` 条件、**每步落库以便重启续跑** | S5、S6、A5 全部 |
+| #13 | `GET /api/agent-runs/:id`、`GET /api/groups/:id/agent-runs`、WS `agent_run` 事件 | |
 
 ### M3 · A6：控制台前端（第 2 天下午）
 
 | # | 任务 | 验收 |
 |---|---|---|
-| | 登录页；请求层 401 单飞刷新；viewer 隐藏写操作 | 页面 1 |
-| | 账号列表：状态、按转移表显示「标记离线 / 重连 / 释放」 | 页面 2 |
-| | 群详情：成员（role）、时间线（加载更早 + WS 实时追加不重不漏）、自己消息的 `deliveryStatus`、agent run 列表（`blocked` 醒目） | 页面 3 |
+| 前端 #2 | 登录页；请求层 401 单飞刷新；viewer 隐藏写操作 | 页面 1 |
+| 前端 #3 | 账号列表：状态、按转移表显示「标记离线 / 重连 / 释放」 | 页面 2 |
+| 前端 #4 | 群详情：成员（role）、时间线（加载更早 + WS 实时追加不重不漏）、自己消息的 `deliveryStatus`、agent run 列表（`blocked` 醒目） | 页面 3 |
 
 ### M4 · B 组（剩余时间，按顺序）
 
 | # | 任务 | 验收 |
 |---|---|---|
-| | B1 定时序列：角色选账号（`rate_limited` 顺延、无人 `skipped`）、`vars/stepVars` 取值链 + `varSources`、预检 422、以 `message_sent` 为基准排期、重启只重排最早一步、并发启动 201/409 | S7、S8 |
-| | B2 leave-all：非群主先退、失败记入 `errors[]`、群主最后退；完成后成员表与网关一致 | |
-| | B3 会话：refresh token HttpOnly + 轮换 + 复用作废整族；logout 即失效；前端并发 401 只刷一次 | |
-| | B4：WS `sinceSeq` 补发（断线 3 秒内补齐不重复）；页面 4 agent 步骤详情、页面 5 序列运行 | |
+| #15 | B1 定时序列：角色选账号（`rate_limited` 顺延、无人 `skipped`）、`vars/stepVars` 取值链 + `varSources`、预检 422、以 `message_sent` 为基准排期、重启只重排最早一步、并发启动 201/409 | S7、S8 |
+| #16 | B2 leave-all：非群主先退、失败记入 `errors[]`、群主最后退；完成后成员表与网关一致 | |
+| #17 | B3 会话：refresh token HttpOnly + 轮换 + 复用作废整族；logout 即失效；前端并发 401 只刷一次 | |
+| #18 / 前端 #7 | B4：WS `sinceSeq` 补发（断线 3 秒内补齐不重复）；页面 4 agent 步骤详情、页面 5 序列运行 | |
 
 ### 不做（C 组）
 
