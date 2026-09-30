@@ -1,23 +1,30 @@
 // 入站事件（题目 2.1 事件流 + A2 入站条款，issue #8）：一条 SSE 帧怎么变成库里的状态。
 //
 // 三层去重 / 容错，各管一件事：
-// 1. **事件级**：inbound_events.eventId 唯一。同一事件推两次（S2）第二次 create 撞 P2002 → 跳过，不处理。
-//    例外：行在、但 processedAt 为空且 attempts = 0 —— 进程死在「插入」与「处理」之间，游标没推进，网关重推
-//    时补处理（这是 at-least-once 下唯一会出现这种行的路径）。
+// 1. **事件级**：inbound_events.eventId 唯一。先入册（独立提交），再在一个事务里「锁住这一行 → 确认还没处理 →
+//    处理 → 写 processedAt」。同一事件推两次（S2）、多个副本同时收到同一事件：锁上排队，后到的看见 processedAt
+//    已写就是 duplicate，不会处理第二遍。
 // 2. **消息级**：messages 的 (groupId, msgId) 唯一。补投 / 乱序带来的同一条消息用新 eventId 再来时，
 //    createMany({ skipDuplicates }) 是 ON CONFLICT DO NOTHING —— 不抛错、不写第二行、不再发 ws 事件
-//    （agent 触发点 #12 读 ws_events，所以这里不发它就不会被重复触发）。
-// 3. **处理失败不中断**：先插入 inbound_events（独立提交）→ 在一个 $transaction 里处理 + 写 processedAt。
-//    处理抛错 → 事务回滚，但 inbound_events 行还在（原文不丢）；随后另起事务写 attempts + 1 / lastError、
-//    一行 inconsistencies { kind: inbound_event_failed, ref: eventId } 与 ws_events inconsistency，
-//    调用方（worker）继续下一条。ingest 本身只在「连记失败都记不下来」（库不可用）时才抛。
+//    （agent 触发只在新建行时发生，所以也不会被重复触发）。
+// 3. **处理失败不中断、不丢、会重试**：处理抛错 → 事务回滚，原文还在 inbound_events；另起事务写 attempts + 1 /
+//    lastError / nextAttemptAt（有界指数退避），首次失败时写一行 inconsistencies { kind: inbound_event_failed,
+//    ref: eventId } + ws inconsistency 让操作员看见，调用方（worker）继续下一条。之后由 inbound-retry-worker 按
+//    nextAttemptAt 领取重试（retryDueEvents），网关重推同一事件也算一次重试；重试成功时把这条事件的失败记录标为
+//    已处理（resolvedBy = system）。失败 MAX_ATTEMPTS 次后停止自动重试（nextAttemptAt 置空），留给操作员。
+//    入册时 nextAttemptAt 就排上「收到时刻 + 孤儿宽限」：进程死在入册与处理之间，这一行也会被重试 worker 接手。
+//    ingest 本身只在「连记失败都记不下来」（库不可用）时才抛。
 //
-// 游标 event_cursor.lastEventId 由 worker 在每条 ingest 之后 advanceCursor：只在 eventId 更大时推进
-// （乱序窗口 ≤ 1s 里先到的可能是更大的 id；先推到大的，再来小的不能把游标拉回去，否则重连会重放一段 ——
-// 去重能吃掉但没必要）。乱序下「推进到大 id 时小 id 还没到」会不会漏？不会：乱序只发生在实时投递，
-// 断线重连的回放是按序的；实时段里小 id 的那条要么随后到达（正常处理），要么随连接一起丢（重连从大 id 之后
-// 回放就漏了它）—— 这是 SSE 语义本身的缝，网关保证乱序窗口 ≤ 1s，重连退避 ≥ 1s 时这种丢失只发生在
-// 「掐断前 1s 内」；补投带新 eventId，最终也会补到。
+// 处理必须与自己的后果同生共死：message_sent / message_failed 的记账（outbox-service.applyGatewayDelivery）、
+// account_status 的终态级联（account-service.enterTerminalInTx）都在这个事务里做 —— 进程死在中间，事件整个重来，
+// 不会出现「一半生效、processedAt 已写」或「记账已生效、后果没跟上、重放又被当成重复跳过」。
+// 业务日志在 commit 之后记（afterCommit）。
+//
+// 成员事件按「最后一次为准」：同一 (群, platformUserId) 已有 eventId 更大的 member_joined / member_left 处理过时，
+// 这一条就是过时的（1 秒乱序窗口里后到的旧事件、或失败后晚些才重试成功的旧事件），跳过 —— 否则一条迟到的
+// member_joined 会把已经退群的人加回成员表。
+//
+// 游标（event_cursor.lastEventId）由 src/workers/inbound-worker.ts 维护，规则见那里。
 //
 // 自己消息的回流（S3）与 #7 的约定：
 // - message 事件的 senderPlatformUserId 命中某个服务账号的 platformUserId → isOwn = true。
@@ -40,7 +47,7 @@ import { type Clock, systemClock } from "../core/clock.js";
 import type { Logger } from "../core/logger.js";
 import { getDb } from "../db/client.js";
 import { Prisma } from "../db/generated/client.js";
-import { enterTerminal } from "./account-service.js";
+import { enterTerminalInTx, logTransition } from "./account-service.js";
 import { onInboundMessage } from "./agent-run-service.js";
 import type { GatewayEvent } from "./gateway-client.js";
 import { emitWsEvent } from "./ws-events.js";
@@ -50,6 +57,7 @@ import { emitWsEvent } from "./ws-events.js";
 /**
  * message_sent { clientMsgId, msgId, sentAt } / message_failed { clientMsgId, code } 的记账，由
  * src/services/outbox-service.ts（#7）导出同签名的 applyGatewayDelivery，经 deps 注入这里。
+ * 在处理这条事件的事务（tx）里跑；业务日志交给 afterCommit。
  * sent 时给 msgId + sentAt；failed 时给 code。找不到 clientMsgId 对应的出站行怎么办由 #7 决定。
  */
 export type ApplyGatewayDeliveryInput = {
@@ -59,9 +67,13 @@ export type ApplyGatewayDeliveryInput = {
   code?: string;
 };
 export type ApplyGatewayDelivery = (
+  tx: Prisma.TransactionClient,
   input: ApplyGatewayDeliveryInput,
-  deps: { clock: Clock; log?: IngestLog },
+  deps: { clock: Clock; log?: IngestLog; afterCommit: AfterCommit },
 ) => Promise<unknown>;
+
+/** 登记一段要在事务 commit 之后执行的代码（业务日志） */
+export type AfterCommit = (fn: () => void) => void;
 
 // ---- 类型 ----------------------------------------------------------------------------
 
@@ -77,6 +89,27 @@ export type IngestDeps = {
 export type IngestOutcome = "processed" | "duplicate" | "failed";
 
 export type IngestResult = { eventId: number; outcome: IngestOutcome };
+
+export type RetryResult = {
+  /** 本次领到的到期事件数 */
+  claimed: number;
+  processed: number;
+  failed: number;
+};
+
+/** 入册后这么久还没处理完 = 处理它的进程死了：重试 worker 接手（正常处理是毫秒级） */
+export const ORPHAN_GRACE_MS = 30_000;
+/** 失败重试的退避：base × 2^(attempts-1)，封顶 cap */
+export const RETRY_BASE_MS = 1_000;
+export const RETRY_CAP_MS = 60_000;
+/** 失败这么多次后停止自动重试，留给操作员（inconsistencies 里有记录） */
+export const MAX_ATTEMPTS = 8;
+/** 重试 worker 领取时把 nextAttemptAt 往后推这么久：处理中的事件不会被别的副本同时领走；进程死了到点再被领 */
+export const RETRY_LEASE_MS = 30_000;
+/** 一次最多领多少条到期事件 */
+export const RETRY_BATCH = 50;
+/** 重试成功后自动把失败记录标为已处理时的 resolvedBy */
+export const AUTO_RESOLVED_BY = "system";
 
 /** inconsistencies.kind 的取值（题目 A2「不能让事件处理中断、不能让内容丢失」） */
 export const INCONSISTENCY_KINDS = Object.freeze({
@@ -137,7 +170,7 @@ function parsePayload<T extends z.ZodType>(
 // ---- 入口 ----------------------------------------------------------------------------
 
 /**
- * 处理一条事件（见文件头）。返回 outcome：processed / duplicate / failed。
+ * 处理一条从事件流收到的事件（见文件头）。返回 outcome：processed / duplicate / failed。
  * 只在库不可用（连失败都记不下来）时抛错 —— worker 据此断流重连，事件会从游标之后重拉。
  */
 export async function ingest(
@@ -149,6 +182,7 @@ export async function ingest(
   const eventId = String(event.eventId);
   const groupId =
     typeof event.data.groupId === "string" ? event.data.groupId : null;
+  const now = clock.now();
 
   // 1. 入册（独立提交）：撞 eventId 唯一 = 重复推送
   try {
@@ -158,59 +192,202 @@ export async function ingest(
         type: event.type,
         groupId,
         payload: event.data as Prisma.InputJsonObject,
-        receivedAt: clock.now(),
+        receivedAt: now,
+        nextAttemptAt: new Date(now.getTime() + ORPHAN_GRACE_MS),
       },
     });
   } catch (err) {
     if (!isUniqueViolation(err)) throw err;
     const existing = await db.inboundEvent.findUniqueOrThrow({
       where: { eventId },
-      select: { processedAt: true, attempts: true },
+      select: { processedAt: true },
     });
-    if (existing.processedAt !== null || existing.attempts > 0) {
+    if (existing.processedAt !== null) {
       deps.log?.info(
         { eventId: event.eventId, type: event.type },
         "重复事件，跳过",
       );
       return { eventId: event.eventId, outcome: "duplicate" };
     }
-    // 上次死在插入与处理之间：补处理
+    // 入册过但没处理成（上次失败、或进程死在入册与处理之间）：网关重推就是一次重试
     deps.log?.warn(
       { eventId: event.eventId, type: event.type },
       "事件已入册但未处理，补处理",
     );
   }
 
-  // 2. 处理 + processedAt 同一事务
-  try {
-    await db.$transaction(async (tx) => {
-      await handle(tx, event, { clock, log: deps.log, deps });
-      await tx.inboundEvent.update({
-        where: { eventId },
-        data: { processedAt: clock.now(), lastError: null },
-      });
-    });
-    return { eventId: event.eventId, outcome: "processed" };
-  } catch (err) {
-    // 3. 失败入册（另起事务）：原文已在 inbound_events；不一致记录 + ws 事件让操作员看见
-    const message = err instanceof Error ? err.message : String(err);
-    deps.log?.error(
-      { err, eventId: event.eventId, type: event.type },
-      "入站事件处理失败，已入册",
+  // 2. 锁行 + 处理 + processedAt 同一事务
+  return processEvent(event, deps);
+}
+
+/**
+ * 到期的未处理事件（失败待重试 / 孤儿）重新处理一遍：inbound-retry-worker 每 tick 调。
+ * 领取 = 一条语句把到期行的 nextAttemptAt 推到租约之后（FOR UPDATE SKIP LOCKED，多副本各领各的，正在处理的行
+ * 被锁着也会跳过）；按 eventId 升序逐条处理，失败照常记账、重排退避。
+ */
+export async function retryDueEvents(
+  deps: IngestDeps & { limit?: number } = {},
+): Promise<RetryResult> {
+  const clock = deps.clock ?? systemClock;
+  const now = clock.now();
+  const leaseUntil = new Date(now.getTime() + RETRY_LEASE_MS);
+  const limit = deps.limit ?? RETRY_BATCH;
+  const rows = await getDb().$queryRaw<
+    { event_id: string; type: string; payload: Prisma.JsonValue }[]
+  >`
+    UPDATE inbound_events SET next_attempt_at = ${leaseUntil}
+    WHERE id IN (
+      SELECT id FROM inbound_events
+      WHERE processed_at IS NULL AND next_attempt_at <= ${now}
+      ORDER BY event_id::bigint
+      LIMIT ${limit}
+      FOR UPDATE SKIP LOCKED
+    )
+    RETURNING event_id, type, payload`;
+  rows.sort((a, b) => Number(a.event_id) - Number(b.event_id));
+
+  const result: RetryResult = { claimed: rows.length, processed: 0, failed: 0 };
+  for (const row of rows) {
+    const payload = row.payload;
+    const data =
+      typeof payload === "object" && payload !== null && !Array.isArray(payload)
+        ? (payload as Record<string, unknown>)
+        : {};
+    const outcome = await processEvent(
+      { eventId: Number(row.event_id), type: row.type, data },
+      deps,
     );
-    await db.$transaction(async (tx) => {
-      await tx.inboundEvent.update({
-        where: { eventId },
-        data: { attempts: { increment: 1 }, lastError: message },
+    if (outcome.outcome === "processed") result.processed += 1;
+    if (outcome.outcome === "failed") result.failed += 1;
+  }
+  return result;
+}
+
+/** 已入册的一条事件：锁行 → 还没处理才处理 → processedAt，一个事务；失败另起事务记账。 */
+async function processEvent(
+  event: GatewayEvent,
+  deps: IngestDeps,
+): Promise<IngestResult> {
+  const clock = deps.clock ?? systemClock;
+  const db = getDb();
+  const eventId = String(event.eventId);
+  const committed: (() => void)[] = [];
+  try {
+    const outcome = await db.$transaction(async (tx) => {
+      const locked = await tx.$queryRaw<{ processed_at: Date | null }[]>`
+        SELECT processed_at FROM inbound_events WHERE event_id = ${eventId} FOR UPDATE`;
+      const current = locked[0];
+      if (!current) throw new Error(`inbound_events 里没有 eventId ${eventId}`);
+      if (current.processed_at !== null) return "duplicate" as const;
+      const now = clock.now();
+      await handle(tx, event, {
+        clock,
+        log: deps.log,
+        deps,
+        afterCommit: (fn) => committed.push(fn),
       });
+      const row = await tx.inboundEvent.update({
+        where: { eventId },
+        data: { processedAt: now, lastError: null, nextAttemptAt: null },
+        select: { attempts: true },
+      });
+      if (row.attempts > 0) await resolveFailureRecords(tx, eventId, now);
+      return "processed" as const;
+    });
+    for (const fn of committed) fn();
+    if (outcome === "duplicate") {
+      deps.log?.info(
+        { eventId: event.eventId, type: event.type },
+        "重复事件，跳过",
+      );
+    }
+    return { eventId: event.eventId, outcome };
+  } catch (err) {
+    await recordFailure(event, err, deps);
+    return { eventId: event.eventId, outcome: "failed" };
+  }
+}
+
+/**
+ * 处理失败（事务已回滚，原文在 inbound_events）：attempts + 1、lastError、按退避排下一次；
+ * 首次失败写不一致记录 + ws 事件让操作员看见，达到上限时再写一条并停止自动重试。
+ */
+async function recordFailure(
+  event: GatewayEvent,
+  err: unknown,
+  deps: IngestDeps,
+): Promise<void> {
+  const clock = deps.clock ?? systemClock;
+  const eventId = String(event.eventId);
+  const message = err instanceof Error ? err.message : String(err);
+  const now = clock.now();
+  const attempts = await getDb().$transaction(async (tx) => {
+    const { attempts } = await tx.inboundEvent.update({
+      where: { eventId },
+      data: { attempts: { increment: 1 }, lastError: message },
+      select: { attempts: true },
+    });
+    const giveUp = attempts >= MAX_ATTEMPTS;
+    await tx.inboundEvent.update({
+      where: { eventId },
+      data: {
+        nextAttemptAt: giveUp
+          ? null
+          : new Date(now.getTime() + retryDelay(attempts)),
+      },
+    });
+    if (attempts === 1) {
       await recordInconsistency(
         tx,
         INCONSISTENCY_KINDS.eventFailed,
         event,
-        `${event.type} 事件（eventId ${eventId}）处理失败：${message}`,
+        `${event.type} 事件（eventId ${eventId}）处理失败，将自动重试：${message}`,
       );
+    } else if (giveUp) {
+      await recordInconsistency(
+        tx,
+        INCONSISTENCY_KINDS.eventFailed,
+        event,
+        `${event.type} 事件（eventId ${eventId}）连续 ${attempts} 次处理失败，已停止自动重试：${message}`,
+      );
+    }
+    return attempts;
+  });
+  deps.log?.error(
+    { err, eventId: event.eventId, type: event.type, attempts },
+    "入站事件处理失败，已入册待重试",
+  );
+}
+
+function retryDelay(attempts: number): number {
+  return Math.min(RETRY_BASE_MS * 2 ** Math.max(0, attempts - 1), RETRY_CAP_MS);
+}
+
+/** 重试成功：这条事件之前的失败记录标为已处理（与操作员手动标记同一套字段与 ws 事件）。 */
+async function resolveFailureRecords(
+  tx: Prisma.TransactionClient,
+  eventId: string,
+  now: Date,
+): Promise<void> {
+  const open = await tx.inconsistency.findMany({
+    where: {
+      kind: INCONSISTENCY_KINDS.eventFailed,
+      ref: eventId,
+      resolvedAt: null,
+    },
+    select: { id: true },
+  });
+  if (open.length === 0) return;
+  await tx.inconsistency.updateMany({
+    where: { id: { in: open.map((r) => r.id) } },
+    data: { resolvedAt: now, resolvedBy: AUTO_RESOLVED_BY },
+  });
+  for (const { id } of open) {
+    await emitWsEvent(tx, "inconsistency_resolved", {
+      id,
+      resolvedAt: now.toISOString(),
+      resolvedBy: AUTO_RESOLVED_BY,
     });
-    return { eventId: event.eventId, outcome: "failed" };
   }
 }
 
@@ -245,7 +422,12 @@ export async function advanceCursor(
 
 // ---- 按类型处理 ------------------------------------------------------------------------
 
-type HandleCtx = { clock: Clock; log?: IngestLog; deps: IngestDeps };
+type HandleCtx = {
+  clock: Clock;
+  log?: IngestLog;
+  deps: IngestDeps;
+  afterCommit: AfterCommit;
+};
 
 async function handle(
   tx: Prisma.TransactionClient,
@@ -256,15 +438,15 @@ async function handle(
     case "message":
       return handleMessage(tx, event, ctx);
     case "message_sent":
-      return handleMessageSent(event, ctx);
+      return handleMessageSent(tx, event, ctx);
     case "message_failed":
-      return handleMessageFailed(event, ctx);
+      return handleMessageFailed(tx, event, ctx);
     case "member_joined":
       return handleMemberJoined(tx, event, ctx);
     case "member_left":
-      return handleMemberLeft(tx, event);
+      return handleMemberLeft(tx, event, ctx);
     case "account_status":
-      return handleAccountStatus(event, ctx);
+      return handleAccountStatus(tx, event, ctx);
     default:
       // 网关新增的类型：原文已入册，不当错误（否则每条都写一行不一致）
       ctx.log?.warn(
@@ -420,15 +602,17 @@ async function handleMessage(
       isOwn,
     });
   }
-  ctx.log?.info(
-    {
-      eventId: event.eventId,
-      groupId: group.id,
-      msgId: data.msgId,
-      isOwn,
-      created,
-    },
-    created ? "入站消息已写入时间线" : "入站消息已存在，未新建",
+  ctx.afterCommit(() =>
+    ctx.log?.info(
+      {
+        eventId: event.eventId,
+        groupId: group.id,
+        msgId: data.msgId,
+        isOwn,
+        created,
+      },
+      created ? "入站消息已写入时间线" : "入站消息已存在，未新建",
+    ),
   );
 }
 
@@ -443,25 +627,51 @@ function requireOutbox(ctx: HandleCtx): ApplyGatewayDelivery {
 }
 
 async function handleMessageSent(
+  tx: Prisma.TransactionClient,
   event: GatewayEvent,
   ctx: HandleCtx,
 ): Promise<void> {
   const data = parsePayload(messageSentSchema, event);
   await requireOutbox(ctx)(
+    tx,
     { clientMsgId: data.clientMsgId, msgId: data.msgId, sentAt: data.sentAt },
-    { clock: ctx.clock, log: ctx.log },
+    { clock: ctx.clock, log: ctx.log, afterCommit: ctx.afterCommit },
   );
 }
 
 async function handleMessageFailed(
+  tx: Prisma.TransactionClient,
   event: GatewayEvent,
   ctx: HandleCtx,
 ): Promise<void> {
   const data = parsePayload(messageFailedSchema, event);
   await requireOutbox(ctx)(
+    tx,
     { clientMsgId: data.clientMsgId, code: data.code },
-    { clock: ctx.clock, log: ctx.log },
+    { clock: ctx.clock, log: ctx.log, afterCommit: ctx.afterCommit },
   );
+}
+
+/**
+ * 同一 (群, platformUserId) 已有 eventId 更大的成员事件处理过：这一条过时了（见文件头「成员事件按最后一次为准」）。
+ * 按网关 groupId 比（inbound_events.group_id 存的就是它），payload 里取 platformUserId。
+ */
+async function isStaleMembershipEvent(
+  tx: Prisma.TransactionClient,
+  event: GatewayEvent,
+  gatewayGroupId: string,
+  platformUserId: string,
+): Promise<boolean> {
+  const newer = await tx.$queryRaw<{ event_id: string }[]>`
+    SELECT event_id FROM inbound_events
+    WHERE type IN ('member_joined', 'member_left')
+      AND group_id = ${gatewayGroupId}
+      AND processed_at IS NOT NULL
+      AND payload->>'platformUserId' = ${platformUserId}
+      AND event_id::bigint > ${event.eventId}
+    LIMIT 1`;
+  if (newer.length === 0) return false;
+  return true;
 }
 
 async function handleMemberJoined(
@@ -472,6 +682,17 @@ async function handleMemberJoined(
   const data = parsePayload(memberSchema, event);
   const group = await resolveGroup(tx, event, data.groupId);
   if (!group) return;
+  if (
+    await isStaleMembershipEvent(tx, event, data.groupId, data.platformUserId)
+  ) {
+    ctx.afterCommit(() =>
+      ctx.log?.info(
+        { eventId: event.eventId, platformUserId: data.platformUserId },
+        "过时的 member_joined（已有更新的成员事件），跳过",
+      ),
+    );
+    return;
+  }
   // 服务账号按 platformUserId 反查填 accountId；外部用户为 null。role 默认 member；
   // 已在（重复事件 / 建群时已写的群主行）只补 accountId，不动 role / joinedAt。
   const account = await tx.account.findUnique({
@@ -505,10 +726,22 @@ async function handleMemberJoined(
 async function handleMemberLeft(
   tx: Prisma.TransactionClient,
   event: GatewayEvent,
+  ctx: HandleCtx,
 ): Promise<void> {
   const data = parsePayload(memberSchema, event);
   const group = await resolveGroup(tx, event, data.groupId);
   if (!group) return;
+  if (
+    await isStaleMembershipEvent(tx, event, data.groupId, data.platformUserId)
+  ) {
+    ctx.afterCommit(() =>
+      ctx.log?.info(
+        { eventId: event.eventId, platformUserId: data.platformUserId },
+        "过时的 member_left（已有更新的成员事件），跳过",
+      ),
+    );
+    return;
+  }
   // 终态级联已删过的行这里 count = 0，照常发事件（前端按它刷新成员即可，幂等）
   await tx.groupMember.deleteMany({
     where: { groupId: group.id, platformUserId: data.platformUserId },
@@ -526,15 +759,28 @@ async function handleMemberLeft(
 }
 
 async function handleAccountStatus(
+  tx: Prisma.TransactionClient,
   event: GatewayEvent,
   ctx: HandleCtx,
 ): Promise<void> {
   const data = parsePayload(accountStatusSchema, event);
-  // 终态级联走 account-service 的统一入口（自己的事务）：已在该终态时静默；账号不存在 → NotFound → 失败入册
-  await enterTerminal(data.accountId, data.status, "gateway_event", {
-    clock: ctx.clock,
-    log: ctx.log,
-  });
+  // 终态级联走 account-service 的统一入口，在这条事件的事务里：已在该终态时静默；账号不存在 → NotFound → 失败入册
+  const result = await enterTerminalInTx(
+    tx,
+    data.accountId,
+    data.status,
+    "gateway_event",
+    ctx.clock.now(),
+  );
+  ctx.afterCommit(() =>
+    logTransition(
+      data.accountId,
+      data.status,
+      "gateway_event",
+      result,
+      ctx.log,
+    ),
+  );
 }
 
 function isUniqueViolation(err: unknown): boolean {

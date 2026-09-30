@@ -37,7 +37,6 @@ import {
   cancelQueuedSends,
   DEFAULT_RATE_LIMIT_SECONDS,
   enterRateLimited,
-  enterTerminal,
   enterTerminalInTx,
   isTerminal,
   logTransition,
@@ -51,7 +50,6 @@ import {
 } from "./gateway-client.js";
 import {
   logGroupUnreachable,
-  markGroupUnreachable,
   markGroupUnreachableInTx,
 } from "./group-service.js";
 import { onOutboundSettled } from "./sequence-service.js";
@@ -126,6 +124,11 @@ export type GatewayDeliveryInput = {
   sentAt?: string | Date;
   /** message_failed：GROUP_WRITE_FORBIDDEN | ACCOUNT_SUSPENDED */
   code?: string;
+};
+
+/** applyGatewayDelivery 在调用方（入站事件）的事务里跑：业务日志交给调用方在 commit 之后执行。 */
+export type DeliveryTxDeps = OutboxDeps & {
+  afterCommit: (fn: () => void) => void;
 };
 
 export type ApplyDeliveryResult = {
@@ -605,49 +608,58 @@ export async function recordSent(
   deps: OutboxDeps = {},
 ): Promise<boolean> {
   const now = (deps.clock ?? systemClock).now();
-  const applied = await getDb().$transaction(async (tx) => {
-    const current = await tx.message.findUnique({ where: { id: messageId } });
-    if (!current || current.deliveryStatus === null) return false;
-    if (
-      current.deliveryStatus === "sent" ||
-      current.deliveryStatus === "failed"
-    ) {
-      return false;
-    }
-    await tx.message.deleteMany({
-      where: {
-        groupId: current.groupId,
-        msgId: landing.msgId,
-        clientMsgId: null,
-        id: { not: messageId },
-      },
-    });
-    await finishAttempt(tx, messageId, now, {
-      httpStatus: null,
-      errorCode: null,
-    });
-    const row = await settle(
-      tx,
-      messageId,
-      null,
-      ["queued", "accepted", "unknown", "cancelled"],
-      {
-        deliveryStatus: "sent",
-        msgId: landing.msgId,
-        sentAt: landing.sentAt,
-        failCode: null,
-        unknownSince: null,
-        nextAttemptAt: null,
-        lastError: null,
-      },
-      now,
-    );
-    return row !== null;
-  });
+  const applied = await getDb().$transaction((tx) =>
+    recordSentInTx(tx, messageId, landing, now),
+  );
   if (applied) {
     deps.log?.info({ messageId, msgId: landing.msgId }, "出站消息已发出");
   }
   return applied;
+}
+
+async function recordSentInTx(
+  tx: Tx,
+  messageId: string,
+  landing: { msgId: string; sentAt: Date },
+  now: Date,
+): Promise<boolean> {
+  const current = await tx.message.findUnique({ where: { id: messageId } });
+  if (!current || current.deliveryStatus === null) return false;
+  if (
+    current.deliveryStatus === "sent" ||
+    current.deliveryStatus === "failed"
+  ) {
+    return false;
+  }
+  await tx.message.deleteMany({
+    where: {
+      groupId: current.groupId,
+      msgId: landing.msgId,
+      clientMsgId: null,
+      id: { not: messageId },
+    },
+  });
+  await finishAttempt(tx, messageId, now, {
+    httpStatus: null,
+    errorCode: null,
+  });
+  const row = await settle(
+    tx,
+    messageId,
+    null,
+    ["queued", "accepted", "unknown", "cancelled"],
+    {
+      deliveryStatus: "sent",
+      msgId: landing.msgId,
+      sentAt: landing.sentAt,
+      failCode: null,
+      unknownSince: null,
+      nextAttemptAt: null,
+      lastError: null,
+    },
+    now,
+  );
+  return row !== null;
 }
 
 // ---- 派发：调网关 + 按 A2 错误表记账 -------------------------------------------------------
@@ -1058,59 +1070,79 @@ export async function recoverStaleClaims(
 
 /**
  * message_sent { clientMsgId, msgId, sentAt } → sent；message_failed { clientMsgId, code } → failed + 与同名
- * 同步错误一样的后果（GROUP_WRITE_FORBIDDEN → 群 unreachable；ACCOUNT_SUSPENDED → 账号 suspended 级联）。
+ * 同步错误一样的后果（GROUP_WRITE_FORBIDDEN → 群 unreachable；ACCOUNT_SUSPENDED / SESSION_EXPIRED → 账号终态级联）。
+ * 在调用方（入站事件）的事务里跑：记账、后果与事件的 processedAt 同生共死 —— 进程死在中间，事件重放时
+ * 整个再来一遍，不会出现「消息已 failed、后果却没跟上」而重放又因 applied = false 跳过后果。
+ * 锁序与派发一致：先账号 / 群行，再消息行。
  * 幂等：重复事件（已是该终态）返回 applied = false；不认识的 clientMsgId 也是 false（不是我们发的，或已被清理）。
  */
 export async function applyGatewayDelivery(
+  tx: Tx,
   input: GatewayDeliveryInput,
-  deps: OutboxDeps = {},
+  deps: DeliveryTxDeps,
 ): Promise<ApplyDeliveryResult> {
   const clock = deps.clock ?? systemClock;
-  const db = getDb();
-  const row = await db.message.findUnique({
+  const now = clock.now();
+  const row = await tx.message.findUnique({
     where: { clientMsgId: input.clientMsgId },
     select: { id: true, groupId: true, accountId: true, deliveryStatus: true },
   });
   if (!row) {
-    deps.log?.warn(
-      { clientMsgId: input.clientMsgId },
-      "网关回执对应的出站消息不存在",
+    deps.afterCommit(() =>
+      deps.log?.warn(
+        { clientMsgId: input.clientMsgId },
+        "网关回执对应的出站消息不存在",
+      ),
     );
     return { applied: false, status: null };
   }
 
   if (input.msgId !== undefined) {
-    const parsed =
-      input.sentAt === undefined ? clock.now() : new Date(input.sentAt);
-    const sentAt = Number.isNaN(parsed.getTime()) ? clock.now() : parsed;
-    const applied = await recordSent(
-      row.id,
-      { msgId: input.msgId, sentAt },
-      deps,
-    );
+    const parsed = input.sentAt === undefined ? now : new Date(input.sentAt);
+    const sentAt = Number.isNaN(parsed.getTime()) ? now : parsed;
+    const msgId = input.msgId;
+    const applied = await recordSentInTx(tx, row.id, { msgId, sentAt }, now);
+    if (applied) {
+      deps.afterCommit(() =>
+        deps.log?.info({ messageId: row.id, msgId }, "出站消息已发出"),
+      );
+    }
     return { applied, status: applied ? "sent" : row.deliveryStatus };
   }
 
   const code = input.code ?? "UNKNOWN";
-  const applied = await recordFailed(row.id, null, code, {}, deps);
-  if (applied) {
-    deps.log?.warn(
-      { clientMsgId: input.clientMsgId, code },
-      "网关 message_failed，出站消息 failed",
+  const terminal: TerminalStatus | null =
+    code === "ACCOUNT_SUSPENDED"
+      ? "suspended"
+      : code === "SESSION_EXPIRED"
+        ? "session_expired"
+        : null;
+  if (terminal !== null && row.accountId !== null) {
+    const accountId = row.accountId;
+    const entered = await enterTerminalInTx(
+      tx,
+      accountId,
+      terminal,
+      "gateway_event",
+      now,
     );
-    if (code === "GROUP_WRITE_FORBIDDEN") {
-      await markGroupUnreachable(row.groupId, code, { clock, log: deps.log });
-    } else if (code === "ACCOUNT_SUSPENDED" && row.accountId !== null) {
-      await enterTerminal(row.accountId, "suspended", "gateway_event", {
-        clock,
-        log: deps.log,
-      });
-    } else if (code === "SESSION_EXPIRED" && row.accountId !== null) {
-      await enterTerminal(row.accountId, "session_expired", "gateway_event", {
-        clock,
-        log: deps.log,
-      });
-    }
+    deps.afterCommit(() =>
+      logTransition(accountId, terminal, "gateway_event", entered, deps.log),
+    );
+  } else if (code === "GROUP_WRITE_FORBIDDEN") {
+    const marked = await markGroupUnreachableInTx(tx, row.groupId, code, now);
+    deps.afterCommit(() =>
+      logGroupUnreachable(row.groupId, code, marked, deps.log),
+    );
+  }
+  const applied = await recordFailedInTx(tx, row.id, null, code, {}, now);
+  if (applied) {
+    deps.afterCommit(() =>
+      deps.log?.warn(
+        { clientMsgId: input.clientMsgId, code },
+        "网关 message_failed，出站消息 failed",
+      ),
+    );
   }
   return { applied, status: applied ? "failed" : row.deliveryStatus };
 }

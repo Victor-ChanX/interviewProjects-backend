@@ -227,21 +227,25 @@ model OutboundAttempt {
 /// 网关 SSE 事件原文 + 处理状态。at-least-once：eventId 唯一，重复推送在 create 时撞 P2002 直接 ack。
 /// type 用 String 不用 enum：网关新增事件类型时也要能原样落库，不能因为枚举拒绝而丢事件。
 model InboundEvent {
-  id          String    @id @default(uuid(7))
+  id            String    @id @default(uuid(7))
   /// 网关 eventId（SSE 的 id 帧；全局单调递增，比较大小由网关的 since 语义负责，这里只存原文）
-  eventId     String    @unique @map("event_id")
-  type        String
+  eventId       String    @unique @map("event_id")
+  type          String
   /// data 里的网关 groupId（account_status 事件没有）；只为按群检索，不做外键：事件可能先于本地群记录到达，外键会把事件拒之门外
-  groupId     String?   @map("group_id")
-  payload     Json
-  receivedAt  DateTime  @default(now()) @map("received_at") @db.Timestamptz
-  /// 处理成功的时刻；null = 未处理或处理失败（失败的同时写一行 inconsistencies，事件内容不丢）
-  processedAt DateTime? @map("processed_at") @db.Timestamptz
-  /// 处理失败次数与最近一次错误，供回收步骤重试
-  attempts    Int       @default(0)
-  lastError   String?   @map("last_error")
+  groupId       String?   @map("group_id")
+  payload       Json
+  receivedAt    DateTime  @default(now()) @map("received_at") @db.Timestamptz
+  /// 处理成功的时刻；null = 未处理或处理失败（首次失败时写一行 inconsistencies，事件内容不丢）
+  processedAt   DateTime? @map("processed_at") @db.Timestamptz
+  /// 处理失败次数与最近一次错误
+  attempts      Int       @default(0)
+  lastError     String?   @map("last_error")
+  /// 下一次（重新）处理的时刻，inbound-retry-worker 按它领取：入册时 = 收到时刻 + 孤儿宽限（进程死在入册与处理之间
+  /// 也有人接手），失败后按退避排；处理成功、或失败次数达上限（只留给操作员）时为 null
+  nextAttemptAt DateTime? @map("next_attempt_at") @db.Timestamptz
 
   @@index([processedAt, receivedAt])
+  @@index([nextAttemptAt])
   @@index([groupId])
   @@map("inbound_events")
 }

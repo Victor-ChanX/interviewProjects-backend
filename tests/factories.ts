@@ -26,6 +26,11 @@ import type {
 import { SEED_USERS } from "../src/db/seed.js";
 import { REFRESH_COOKIE_NAME } from "../src/services/auth-service.js";
 import {
+  type ApplyDeliveryResult,
+  applyGatewayDelivery,
+  type GatewayDeliveryInput,
+} from "../src/services/outbox-service.js";
+import {
   assignWsSeqs,
   emitWsEvent,
   type WsEventType,
@@ -334,4 +339,28 @@ export async function withFailingUpdates<T>(
     await db.$executeRawUnsafe(`DROP TRIGGER injected_failure ON ${table}`);
     await db.$executeRawUnsafe(`DROP FUNCTION injected_failure()`);
   }
+}
+
+// ---- 网关回执（message_sent / message_failed）------------------------------------------
+
+/**
+ * 模拟入站 worker 收到一条 message_sent / message_failed：在一个事务里调 outbox-service.applyGatewayDelivery
+ * （生产里它跑在处理这条事件的事务中），commit 之后执行它登记的日志。
+ */
+export async function deliverGatewayReceipt(
+  input: GatewayDeliveryInput,
+  deps: {
+    clock?: Clock;
+    log?: Parameters<typeof applyGatewayDelivery>[2]["log"];
+  } = {},
+): Promise<ApplyDeliveryResult> {
+  const committed: (() => void)[] = [];
+  const result = await getDb().$transaction((tx) =>
+    applyGatewayDelivery(tx, input, {
+      ...deps,
+      afterCommit: (fn) => committed.push(fn),
+    }),
+  );
+  for (const fn of committed) fn();
+  return result;
 }

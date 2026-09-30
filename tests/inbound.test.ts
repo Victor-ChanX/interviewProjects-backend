@@ -27,17 +27,28 @@ import {
 import {
   advanceCursor,
   type ApplyGatewayDelivery,
+  AUTO_RESOLVED_BY,
   INCONSISTENCY_KINDS,
   ingest,
+  MAX_ATTEMPTS,
+  ORPHAN_GRACE_MS,
   readCursor,
+  RETRY_BASE_MS,
+  retryDueEvents,
 } from "../src/services/inbound-service.js";
+import { applyGatewayDelivery } from "../src/services/outbox-service.js";
 import { buildGatewayApp } from "../src/sim/gateway/app.js";
 import {
   abortableSleep,
   consumeOnce,
   startInboundWorker,
 } from "../src/workers/inbound-worker.js";
-import { makeAccount, makeGroup } from "./factories.js";
+import {
+  makeAccount,
+  makeGroup,
+  makeMessage,
+  withFailingUpdates,
+} from "./factories.js";
 import { truncateAll } from "./setup.js";
 
 type Json = Record<string, unknown>;
@@ -334,7 +345,7 @@ describe("ingest", () => {
   describe("message_sent / message_failed → #7 的 applyGatewayDelivery", () => {
     it("注入的记账函数按解析后的参数被调用（sentAt 为 Date；failed 带 code）", async () => {
       const calls: unknown[] = [];
-      const applyGatewayDelivery: ApplyGatewayDelivery = async (input) => {
+      const applyGatewayDelivery: ApplyGatewayDelivery = async (_tx, input) => {
         calls.push(input);
       };
       const sentAt = at(0);
@@ -485,6 +496,49 @@ describe("ingest", () => {
       ]);
     });
 
+    it("成员事件按最后一次为准：更新的 member_left 已处理后，迟到的旧 member_joined 不把人加回来（反之亦然）", async () => {
+      const group = await localGroup();
+      const left = frame(
+        "member_left",
+        { groupId: "g-1", platformUserId: "u1" },
+        11,
+      );
+      const staleJoin = frame(
+        "member_joined",
+        { groupId: "g-1", platformUserId: "u1" },
+        10,
+      );
+      expect((await ingest(left, { clock, log: silentLog })).outcome).toBe(
+        "processed",
+      );
+      expect((await ingest(staleJoin, { clock, log: silentLog })).outcome).toBe(
+        "processed",
+      );
+      expect(
+        await db().groupMember.count({ where: { groupId: group.id } }),
+      ).toBe(0);
+
+      const join = frame(
+        "member_joined",
+        { groupId: "g-1", platformUserId: "u2" },
+        21,
+      );
+      const staleLeft = frame(
+        "member_left",
+        { groupId: "g-1", platformUserId: "u2" },
+        20,
+      );
+      await ingest(join, { clock, log: silentLog });
+      await ingest(staleLeft, { clock, log: silentLog });
+      expect(
+        (await db().groupMember.findMany({ where: { groupId: group.id } })).map(
+          (m) => m.platformUserId,
+        ),
+      ).toEqual(["u2"]);
+      // 过时的那两条不发 member_changed
+      expect(await wsEvents("member_changed")).toHaveLength(2);
+    });
+
     it("指向本地没有的群：不一致记录，不写成员表", async () => {
       await ingest(
         frame("member_joined", { groupId: "g-none", platformUserId: "ext-1" }),
@@ -556,7 +610,7 @@ describe("ingest", () => {
   });
 
   describe("处理失败：不中断、不丢", () => {
-    it("payload 缺 groupId → 事务回滚、原文保留、attempts + 1、inconsistency + ws 事件；后续事件照常处理；重推同一事件跳过", async () => {
+    it("payload 缺 groupId → 事务回滚、原文保留、attempts + 1、排重试、inconsistency + ws 事件；后续事件照常处理；重推同一事件 = 再试一次", async () => {
       const group = await localGroup();
       const bad = frame("message", {
         msgId: "m-bad",
@@ -574,6 +628,9 @@ describe("ingest", () => {
       expect(row.attempts).toBe(1);
       expect(row.lastError).toContain("groupId");
       expect(row.payload).toEqual(bad.data);
+      expect(row.nextAttemptAt?.getTime()).toBe(
+        clock.now().getTime() + RETRY_BASE_MS,
+      );
 
       const incs = await inconsistencies(INCONSISTENCY_KINDS.eventFailed);
       expect(incs).toHaveLength(1);
@@ -597,9 +654,16 @@ describe("ingest", () => {
         1,
       );
 
-      // 网关重推那条坏事件：已入册（attempts > 0）→ 跳过，不再写第二条不一致
+      // 网关重推那条坏事件：还没处理成 → 再试一次（仍失败），attempts 2，退避翻倍，不再写第二条不一致
       const again = await ingest(bad, { clock, log: silentLog });
-      expect(again.outcome).toBe("duplicate");
+      expect(again.outcome).toBe("failed");
+      const retried = await db().inboundEvent.findUniqueOrThrow({
+        where: { eventId: String(bad.eventId) },
+      });
+      expect(retried.attempts).toBe(2);
+      expect(retried.nextAttemptAt?.getTime()).toBe(
+        clock.now().getTime() + 2 * RETRY_BASE_MS,
+      );
       expect(
         await inconsistencies(INCONSISTENCY_KINDS.eventFailed),
       ).toHaveLength(1);
@@ -636,6 +700,177 @@ describe("ingest", () => {
       expect(
         (await db().inboundEvent.findFirstOrThrow()).processedAt,
       ).not.toBeNull();
+    });
+  });
+
+  describe("失败重试（retryDueEvents）", () => {
+    const failingSent = () =>
+      frame("message_sent", {
+        clientMsgId: "c-1",
+        msgId: "m-1",
+        sentAt: at(0).toISOString(),
+      });
+
+    it("失败的事件到点被重试 worker 重新处理；成功后失败记录自动标为已处理（推 inconsistency_resolved）", async () => {
+      const ev = failingSent();
+      // 没注入记账函数 → 失败入册
+      expect((await ingest(ev, { clock, log: silentLog })).outcome).toBe(
+        "failed",
+      );
+      const calls: unknown[] = [];
+      const deliver: ApplyGatewayDelivery = async (_tx, input) => {
+        calls.push(input);
+      };
+      // 还没到点：不领
+      expect(
+        await retryDueEvents({
+          clock,
+          log: silentLog,
+          applyGatewayDelivery: deliver,
+        }),
+      ).toEqual({ claimed: 0, processed: 0, failed: 0 });
+
+      clock.advance(RETRY_BASE_MS);
+      expect(
+        await retryDueEvents({
+          clock,
+          log: silentLog,
+          applyGatewayDelivery: deliver,
+        }),
+      ).toEqual({ claimed: 1, processed: 1, failed: 0 });
+      expect(calls).toHaveLength(1);
+      const row = await db().inboundEvent.findUniqueOrThrow({
+        where: { eventId: String(ev.eventId) },
+      });
+      expect(row.processedAt).not.toBeNull();
+      expect(row.nextAttemptAt).toBeNull();
+      const [inc] = await inconsistencies(INCONSISTENCY_KINDS.eventFailed);
+      expect(inc).toMatchObject({ resolvedBy: AUTO_RESOLVED_BY });
+      expect(inc?.resolvedAt).not.toBeNull();
+      expect(
+        (await wsEvents("inconsistency_resolved")).map((e) => e.payload),
+      ).toEqual([
+        {
+          id: inc?.id,
+          resolvedAt: clock.now().toISOString(),
+          resolvedBy: AUTO_RESOLVED_BY,
+        },
+      ]);
+      // 处理过了：再到点也不会再领、不会再调一次
+      clock.advance(60_000);
+      expect(
+        (
+          await retryDueEvents({
+            clock,
+            log: silentLog,
+            applyGatewayDelivery: deliver,
+          })
+        ).claimed,
+      ).toBe(0);
+      expect(calls).toHaveLength(1);
+    });
+
+    it("一直失败：退避翻倍，失败 MAX_ATTEMPTS 次后停止自动重试，留一条「已停止」的不一致给操作员", async () => {
+      const ev = failingSent();
+      await ingest(ev, { clock, log: silentLog });
+      for (let attempt = 2; attempt <= MAX_ATTEMPTS; attempt += 1) {
+        clock.advance(60_000);
+        expect(await retryDueEvents({ clock, log: silentLog })).toEqual({
+          claimed: 1,
+          processed: 0,
+          failed: 1,
+        });
+      }
+      const row = await db().inboundEvent.findUniqueOrThrow({
+        where: { eventId: String(ev.eventId) },
+      });
+      expect(row.attempts).toBe(MAX_ATTEMPTS);
+      expect(row.nextAttemptAt).toBeNull();
+      expect(row.processedAt).toBeNull();
+      const incs = await inconsistencies(INCONSISTENCY_KINDS.eventFailed);
+      expect(incs.map((i) => i.message)).toEqual([
+        expect.stringContaining("将自动重试"),
+        expect.stringContaining("已停止自动重试"),
+      ]);
+      clock.advance(3_600_000);
+      expect((await retryDueEvents({ clock, log: silentLog })).claimed).toBe(0);
+    });
+
+    it("进程死在入册与处理之间（孤儿行）：网关不重推也会在宽限期后被重试 worker 接手", async () => {
+      const group = await localGroup();
+      const ev = frame("message", msgData("g-1", "m-orphan"));
+      await db().inboundEvent.create({
+        data: {
+          eventId: String(ev.eventId),
+          type: ev.type,
+          groupId: "g-1",
+          payload: ev.data as Prisma.InputJsonObject,
+          receivedAt: clock.now(),
+          nextAttemptAt: new Date(clock.now().getTime() + ORPHAN_GRACE_MS),
+        },
+      });
+      expect((await retryDueEvents({ clock, log: silentLog })).claimed).toBe(0);
+      clock.advance(ORPHAN_GRACE_MS);
+      expect(await retryDueEvents({ clock, log: silentLog })).toEqual({
+        claimed: 1,
+        processed: 1,
+        failed: 0,
+      });
+      expect(await db().message.count({ where: { groupId: group.id } })).toBe(
+        1,
+      );
+    });
+
+    it("message_failed 的后果（账号终态级联）中途出错：记账与后果一起回滚；重试时一并补上", async () => {
+      const group = await localGroup();
+      const account = await makeAccount({
+        id: "acc-x",
+        status: "online",
+        platformUserId: "pu-x",
+      });
+      const outbound = await makeMessage({
+        groupId: group.id,
+        accountId: account.id,
+        senderPlatformUserId: "pu-x",
+        isOwn: true,
+        clientMsgId: "c-x",
+        deliveryStatus: "accepted",
+      });
+      const ev = frame("message_failed", {
+        clientMsgId: "c-x",
+        code: "ACCOUNT_SUSPENDED",
+      });
+      const first = await withFailingUpdates(
+        "accounts",
+        "NEW.status = 'suspended'",
+        () => ingest(ev, { clock, log: silentLog, applyGatewayDelivery }),
+      );
+      expect(first.outcome).toBe("failed");
+      // 一半都没生效：消息还是 accepted、账号还是 online
+      expect(
+        (await db().message.findUniqueOrThrow({ where: { id: outbound.id } }))
+          .deliveryStatus,
+      ).toBe("accepted");
+      expect(
+        (await db().account.findUniqueOrThrow({ where: { id: account.id } }))
+          .status,
+      ).toBe("online");
+
+      clock.advance(RETRY_BASE_MS);
+      expect(
+        await retryDueEvents({ clock, log: silentLog, applyGatewayDelivery }),
+      ).toEqual({ claimed: 1, processed: 1, failed: 0 });
+      expect(
+        await db().message.findUniqueOrThrow({ where: { id: outbound.id } }),
+      ).toMatchObject({
+        deliveryStatus: "failed",
+        failCode: "ACCOUNT_SUSPENDED",
+      });
+      expect(
+        (await db().account.findUniqueOrThrow({ where: { id: account.id } }))
+          .status,
+      ).toBe("suspended");
+      expect(await wsEvents("account_terminal")).toHaveLength(1);
     });
   });
 
@@ -830,7 +1065,7 @@ describe("openEventStream / inbound worker（真 SSE）", () => {
       // message_sent 的记账交给 #7；这里用一个假实现按 clientMsgId 写出站行的 msgId（模拟 #7 的合并约定不在本用例范围）
       const deliveries: Json[] = [];
       start({
-        applyGatewayDelivery: async (input) => {
+        applyGatewayDelivery: async (_tx, input) => {
           deliveries.push(input);
         },
       });

@@ -19,6 +19,7 @@ import {
   defaultAgentWorkerId,
   startAgentWorker,
 } from "./workers/agent-worker.js";
+import { startInboundRetryWorker } from "./workers/inbound-retry-worker.js";
 import { startInboundWorker } from "./workers/inbound-worker.js";
 import { defaultJobWorkerId, startJobWorker } from "./workers/job-worker.js";
 import { defaultWorkerId, startOutboxWorker } from "./workers/outbox-worker.js";
@@ -56,6 +57,12 @@ async function main(): Promise<void> {
     gateway,
     applyGatewayDelivery,
   });
+  // 入站事件重试：处理失败 / 入册后没处理成的事件，排期在 inbound_events.nextAttemptAt，这里每秒看一眼
+  const inboundRetryWorker = startInboundRetryWorker({
+    clock: systemClock,
+    applyGatewayDelivery,
+    intervalMs: 1_000,
+  });
   const wsBroadcastWorker = startWsBroadcastWorker({
     hub: wsHub,
     pollIntervalMs: 200,
@@ -92,6 +99,7 @@ async function main(): Promise<void> {
       outboxWorker.stop(),
       rateLimitWorker.stop(),
       inboundWorker.stop(),
+      inboundRetryWorker.stop(),
       wsBroadcastWorker.stop(),
       jobWorker.stop(),
       agentWorker.stop(),

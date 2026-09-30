@@ -3,7 +3,7 @@
 // 真库（tests/setup.ts 的临时 schema）；网关用 src/sim/gateway 的 buildGatewayApp 起在 listen(0) 上，出站 worker
 // 经 createGatewayClient 走真 HTTP。时间：应用、service、worker 与网关模拟器共用一个可拨动的假 Clock。
 // worker 不起循环：直接 await runSequenceTick()（一个 tick = 领取到点的 run 并推进）；出站派发 await runOutboxTick()；
-// message_sent / message_failed 由 #8 的入站流消费，这里直接调 applyGatewayDelivery 模拟它。
+// message_sent / message_failed 由 #8 的入站流消费，这里用 factories 的 deliverGatewayReceipt 模拟它。
 // 多连接真并行的并发启动用例在 tests/sequences-concurrency.test.ts。
 import { randomUUID } from "node:crypto";
 
@@ -27,8 +27,7 @@ import {
   createGatewayClient,
   type GatewayClient,
 } from "../src/services/gateway-client.js";
-import { markGroupUnreachable } from "../src/services/group-service.js";
-import { applyGatewayDelivery } from "../src/services/outbox-service.js";
+import { markGroupUnreachableInTx } from "../src/services/group-service.js";
 import {
   createSequence,
   NO_ACCOUNT_FAIL_CODE,
@@ -39,7 +38,12 @@ import {
 import { buildGatewayApp } from "../src/sim/gateway/app.js";
 import { runOutboxTick } from "../src/workers/outbox-worker.js";
 import { runSequenceTick } from "../src/workers/sequence-worker.js";
-import { loginAs, makeAccount, makeGroup } from "./factories.js";
+import {
+  deliverGatewayReceipt,
+  loginAs,
+  makeAccount,
+  makeGroup,
+} from "./factories.js";
 import { truncateAll } from "./setup.js";
 
 type Json = Record<string, unknown>;
@@ -354,7 +358,7 @@ describe("定时序列（#15）", () => {
 
   /** 模拟网关 message_sent（#8 的入站流会调同一个入口） */
   const sent = (clientMsgId: string, at: Date) =>
-    applyGatewayDelivery(
+    deliverGatewayReceipt(
       { clientMsgId, msgId: `m-${randomUUID().slice(0, 6)}`, sentAt: at },
       { clock, log: silent },
     );
@@ -883,7 +887,7 @@ describe("定时序列（#15）", () => {
       const s1 = await stepOf(runId, 1);
       clock.advance(sec(1));
       const at = clock.now();
-      await applyGatewayDelivery(
+      await deliverGatewayReceipt(
         { clientMsgId: s1.clientMsgId!, code: "SENDER_NOT_IN_GROUP" },
         { clock, log: silent },
       );
@@ -946,10 +950,13 @@ describe("定时序列（#15）", () => {
       await tick();
       const s1 = await stepOf(runId, 1);
       await sent(s1.clientMsgId!, clock.now());
-      const result = await markGroupUnreachable(
-        group.id,
-        "GROUP_WRITE_FORBIDDEN",
-        { clock, log: silent },
+      const result = await getDb().$transaction((tx) =>
+        markGroupUnreachableInTx(
+          tx,
+          group.id,
+          "GROUP_WRITE_FORBIDDEN",
+          clock.now(),
+        ),
       );
       expect(result.sequenceRunsStopped).toBe(1);
       const r = await run(runId);

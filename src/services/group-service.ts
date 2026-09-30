@@ -21,7 +21,7 @@
 //   由 agent 循环 #12 在每步之后读 groups.status 决定），只写一行 ws_events group_status_changed 让操作员看见。
 //   计数 agentRunsRunning 返回给调用方（api.side-effect-count）。
 // - 账号状态不变（题目原文）。
-import { type Clock, systemClock } from "../core/clock.js";
+import type { Clock } from "../core/clock.js";
 import { Conflict, Invalid, NotFound } from "../core/errors.js";
 import type { Logger } from "../core/logger.js";
 import { getDb } from "../db/client.js";
@@ -58,20 +58,6 @@ export type MarkUnreachableResult = {
   /** 仍在 running 的 agent run 数：由 #12 的循环在当前步后自行 cancelled */
   agentRunsRunning: number;
 };
-
-/** markGroupUnreachableInTx 自己开一个事务（message_failed 事件的记账还不在入站事务里时用）。 */
-export async function markGroupUnreachable(
-  groupId: string,
-  reason: string,
-  deps: GroupServiceDeps = {},
-): Promise<MarkUnreachableResult> {
-  const clock = deps.clock ?? systemClock;
-  const result = await getDb().$transaction((tx) =>
-    markGroupUnreachableInTx(tx, groupId, reason, clock.now()),
-  );
-  logGroupUnreachable(groupId, reason, result, deps.log);
-  return result;
-}
 
 /** markGroupUnreachableInTx 的业务日志：调用方在 commit 之后调。 */
 export function logGroupUnreachable(

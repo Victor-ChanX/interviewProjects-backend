@@ -4,7 +4,7 @@
 // 时间：应用、service、worker、网关模拟器共用一个可拨动的假 Clock（clock.advance 同时推动本地的限流截止 /
 // 2 秒确认窗口与网关侧的限流期），不真 sleep；只有模拟器「504 后落地」用 setTimeout(0) 时等几毫秒。
 // worker 不起循环：直接 await runOutboxTick()，一个 tick = 回收 → 确认 unknown → 领取 → 派发。
-// message_sent / message_failed 事件流由 #8 消费；这里直接调 applyGatewayDelivery 模拟它。
+// message_sent / message_failed 事件流由 #8 消费；这里用 factories 的 deliverGatewayReceipt（事务里调 applyGatewayDelivery）模拟它。
 // 多连接真并行的领取用例在 tests/outbox-concurrency.test.ts。
 import { randomUUID } from "node:crypto";
 
@@ -25,14 +25,11 @@ import {
   createGatewayClient,
   type GatewayClient,
 } from "../src/services/gateway-client.js";
-import {
-  applyGatewayDelivery,
-  claimBatch,
-  enqueueMessage,
-} from "../src/services/outbox-service.js";
+import { claimBatch, enqueueMessage } from "../src/services/outbox-service.js";
 import { buildGatewayApp } from "../src/sim/gateway/app.js";
 import { runOutboxTick } from "../src/workers/outbox-worker.js";
 import {
+  deliverGatewayReceipt,
   loginAs,
   makeAccount,
   makeGroup,
@@ -434,7 +431,7 @@ describe("outbox（#7）", () => {
       const landed = sim.messages[0]!;
 
       // #8 收到 message_sent 后调这里
-      const applied = await applyGatewayDelivery(
+      const applied = await deliverGatewayReceipt(
         { clientMsgId, msgId: landed.msgId, sentAt: landed.sentAt },
         { clock, log: silent },
       );
@@ -456,7 +453,7 @@ describe("outbox（#7）", () => {
       expect(events[2]).toMatchObject({ msgId: landed.msgId, clientMsgId });
 
       // 重复的 message_sent：不改、不再发事件
-      const again = await applyGatewayDelivery(
+      const again = await deliverGatewayReceipt(
         { clientMsgId, msgId: landed.msgId, sentAt: landed.sentAt },
         { clock, log: silent },
       );
@@ -481,7 +478,7 @@ describe("outbox（#7）", () => {
         },
       });
 
-      await applyGatewayDelivery(
+      await deliverGatewayReceipt(
         { clientMsgId, msgId: landed.msgId, sentAt: new Date(landed.sentAt) },
         { clock, log: silent },
       );
@@ -497,7 +494,7 @@ describe("outbox（#7）", () => {
     });
 
     it("不认识的 clientMsgId：applied = false，不写任何东西", async () => {
-      const r = await applyGatewayDelivery(
+      const r = await deliverGatewayReceipt(
         { clientMsgId: randomUUID(), msgId: "m", sentAt: clock.now() },
         { clock, log: silent },
       );
@@ -1077,7 +1074,7 @@ describe("outbox（#7）", () => {
       },
     );
 
-    it("message_failed 事件（applyGatewayDelivery）：GROUP_WRITE_FORBIDDEN → failed + 群 unreachable；ACCOUNT_SUSPENDED → failed + 账号终态", async () => {
+    it("message_failed 事件：GROUP_WRITE_FORBIDDEN → failed + 群 unreachable；ACCOUNT_SUSPENDED → failed + 账号终态", async () => {
       const { group, creator } = await stageGroup();
       const other = await stageGroup();
       const m1 = await enqueue(group, creator);
@@ -1085,7 +1082,7 @@ describe("outbox（#7）", () => {
       await tick();
       expect((await row(m1.messageId)).deliveryStatus).toBe("accepted");
 
-      const r1 = await applyGatewayDelivery(
+      const r1 = await deliverGatewayReceipt(
         { clientMsgId: m1.clientMsgId, code: "GROUP_WRITE_FORBIDDEN" },
         { clock, log: silent },
       );
@@ -1100,7 +1097,7 @@ describe("outbox（#7）", () => {
       ).toBe("unreachable");
       expect((await account(creator.id)).status).toBe("online");
 
-      const r2 = await applyGatewayDelivery(
+      const r2 = await deliverGatewayReceipt(
         { clientMsgId: m2.clientMsgId, code: "ACCOUNT_SUSPENDED" },
         { clock, log: silent },
       );
@@ -1112,7 +1109,7 @@ describe("outbox（#7）", () => {
       expect((await account(other.creator.id)).status).toBe("suspended");
 
       // 重复的 message_failed：不改
-      const dup = await applyGatewayDelivery(
+      const dup = await deliverGatewayReceipt(
         { clientMsgId: m2.clientMsgId, code: "ACCOUNT_SUSPENDED" },
         { clock, log: silent },
       );

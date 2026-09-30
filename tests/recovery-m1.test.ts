@@ -39,7 +39,13 @@ import {
   runOutboxTick,
   startOutboxWorker,
 } from "../src/workers/outbox-worker.js";
-import { loginAs, makeAccount, makeGroup, makeMessage } from "./factories.js";
+import {
+  deliverGatewayReceipt,
+  loginAs,
+  makeAccount,
+  makeGroup,
+  makeMessage,
+} from "./factories.js";
 import { truncateAll } from "./setup.js";
 
 type Json = Record<string, unknown>;
@@ -774,7 +780,7 @@ describe("重启恢复与并发（#10）", () => {
           clock,
           log: silent,
         }),
-        applyGatewayDelivery(
+        deliverGatewayReceipt(
           { clientMsgId: queued.clientMsgId!, code: "ACCOUNT_SUSPENDED" },
           { clock, log: silent },
         ),
