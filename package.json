@@ -26,10 +26,12 @@
     "llm-agent": "tsx --env-file-if-exists=.env src/llm-agent/main.ts"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.129.0",
     "@fastify/cookie": "^11.1.2",
     "@fastify/cors": "^11.3.0",
     "@fastify/swagger": "^9.9.0",
     "@fastify/websocket": "^11.3.1",
+    "@google/genai": "^2.24.0",
     "@prisma/adapter-pg": "^7.10.0",
     "@prisma/client": "^7.10.0",
     "fastify": "^5.12.5",

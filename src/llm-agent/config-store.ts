@@ -1,10 +1,11 @@
-// 当前生效的 LLM 配置（base url / api key / 模型）：只来自控制台保存的文件（LLM_AGENT_CONFIG_FILE）。
+// 当前生效的 LLM 配置（服务商 / api key / 模型）：只来自控制台保存的文件（LLM_AGENT_CONFIG_FILE）。
+// 服务商只有题目 C2 点名的两家：anthropic（Claude）与 gemini（Gemini），各用官方 SDK 调官方端点。
 //
 // - 读：每次 /agent/turn、/agent/audit、/admin/* 都调 load() 重新读文件（文件很小），控制台保存后不用重启；
-//   多个进程共用同一个文件也一致。文件不存在 → source "none"（/agent/* 回 503）；文件存在但坏了 → 抛错，
-//   不当作「未配置」糊过去。
+//   多个进程共用同一个文件也一致。文件不存在 → source "none"（/agent/* 回 503）；文件存在但形状不对 → 抛错，
+//   不当作「未配置」糊过去（控制台带着 key 重新保存一次即可覆盖）。
 // - 写：先写同目录临时文件（mode 600）再 rename，最后再 chmod 600 —— 不会读到半个文件，key 不会对其他用户可读。
-// - key 明文只在这里和发往上游的 Authorization 头里出现：对外只给 hasApiKey + apiKeyHint（前 3 后 4），
+// - key 明文只在这里和发往上游的 SDK 客户端里出现：对外只给 hasApiKey + apiKeyHint（前 3 后 4），
 //   任何要进响应 / 日志的上游报错先过 redact()。
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
@@ -13,11 +14,14 @@ import { z } from "zod";
 
 import { systemClock, type Clock } from "../core/clock.js";
 
+export const PROVIDERS = ["anthropic", "gemini"] as const;
+export type Provider = (typeof PROVIDERS)[number];
+
 export type LlmConfigSource = "file" | "none";
 
 /** 调上游所需的全部：有它才能服务 /agent/turn、/agent/audit */
 export type LlmTarget = {
-  baseUrl: string;
+  provider: Provider;
   apiKey: string;
   model: string;
   /** null = 同 model */
@@ -26,7 +30,7 @@ export type LlmTarget = {
 
 export type LoadedLlmConfig = {
   source: LlmConfigSource;
-  baseUrl: string | null;
+  provider: Provider | null;
   apiKey: string | null;
   model: string | null;
   auditModel: string | null;
@@ -38,7 +42,7 @@ export type LoadedLlmConfig = {
 
 /** 对外（管理端点）的形状：永不含 key 明文 */
 export type LlmConfigView = {
-  baseUrl: string | null;
+  provider: Provider | null;
   model: string | null;
   auditModel: string | null;
   hasApiKey: boolean;
@@ -48,22 +52,19 @@ export type LlmConfigView = {
 };
 
 export type ConfigStore = {
+  /** 配置文件路径：会话状态目录放在它旁边（session-store.ts） */
+  readonly filePath: string;
   load(): Promise<LoadedLlmConfig>;
   save(input: LlmTarget): Promise<LoadedLlmConfig>;
 };
 
 const StoredFile = z.object({
-  baseUrl: z.string().min(1),
+  provider: z.enum(PROVIDERS),
   apiKey: z.string().min(1),
   model: z.string().min(1),
   auditModel: z.string().min(1).nullable(),
   updatedAt: z.string(),
 });
-
-/** 去掉首尾空白与末尾的 /：「同一个主机」的比较与拼 url 都用它 */
-export function normalizeBaseUrl(url: string): string {
-  return url.trim().replace(/\/+$/, "");
-}
 
 /** key 的提示：只露前 3 后 4（`sk-…abcd`）；太短的 key 露了就等于全露，只给省略号 */
 export function apiKeyHint(key: string | null): string | null {
@@ -80,7 +81,7 @@ export function redact(text: string, key: string | null | undefined): string {
 
 export function toView(loaded: LoadedLlmConfig): LlmConfigView {
   return {
-    baseUrl: loaded.baseUrl,
+    provider: loaded.provider,
     model: loaded.model,
     auditModel: loaded.auditModel,
     hasApiKey: loaded.apiKey !== null,
@@ -92,7 +93,7 @@ export function toView(loaded: LoadedLlmConfig): LlmConfigView {
 
 const NONE: LoadedLlmConfig = Object.freeze({
   source: "none",
-  baseUrl: null,
+  provider: null,
   apiKey: null,
   model: null,
   auditModel: null,
@@ -101,15 +102,15 @@ const NONE: LoadedLlmConfig = Object.freeze({
 });
 
 function fromStored(stored: z.infer<typeof StoredFile>): LoadedLlmConfig {
-  const { baseUrl, apiKey, model, auditModel, updatedAt } = stored;
+  const { provider, apiKey, model, auditModel, updatedAt } = stored;
   return {
     source: "file",
-    baseUrl,
+    provider,
     apiKey,
     model,
     auditModel,
     updatedAt,
-    usable: { baseUrl, apiKey, model, auditModel },
+    usable: { provider, apiKey, model, auditModel },
   };
 }
 
@@ -123,6 +124,8 @@ export function createConfigStore(opts: {
   const clock = opts.clock ?? systemClock;
 
   return {
+    filePath: opts.filePath,
+
     async load() {
       let raw: string;
       try {
@@ -136,7 +139,7 @@ export function createConfigStore(opts: {
         parsed = StoredFile.parse(JSON.parse(raw));
       } catch {
         throw new Error(
-          `LLM 配置文件 ${opts.filePath} 已损坏：删掉它后在控制台的模型设置里重新保存`,
+          `LLM 配置文件 ${opts.filePath} 的格式不对（服务商只支持 anthropic / gemini）：在控制台的模型设置里带上 API Key 重新保存，或删掉这个文件`,
         );
       }
       return fromStored(parsed);
@@ -144,7 +147,7 @@ export function createConfigStore(opts: {
 
     async save(input) {
       const stored: z.infer<typeof StoredFile> = {
-        baseUrl: normalizeBaseUrl(input.baseUrl),
+        provider: input.provider,
         apiKey: input.apiKey,
         model: input.model,
         auditModel: input.auditModel,

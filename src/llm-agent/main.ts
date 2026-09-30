@@ -1,6 +1,7 @@
 // 真实 LLM 版 Agent 服务入口（题目 C2）：独立进程（`npm run llm-agent`），端口 LLM_AGENT_PORT（默认 8300）。
 // 不连数据库、不启 worker；后端把 AGENT_URL 指到这里（http://localhost:8300）即可从模拟器切过来。
-// 上游（base url / key / 模型）在控制台的模型设置里配，存进 LLM_AGENT_CONFIG_FILE；没配也能启动（/agent/* 回 503）。
+// 上游只有 Claude（官方 @anthropic-ai/sdk）与 Gemini（官方 @google/genai）；服务商 / key / 模型在控制台的模型设置里配，
+// 存进 LLM_AGENT_CONFIG_FILE；没配也能启动（/agent/* 回 503）。按 runId 的会话状态放在配置文件同目录的 .llm-agent-sessions/。
 // 缺 LLM_AGENT_ADMIN_TOKEN 时打印怎么配然后退出 1。设计说明见同目录 README.md。
 import { resolve } from "node:path";
 
@@ -11,10 +12,12 @@ import {
   MODELS_TIMEOUT_MS,
   buildLlmAgentApp,
 } from "./app.js";
+import { createAnthropicClient } from "./anthropic.js";
 import { createConfigStore } from "./config-store.js";
-import { createOpenAiClient } from "./openai-client.js";
+import { createGeminiClient } from "./gemini.js";
+import { createSessionStore, sessionDirFor } from "./session-store.js";
 
-/** 429 / 5xx / 连接失败时最多再试几次（仍受总预算约束） */
+/** SDK 对 429 / 5xx / 连接失败最多再试几次（仍受每次调用的总预算约束） */
 const MAX_RETRIES = 2;
 
 async function main(): Promise<void> {
@@ -40,8 +43,12 @@ async function main(): Promise<void> {
 
   const configFile = resolve(config.llmAgentConfigFile);
   const store = createConfigStore({ filePath: configFile });
-  const loaded = await store.load();
-  if (!loaded.usable) {
+  // 配置文件格式不对也照常启动：控制台带着 key 重新保存一次就能覆盖（在那之前 /agent/*、/admin/config 回 500 并说明原因）
+  const loaded = await store.load().catch((err: unknown) => {
+    logger.warn({ err, configFile }, "LLM 配置文件读不出来");
+    return null;
+  });
+  if (loaded && !loaded.usable) {
     logger.warn(
       { configFile },
       "尚未配置 LLM：/agent/turn、/agent/audit 会回 503，直到在控制台的模型设置里保存一次",
@@ -49,8 +56,12 @@ async function main(): Promise<void> {
   }
 
   const app = await buildLlmAgentApp({
-    upstream: createOpenAiClient({ maxRetries: MAX_RETRIES }),
+    clients: {
+      anthropic: createAnthropicClient({ maxRetries: MAX_RETRIES }),
+      gemini: createGeminiClient({ maxRetries: MAX_RETRIES }),
+    },
     store,
+    sessions: createSessionStore({ dir: sessionDirFor(configFile) }),
     adminToken,
     settings: {
       turnTimeoutMs: config.llmTimeoutMs,
@@ -71,9 +82,9 @@ async function main(): Promise<void> {
   logger.info(
     {
       configFile,
-      baseUrl: loaded.baseUrl,
-      model: loaded.model,
-      source: loaded.source,
+      provider: loaded?.provider ?? null,
+      model: loaded?.model ?? null,
+      source: loaded?.source ?? null,
     },
     "llm-agent 已启动",
   );

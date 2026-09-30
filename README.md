@@ -59,10 +59,10 @@ curl -s localhost:8100/_sim/scenario -H 'content-type: application/json' -d '{"e
 
 ## 接入真实 LLM（题目 C2）
 
-`src/llm-agent/` 是一个独立的 Agent 服务：对外接口与题目 2.2 完全相同，上游走 OpenAI Chat Completions 兼容格式。
-上游的 Base URL / API Key / 模型**只在 Web 控制台的「模型设置」里配**（填 Base URL 与 Key → 获取模型列表 → 选模型 → 保存 →
-测试连接），保存后立即生效、重启后仍在。设计（协议转换、配置与 key 的处理、失败语义、超时预算、思考类模型）见
-[src/llm-agent/README.md](src/llm-agent/README.md)。
+`src/llm-agent/` 是一个独立的 Agent 服务：对外接口与题目 2.2 完全相同，上游只支持题目点名的 **Claude** 与 **Gemini**，
+分别用官方 SDK（`@anthropic-ai/sdk`、`@google/genai`）调官方端点。服务商、API Key、模型**只在 Web 控制台的「模型设置」里配**
+（选服务商、填 Key → 获取模型列表 → 选模型 → 保存 → 测试连接），保存后立即生效、重启后仍在。设计（两家的协议映射、
+思考状态按 runId 回传、配置与 key 的处理、失败语义、超时预算）见 [src/llm-agent/README.md](src/llm-agent/README.md)。
 
 ```bash
 # .env：AGENT_URL=http://localhost:8300，LLM_AGENT_ADMIN_TOKEN=<随机长串>（后端与 llm-agent 读同一份 .env）
@@ -73,22 +73,23 @@ npm run dev                     # 后端照常；控制台的模型设置经后�
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `LLM_AGENT_ADMIN_TOKEN` | llm-agent 必填 | 管理端点的令牌，后端与 llm-agent 配同一个值；后端没配时控制台显示「不支持」 |
-| `LLM_AGENT_CONFIG_FILE` | 启动目录下的 .llm-agent.json | 控制台保存的配置（含 key，chmod 600，不进 git / 镜像），相对启动目录 |
+| `LLM_AGENT_CONFIG_FILE` | 启动目录下的 .llm-agent.json | 控制台保存的配置（含 key，chmod 600，不进 git / 镜像），相对启动目录；同目录的 .llm-agent-sessions/ 存按 runId 的思考状态 |
 | `LLM_TIMEOUT_MS` | 10000 | 一次 turn 调上游的总预算（含重试），须小于后端 `AGENT_TURN_TIMEOUT_MS` |
 | `LLM_AGENT_PORT` | 8300 | 监听端口 |
 
 `AGENT_URL` 仍指向 Agent 模拟器时，控制台的模型设置显示「不支持」（`supported: false`），其余功能照常。
-审计请求先带 `response_format: {"type":"json_object"}`；服务商拒绝这个参数时自动去掉它重试一次，并从回复正文里取出 JSON 结论，所以不支持 JSON 模式的服务商也能用。
+从更早版本升级时，旧的 .llm-agent.json 格式不再被接受（`LLM_CONFIG_INVALID`）：在控制台带上 API Key 重新保存一次即可覆盖。
 
-**服务商示例**（2026-09-30 按官方文档核实；模型名会更新，以控制台「获取模型列表」和出处为准）。本服务不回传
-`reasoning_content`，所以对能关思考的服务商自动关掉（`src/llm-agent/providers.ts`），关不掉又要求回传的模型不能用。
+**两家的要点**（2026-09-30 按官方文档核实；模型会更新，以控制台「获取模型列表」为准，列表只列本服务用得上的模型）：
 
-| 服务商 | Base URL | 模型 | 备注 | 出处 |
-| --- | --- | --- | --- | --- |
-| DeepSeek | `https://api.deepseek.com` | `deepseek-flash`、`deepseek-v4-pro` | 思考默认开启，本服务自动关；带 tools 时不回传 `reasoning_content` 会 400 | [models](https://api-docs.deepseek.com/quick_start/pricing)、[thinking](https://api-docs.deepseek.com/guides/thinking_mode) |
-| Kimi（Moonshot） | `https://api.moonshot.ai/v1` | `kimi-k2.6` | 只有 `kimi-k2.6` 能关思考（本服务自动关）；`kimi-k3`、`kimi-k2.7-code` 始终思考且要求回传思考内容，不能用 | [thinking](https://platform.kimi.ai/docs/guide/use-thinking-models)、[API](https://platform.kimi.ai/docs/api/chat) |
-| 小米 MiMo | `https://api.xiaomimimo.com/v1` | `mimo-v2.6-flash`、`mimo-v2.6-pro` | 思考默认开启，本服务自动关；`tool_choice` 只认 `auto`（本服务就发 `auto`）；JSON 模式未能从文档确认，不支持时审计自动改用普通请求 | [OpenAI API](https://mimo.mi.com/docs/en-US/api/chat/openai-api) |
-| Google Gemini | `https://generativelanguage.googleapis.com/v1beta/openai/` | 见服务商文档（示例用 `gemini-3.8-flash`） | 文档写明 2.5 Pro 与 3 系列不能关思考；3 系列在兼容端点上的 thought signature 回传规则未核实，多轮工具调用以「测试连接」为准 | [OpenAI compatibility](https://ai.google.dev/gemini-api/docs/openai) |
+| | Claude | Gemini |
+| --- | --- | --- |
+| Key | Claude Console 的 API key，请求头 `x-api-key` | Google AI Studio 的 API key，请求头 `x-goog-api-key` |
+| 模型列表 | Models API；只留 adaptive 思考、`low` effort、结构化输出都支持的模型 | `models.list`；只留支持 `generateContent` 的模型 |
+| 工具调用 | tools / messages 直通；`tool_choice` 只用 `auto`（当前模型拒绝强制调用），一次最多一个 tool_use | `functionDeclarations`（`parametersJsonSchema`）+ `AUTO`；多个 functionCall 只取第一个 |
+| 思考 | adaptive、effort `low`（当前模型思考关不掉）；思考块按 runId 原样回传 | Gemini 3 设 `thinkingLevel: LOW`；`thoughtSignature` 按 runId 原样回传 |
+| 审计 | 结构化输出 `output_config.format`（JSON schema） | `responseMimeType: "application/json"` + `responseJsonSchema` |
+| 拒绝 | `stop_reason: "refusal"` → end_turn；Opus 5.5 / Opus 5 / Sonnet 5.5 / Fable 5.1 默认开服务端拒绝兜底 `fallbacks: "default"` | 安全拦截（`blockReason` / `finishReason`）→ end_turn |
 
 **超时关系**：后端每轮等 `/agent/turn` 的时间是 `AGENT_TURN_TIMEOUT_MS`（默认 12000，题目允许 10–15 秒），等
 `/agent/audit` 是 `AGENT_AUDIT_TIMEOUT_MS`（默认 5000）；llm-agent 调上游的总预算（`LLM_TIMEOUT_MS`、审计固定 4000）
@@ -117,7 +118,7 @@ src/workers/    出站 outbox / 入站事件流 / 建群与退群 job / agent ru
 src/db/         Prisma client、启动迁移与 schema 门禁、幂等种子
 src/core/       配置、JWT、领域异常、时钟、日志
 src/sim/        网关与 Agent 模拟器（独立进程）
-src/llm-agent/  真实 LLM 版 Agent 服务（题目 C2，独立进程，OpenAI 兼容上游）
+src/llm-agent/  真实 LLM 版 Agent 服务（题目 C2，独立进程，上游 Claude / Gemini 官方 SDK）
 prisma/         schema 与迁移（部分唯一索引、CHECK 约束手写在迁移里）
 tests/          vitest（真库）
 ```

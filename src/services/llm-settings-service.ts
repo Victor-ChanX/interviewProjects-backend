@@ -4,6 +4,7 @@
 // x-admin-token = LLM_AGENT_ADMIN_TOKEN）。AGENT_URL 指向 Agent 模拟器时对方没有 /admin/*（404）→ 读返回
 // supported=false，写 / 列模型 / 测试 → 409 LLM_AGENT_UNSUPPORTED。后端没配令牌同样按「不支持」处理。
 //
+// 服务商只有题目 C2 点名的 Claude（anthropic）与 Gemini（gemini），llm-agent 用各自官方 SDK 调官方端点。
 // 后端不存任何 LLM 配置、不碰库：配置文件在 llm-agent 那边（含 key）。API key 只进不出 —— 请求体里的 apiKey
 // 原样转给 llm-agent，响应里只有 hasApiKey + apiKeyHint；这里的日志与错误文案都不含 key。
 // 用全局 fetch（tests/setup.ts 的 MockAgent 只接管它）；测试经 buildApp({ llmAdmin }) 注入指向本地实例的客户端。
@@ -15,8 +16,10 @@ import {
   type ErrorCode,
 } from "../core/errors.js";
 
+export type LlmProvider = "anthropic" | "gemini";
+
 export type LlmConfigView = {
-  baseUrl: string | null;
+  provider: LlmProvider | null;
   model: string | null;
   auditModel: string | null;
   hasApiKey: boolean;
@@ -31,7 +34,7 @@ export type LlmSettings = Omit<LlmConfigView, "source"> & {
   source: LlmConfigView["source"] | null;
 };
 
-export type LlmModel = { id: string; ownedBy: string | null };
+export type LlmModel = { id: string; displayName: string };
 
 export type LlmTestOutcome = {
   ok: boolean;
@@ -68,12 +71,12 @@ const isRecord = (v: unknown): v is Record<string, unknown> =>
   typeof v === "object" && v !== null && !Array.isArray(v);
 
 export function createLlmAdminClient(opts: {
-  baseUrl: string;
+  agentUrl: string;
   adminToken: string;
   timeoutMs?: number;
   fetch?: typeof fetch;
 }): LlmAdminClient {
-  const baseUrl = opts.baseUrl.replace(/\/+$/, "");
+  const agentUrl = opts.agentUrl.replace(/\/+$/, "");
   const fetchImpl = opts.fetch ?? fetch;
   const timeoutMs = opts.timeoutMs ?? LLM_ADMIN_TIMEOUT_MS;
   return {
@@ -81,7 +84,7 @@ export function createLlmAdminClient(opts: {
       let res: Response;
       let raw: string;
       try {
-        res = await fetchImpl(`${baseUrl}${path}`, {
+        res = await fetchImpl(`${agentUrl}${path}`, {
           method,
           headers: {
             "x-admin-token": opts.adminToken,
@@ -143,7 +146,7 @@ export function createLlmAdminClient(opts: {
 export function llmAdminClientFromConfig(): LlmAdminClient | null {
   if (!config.agentUrl || !config.llmAgentAdminToken) return null;
   return createLlmAdminClient({
-    baseUrl: config.agentUrl,
+    agentUrl: config.agentUrl,
     adminToken: config.llmAgentAdminToken,
   });
 }
@@ -153,7 +156,7 @@ const UNSUPPORTED_MESSAGE =
 
 const UNSUPPORTED_READ: LlmSettings = Object.freeze({
   supported: false,
-  baseUrl: null,
+  provider: null,
   model: null,
   auditModel: null,
   hasApiKey: false,
@@ -188,18 +191,25 @@ function toDomainError(res: Exclude<AdminResponse, { kind: "ok" }>): Error {
   return new BadGateway("LLM_UPSTREAM_ERROR", res.message);
 }
 
+const isProvider = (v: unknown): v is LlmProvider =>
+  v === "anthropic" || v === "gemini";
+
 /** llm-agent 的 /admin/config 响应 → LlmConfigView（形状不对按 502：对方版本不匹配） */
 function toView(body: unknown): LlmConfigView {
   const nullableString = (v: unknown): string | null =>
     typeof v === "string" ? v : null;
-  if (!isRecord(body) || (body.source !== "file" && body.source !== "none")) {
+  if (
+    !isRecord(body) ||
+    (body.source !== "file" && body.source !== "none") ||
+    (body.provider !== null && !isProvider(body.provider))
+  ) {
     throw new BadGateway(
       "LLM_UPSTREAM_ERROR",
       "llm-agent 返回的配置形状不对，确认两边是同一版本",
     );
   }
   return {
-    baseUrl: nullableString(body.baseUrl),
+    provider: isProvider(body.provider) ? body.provider : null,
     model: nullableString(body.model),
     auditModel: nullableString(body.auditModel),
     hasApiKey: body.hasApiKey === true,
@@ -222,7 +232,7 @@ export async function getLlmSettings(
 export async function saveLlmSettings(
   client: LlmAdminClient | null,
   input: {
-    baseUrl: string;
+    provider: LlmProvider;
     apiKey?: string | undefined;
     model: string;
     auditModel?: string | null | undefined;
@@ -230,7 +240,7 @@ export async function saveLlmSettings(
 ): Promise<LlmSettings> {
   if (!client) throw toDomainError({ kind: "unsupported" });
   const res = await client.request("PUT", "/admin/config", {
-    baseUrl: input.baseUrl,
+    provider: input.provider,
     ...(input.apiKey !== undefined ? { apiKey: input.apiKey } : {}),
     model: input.model,
     auditModel: input.auditModel ?? null,
@@ -241,18 +251,16 @@ export async function saveLlmSettings(
 
 export async function listLlmModels(
   client: LlmAdminClient | null,
-  input: { baseUrl: string; apiKey?: string | undefined },
+  input: { provider: LlmProvider; apiKey?: string | undefined },
 ): Promise<{ items: LlmModel[]; total: number }> {
   if (!client) throw toDomainError({ kind: "unsupported" });
   const res = await client.request("POST", "/admin/models", {
-    baseUrl: input.baseUrl,
+    provider: input.provider,
     ...(input.apiKey !== undefined ? { apiKey: input.apiKey } : {}),
   });
   if (res.kind !== "ok") throw toDomainError(res);
   const models =
-    isRecord(res.body) && Array.isArray(res.body.models)
-      ? res.body.models
-      : null;
+    isRecord(res.body) && Array.isArray(res.body.items) ? res.body.items : null;
   if (!models) {
     throw new BadGateway(
       "LLM_UPSTREAM_ERROR",
@@ -266,7 +274,8 @@ export async function listLlmModels(
     )
     .map((m) => ({
       id: m.id as string,
-      ownedBy: typeof m.ownedBy === "string" ? m.ownedBy : null,
+      displayName:
+        typeof m.displayName === "string" ? m.displayName : (m.id as string),
     }));
   return { items, total: items.length };
 }

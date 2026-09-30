@@ -17,3 +17,6 @@ tests
 .env.*
 # llm-agent 在控制台保存的 LLM 配置（含 API key），永远不进镜像
 .llm-agent.json
+
+# llm-agent 按 runId 记住的上游思考状态（含模型输出）
+.llm-agent-sessions/

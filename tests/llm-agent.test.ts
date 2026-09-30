@@ -1,14 +1,15 @@
-// 题目 C2（issue #19）：真实 LLM 版 Agent 服务（src/llm-agent）。
-// 上游是**假 OpenAI 服务**（tests/fake-openai.ts，listen(0)，按剧本返回、记录请求），不打外网。
-// 上游配置只来自控制台保存的配置文件：每组用例在临时目录里放一份（store.save），用完删掉。
-// 四部分：
-// 1. /agent/turn：协议翻译（两个方向）、每轮恰好一个块、非法 arguments、上游 429 / 5xx / 超时 / 形状不对 → 502、
-//    未配置 → 503、Authorization 头、服务商参数。
-// 2. /agent/audit：pass / fail / 解析不了 → 500、json_object。
-// 3. 管理端点 /admin/*：令牌、配置读写与 key 沿用规则、文件 600 与重启后读回、/models、测试连接、明文不出现在响应与日志。
-// 4. 全链路：后端 agent run（真库 + 网关模拟器 + runAgentTick）把 Agent 客户端指向 llm-agent，run 正常 finished / final。
+// 题目 C2（issue #21）：真实 LLM 版 Agent 服务（src/llm-agent），上游只有 Claude 与 Gemini（官方 SDK）。
+// 上游是假服务（tests/fake-anthropic.ts、tests/fake-gemini.ts，listen(0)，按剧本返回、记录请求），不打外网。
+// 上游配置只来自控制台保存的配置文件：每组用例在临时目录里放一份（store.save），会话状态目录也在那里，用完删掉。
+// 五部分：
+// 1. Claude /agent/turn：tools / messages 直通与系统提示、思考块按 runId 回传（含重启后、记不到时的规则）、
+//    tool_use / end_turn / refusal 映射、多个 tool_use 只取第一个、上游 401 / 5xx / 超时 → 502；/agent/audit。
+// 2. Gemini 对应的一套（functionDeclarations / contents、thoughtSignature 回传与占位、finishReason 映射、结构化输出）。
+// 3. 请求校验与未配置。
+// 4. 管理端点 /admin/*：令牌、服务商切换不沿用 key、文件 600、模型列表、测试连接、key 明文不进响应与日志。
+// 5. 全链路：后端 agent run（真库 + 网关模拟器 + runAgentTick）→ llm-agent → 假 Anthropic，run finished / final。
 import { randomUUID } from "node:crypto";
-import { stat } from "node:fs/promises";
+import { readdir, stat, writeFile } from "node:fs/promises";
 
 import type { FastifyInstance } from "fastify";
 import {
@@ -26,14 +27,20 @@ import { logger } from "../src/core/logger.js";
 import { closeDb, getDb } from "../src/db/client.js";
 import type { Group } from "../src/db/generated/client.js";
 import {
-  createConfigStore,
-  type ConfigStore,
-} from "../src/llm-agent/config-store.js";
-import { providerParams } from "../src/llm-agent/providers.js";
+  FALLBACK_BETA,
+  toAnthropicMessages,
+} from "../src/llm-agent/anthropic.js";
+import type { ConfigStore, LlmTarget } from "../src/llm-agent/config-store.js";
+import { SKIP_THOUGHT_SIGNATURE } from "../src/llm-agent/gemini.js";
 import {
-  toOpenAiMessages,
-  type AnthropicMessage,
-} from "../src/llm-agent/translate.js";
+  AUDIT_SYSTEM_PROMPT,
+  TURN_SYSTEM_PROMPT,
+} from "../src/llm-agent/prompts.js";
+import type { AgentMessage } from "../src/llm-agent/protocol.js";
+import {
+  sessionDirFor,
+  type SessionStore,
+} from "../src/llm-agent/session-store.js";
 import {
   AGENT_TOOLS,
   onInboundMessage,
@@ -46,24 +53,20 @@ import {
 import { buildGatewayApp } from "../src/sim/gateway/app.js";
 import { runAgentTick } from "../src/workers/agent-worker.js";
 import { runOutboxTick } from "../src/workers/outbox-worker.js";
+import * as A from "./fake-anthropic.js";
+import * as G from "./fake-gemini.js";
+import { makeAccount, makeGroup, makeMessage } from "./factories.js";
 import {
   ADMIN_TOKEN,
   buildTestLlmAgent,
-  callTools,
-  completion,
-  say,
-  startFakeOpenAi,
-  tempConfigFile,
-  toolCall,
-  verdict,
-  type FakeOpenAi,
-} from "./fake-openai.js";
-import { makeAccount, makeGroup, makeMessage } from "./factories.js";
+  tempLlmAgentDir,
+} from "./llm-agent-harness.js";
 import { truncateAll } from "./setup.js";
 
 type Json = Record<string, unknown>;
 
-const API_KEY = "sk-test-key-0123456789abcd";
+const API_KEY = "sk-ant-test-key-0123456789abcd";
+const GEMINI_KEY = "AIza-test-gemini-key-9876543210";
 
 const CONTEXT = JSON.stringify({
   groupId: "g-1",
@@ -74,14 +77,44 @@ const CONTEXT = JSON.stringify({
   ownPlatformUserIds: ["pu-self"],
 });
 
-const turnBody = (
-  messages: AnthropicMessage[],
-  tools: unknown = AGENT_TOOLS,
-) => ({ runId: "run-1", tools, messages });
-
-const firstTurn: AnthropicMessage[] = [
+const firstTurn: AgentMessage[] = [
   { role: "user", content: [{ type: "text", text: CONTEXT }] },
 ];
+
+/** 历史里的一轮：assistant tool_use + user tool_result（2.2 形状，后端传回来的样子） */
+const step = (
+  id: string,
+  name: string,
+  input: Json,
+  result: string,
+  isError = false,
+): AgentMessage[] => [
+  { role: "assistant", content: [{ type: "tool_use", id, name, input }] },
+  {
+    role: "user",
+    content: [
+      {
+        type: "tool_result",
+        tool_use_id: id,
+        content: result,
+        ...(isError ? { is_error: true } : {}),
+      },
+    ],
+  },
+];
+
+const CLAUDE: LlmTarget = {
+  provider: "anthropic",
+  apiKey: API_KEY,
+  model: "claude-opus-5-5",
+  auditModel: "claude-haiku-4-5",
+};
+const GEMINI: LlmTarget = {
+  provider: "gemini",
+  apiKey: GEMINI_KEY,
+  model: "gemini-3-flash-preview",
+  auditModel: null,
+};
 
 /** 收集 llm-agent 的日志行：断言 key 明文从未进日志 */
 const logLines: string[] = [];
@@ -90,39 +123,51 @@ const captureLogs = {
   stream: { write: (line: string) => void logLines.push(line) },
 };
 
-describe("llm-agent（C2 / #19）", () => {
-  let fake: FakeOpenAi;
+describe("llm-agent（C2 / #21）", () => {
+  let claude: A.FakeAnthropic;
+  let gemini: G.FakeGemini;
   let agent: FastifyInstance;
   let store: ConfigStore;
+  let sessions: SessionStore;
+  let filePath: string;
   let cleanup: () => Promise<void>;
 
   beforeAll(async () => {
-    fake = await startFakeOpenAi();
-    const tmp = await tempConfigFile();
-    cleanup = tmp.cleanup;
-    store = createConfigStore({ filePath: tmp.filePath });
-    await store.save({
-      baseUrl: fake.baseUrl,
-      apiKey: API_KEY,
-      model: "turn-model",
-      auditModel: "audit-model",
+    claude = await A.startFakeAnthropic();
+    gemini = await G.startFakeGemini();
+    const tmp = await tempLlmAgentDir();
+    ({ store, sessions, filePath, cleanup } = tmp);
+    agent = await buildTestLlmAgent({
+      store,
+      sessions,
+      anthropicUrl: claude.url,
+      geminiUrl: gemini.url,
+      logger: captureLogs,
     });
-    agent = await buildTestLlmAgent({ store, logger: captureLogs });
   });
 
-  beforeEach(() => fake.reset());
+  beforeEach(async () => {
+    claude.reset();
+    gemini.reset();
+    await store.save(CLAUDE);
+  });
 
   afterAll(async () => {
     await agent.close();
-    await fake.app.close();
+    await claude.app.close();
+    await gemini.app.close();
     await cleanup();
   });
 
-  const turn = (messages: AnthropicMessage[], tools?: unknown) =>
+  const turn = (
+    messages: AgentMessage[],
+    runId = "run-1",
+    tools: unknown = AGENT_TOOLS,
+  ) =>
     agent.inject({
       method: "POST",
       url: "/agent/turn",
-      payload: turnBody(messages, tools),
+      payload: { runId, tools, messages },
     });
 
   const audit = (text: string) =>
@@ -132,45 +177,82 @@ describe("llm-agent（C2 / #19）", () => {
       payload: { text, groupId: "g-1" },
     });
 
-  const lastBody = (): Json =>
-    fake.received[fake.received.length - 1]?.body ?? {};
+  const lastClaude = (): Json =>
+    claude.received[claude.received.length - 1]?.body ?? {};
+  const lastGemini = (): Json =>
+    gemini.received[gemini.received.length - 1]?.body ?? {};
 
-  // ---- /agent/turn：请求方向 -------------------------------------------------------------------
+  // ---- 1. Claude ---------------------------------------------------------------------------
 
-  describe("/agent/turn 请求翻译（Anthropic → OpenAI）", () => {
-    it("tools、tool_use / tool_result 配对、is_error 前缀、PROTOCOL_ERROR 文本、模型、Authorization", async () => {
-      fake.turnScript.push(
-        callTools(toolCall("call_z", "finish", { summary: "好了" })),
+  describe("Claude /agent/turn", () => {
+    it("tools / messages 直通，系统提示、tool_choice auto（不并行）、adaptive 思考 + low effort、x-api-key、拒绝兜底", async () => {
+      claude.turnScript.push(
+        A.callTool("toolu_1", "get_recent_messages", { limit: 10 }),
       );
-      const res = await turn([
+      const history: AgentMessage[] = [
         ...firstTurn,
-        {
-          role: "assistant",
-          content: [
-            {
-              type: "tool_use",
-              id: "tu_1",
-              name: "get_recent_messages",
-              input: { limit: 10 },
-            },
-          ],
-        },
+        ...step(
+          "toolu_0",
+          "send_message",
+          { text: "在的", idempotency_key: "k-1" },
+          '{"code":"AUDIT_REJECTED","message":"没过审"}',
+          true,
+        ),
         {
           role: "user",
           content: [
             {
-              type: "tool_result",
-              tool_use_id: "tu_1",
-              content: '{"messages":[],"truncated":false}',
+              type: "text",
+              text: "PROTOCOL_ERROR BAD_JSON: 响应体不是合法 JSON",
             },
           ],
         },
+      ];
+      const res = await turn(history, "run-shape");
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({
+        stop_reason: "tool_use",
+        content: [
+          {
+            type: "tool_use",
+            id: "toolu_1",
+            name: "get_recent_messages",
+            input: { limit: 10 },
+          },
+        ],
+      });
+
+      const req = claude.received[0];
+      expect(req?.url).toBe("/v1/messages?beta=true");
+      expect(req?.headers["x-api-key"]).toBe(API_KEY);
+      expect(req?.headers.authorization).toBeUndefined();
+      expect(req?.headers["anthropic-beta"]).toBe(FALLBACK_BETA);
+      const body = req?.body ?? {};
+      expect(body).toMatchObject({
+        model: "claude-opus-5-5",
+        max_tokens: 16000,
+        system: TURN_SYSTEM_PROMPT,
+        tool_choice: { type: "auto", disable_parallel_tool_use: true },
+        thinking: { type: "adaptive" },
+        output_config: { effort: "low" },
+        fallbacks: "default",
+      });
+      expect(body.tools).toEqual(
+        AGENT_TOOLS.map((t) => ({
+          name: t.name,
+          description: t.description,
+          input_schema: t.input_schema,
+        })),
+      );
+      // messages 原样（记不到思考块的 toolu_0 只发 tool_use；is_error 保留；相邻 user 不合并）
+      expect(body.messages).toEqual([
+        { role: "user", content: [{ type: "text", text: CONTEXT }] },
         {
           role: "assistant",
           content: [
             {
               type: "tool_use",
-              id: "tu_2",
+              id: "toolu_0",
               name: "send_message",
               input: { text: "在的", idempotency_key: "k-1" },
             },
@@ -181,7 +263,7 @@ describe("llm-agent（C2 / #19）", () => {
           content: [
             {
               type: "tool_result",
-              tool_use_id: "tu_2",
+              tool_use_id: "toolu_0",
               content: '{"code":"AUDIT_REJECTED","message":"没过审"}',
               is_error: true,
             },
@@ -197,731 +279,950 @@ describe("llm-agent（C2 / #19）", () => {
           ],
         },
       ]);
-      expect(res.statusCode).toBe(200);
+    });
 
-      expect(fake.received).toHaveLength(1);
-      const req = fake.received[0];
-      expect(req?.url).toBe("/v1/chat/completions");
-      expect(req?.headers.authorization).toBe(`Bearer ${API_KEY}`);
-      const body = req?.body ?? {};
-      expect(body).toMatchObject({ model: "turn-model", tool_choice: "auto" });
-      // 本地假服务不是已知服务商：不加服务商参数；parallel_tool_calls / temperature 从不发
-      expect(body).not.toHaveProperty("thinking");
-      expect(body).not.toHaveProperty("parallel_tool_calls");
-      expect(body).not.toHaveProperty("temperature");
-      // tools：input_schema → function.parameters，原样
-      expect(body.tools).toEqual(
-        AGENT_TOOLS.map((t) => ({
-          type: "function",
-          function: {
-            name: t.name,
-            description: t.description,
-            parameters: t.input_schema,
-          },
-        })),
+    it("不在文档默认兜底名单里的模型不带 fallbacks 与 beta 头", async () => {
+      await store.save({ ...CLAUDE, model: "claude-haiku-4-5" });
+      claude.turnScript.push(A.say("好的"));
+      expect((await turn(firstTurn, "run-haiku")).statusCode).toBe(200);
+      expect(lastClaude().fallbacks).toBeUndefined();
+      expect(claude.received[0]?.headers["anthropic-beta"]).toBeUndefined();
+    });
+
+    it("思考块按 runId 回传：下一轮把 assistant tool_use 换回上游返回的完整 content；别的 run 不串；重启后照样", async () => {
+      claude.turnScript.push(
+        A.message(
+          [
+            A.thinking("sig-A"),
+            A.text("先看看消息"),
+            A.toolUse("toolu_a", "get_recent_messages", { limit: 5 }),
+          ],
+          "tool_use",
+        ),
       );
-      const messages = body.messages as Json[];
-      expect(messages.map((m) => m.role)).toEqual([
-        "system",
-        "user",
-        "assistant",
-        "tool",
-        "assistant",
-        "tool",
-        "user",
-      ]);
-      expect(messages[0]?.content).toContain("finish");
-      expect(messages[0]?.content).toContain("ownPlatformUserIds");
-      // 触发上下文原样
-      expect(messages[1]).toEqual({ role: "user", content: CONTEXT });
-      expect(messages[2]).toEqual({
+      const first = await turn(firstTurn, "run-replay");
+      expect(first.json()).toMatchObject({
+        stop_reason: "tool_use",
+        content: [{ id: "toolu_a" }],
+      });
+      expect(first.json<{ content: unknown[] }>().content).toHaveLength(1);
+
+      const second: AgentMessage[] = [
+        ...firstTurn,
+        ...step(
+          "toolu_a",
+          "get_recent_messages",
+          { limit: 5 },
+          '{"messages":[],"truncated":false}',
+        ),
+      ];
+      claude.turnScript.push(
+        A.callTool(
+          "toolu_b",
+          "send_message",
+          { text: "在", idempotency_key: "k" },
+          "sig-B",
+        ),
+      );
+      await turn(second, "run-replay");
+      expect((lastClaude().messages as Json[])[1]).toEqual({
         role: "assistant",
-        content: null,
-        tool_calls: [
-          {
-            id: "tu_1",
-            type: "function",
-            function: {
-              name: "get_recent_messages",
-              arguments: '{"limit":10}',
-            },
-          },
+        content: [
+          A.thinking("sig-A"),
+          A.text("先看看消息"),
+          A.toolUse("toolu_a", "get_recent_messages", { limit: 5 }),
         ],
       });
-      expect(messages[3]).toEqual({
-        role: "tool",
-        tool_call_id: "tu_1",
-        content: '{"messages":[],"truncated":false}',
+
+      // 同样的历史、另一个 runId：没有记忆，只发 tool_use
+      claude.turnScript.push(A.say("好"));
+      await turn(second, "run-other");
+      expect((lastClaude().messages as Json[])[1]).toEqual({
+        role: "assistant",
+        content: [A.toolUse("toolu_a", "get_recent_messages", { limit: 5 })],
       });
-      expect((messages[4]?.tool_calls as Json[])[0]).toMatchObject({
-        id: "tu_2",
-        function: {
-          name: "send_message",
-          arguments: '{"text":"在的","idempotency_key":"k-1"}',
+
+      // llm-agent 重启（新实例、同一个配置目录）：记忆还在
+      const restarted = await buildTestLlmAgent({
+        store,
+        sessions,
+        anthropicUrl: claude.url,
+        geminiUrl: gemini.url,
+      });
+      claude.turnScript.push(
+        A.callTool("toolu_c", "finish", { summary: "好了" }),
+      );
+      const third = await restarted.inject({
+        method: "POST",
+        url: "/agent/turn",
+        payload: {
+          runId: "run-replay",
+          tools: AGENT_TOOLS,
+          messages: [
+            ...second,
+            ...step(
+              "toolu_b",
+              "send_message",
+              { text: "在", idempotency_key: "k" },
+              '{"deliveryStatus":"sent"}',
+            ),
+          ],
         },
       });
-      expect(messages[5]?.tool_call_id).toBe("tu_2");
-      expect(messages[5]?.content).toMatch(
-        /^工具调用失败（is_error=true）.*AUDIT_REJECTED/,
+      expect(third.statusCode).toBe(200);
+      await restarted.close();
+      const replayed = lastClaude().messages as Json[];
+      expect((replayed[1]?.content as Json[])[0]).toEqual(A.thinking("sig-A"));
+      expect(replayed[3]?.content).toEqual([
+        A.thinking("sig-B"),
+        A.toolUse("toolu_b", "send_message", {
+          text: "在",
+          idempotency_key: "k",
+        }),
+      ]);
+      // finish 之后这个 run 的记忆被清掉
+      expect((await sessions.load("run-replay")).size).toBe(0);
+      expect((await sessions.load("run-other")).size).toBe(0);
+    });
+
+    it("换了模型：之前记住的（另一个模型的）思考块不回传", async () => {
+      claude.turnScript.push(
+        A.callTool("toolu_m", "get_recent_messages", { limit: 1 }),
       );
-      expect(messages[6]).toEqual({
-        role: "user",
-        content: "PROTOCOL_ERROR BAD_JSON: 响应体不是合法 JSON",
+      await turn(firstTurn, "run-switch");
+      await store.save({ ...CLAUDE, model: "claude-sonnet-5-5" });
+      claude.turnScript.push(A.say("好"));
+      await turn(
+        [
+          ...firstTurn,
+          ...step("toolu_m", "get_recent_messages", { limit: 1 }, "{}"),
+        ],
+        "run-switch",
+      );
+      expect((lastClaude().messages as Json[])[1]?.content).toEqual([
+        A.toolUse("toolu_m", "get_recent_messages", { limit: 1 }),
+      ]);
+    });
+
+    it("记不到时的规则（纯函数）：前面连续记不到的允许，之后照常回传；回传开始后遇到记不到的，从那里起不再回传", () => {
+      const history: AgentMessage[] = [
+        ...firstTurn,
+        ...step("t1", "get_recent_messages", { limit: 1 }, "{}"),
+        ...step("t2", "get_recent_messages", { limit: 2 }, "{}"),
+        ...step("t3", "get_recent_messages", { limit: 3 }, "{}"),
+        ...step("t4", "get_recent_messages", { limit: 4 }, "{}"),
+      ];
+      const full = (id: string): Json[] => [
+        A.thinking(`sig-${id}`),
+        A.toolUse(id, "get_recent_messages", {}),
+      ];
+      const assistants = (recalled: Record<string, Json[]>) =>
+        toAnthropicMessages(history, (id) => recalled[id])
+          .messages.filter((m) => m.role === "assistant")
+          .map((m) =>
+            Array.isArray(m.content) &&
+            m.content.some((b) => b.type === "thinking")
+              ? "思考"
+              : "裸",
+          );
+
+      // t1 记不到（最前面），t2、t3 记得到 → 回传；t4 记不到
+      expect(assistants({ t2: full("t2"), t3: full("t3") })).toEqual([
+        "裸",
+        "思考",
+        "思考",
+        "裸",
+      ]);
+      // t1 记得到，t2 记不到（中间）→ t3 即使记得到也不回传
+      expect(
+        assistants({ t1: full("t1"), t3: full("t3"), t4: full("t4") }),
+      ).toEqual(["思考", "裸", "裸", "裸"]);
+      // 记忆内容坏了（不是块数组）按记不到处理
+      expect(assistants({ t1: [] as Json[], t2: full("t2") })).toEqual([
+        "裸",
+        "思考",
+        "裸",
+        "裸",
+      ]);
+    });
+
+    it("end_turn：拼 text（思考块不出现）；没有 text 给默认 summary；这个 run 的记忆清掉", async () => {
+      claude.turnScript.push(
+        A.callTool("toolu_e", "get_recent_messages", { limit: 1 }),
+      );
+      await turn(firstTurn, "run-end");
+      expect((await sessions.load("run-end")).size).toBe(1);
+
+      claude.turnScript.push(
+        A.message([A.thinking("s"), A.text("已经处理完了")]),
+      );
+      const done = await turn(firstTurn, "run-end");
+      expect(done.json()).toEqual({
+        stop_reason: "end_turn",
+        content: [{ type: "text", text: "已经处理完了" }],
+      });
+      expect((await sessions.load("run-end")).size).toBe(0);
+
+      claude.turnScript.push(A.message([A.thinking("s")]));
+      expect((await turn(firstTurn)).json()).toEqual({
+        stop_reason: "end_turn",
+        content: [{ type: "text", text: "模型没有给出总结，本次处理已结束。" }],
       });
     });
 
-    it("纯函数：相邻 user 文本合并；配不上的 tool_result 降级成 user 文本；没结果的 tool_call 补占位", () => {
-      const out = toOpenAiMessages(
+    it("refusal → end_turn，text 写明模型拒绝与类别；不记忆", async () => {
+      claude.turnScript.push(
+        A.message([], "refusal", {
+          stop_details: {
+            type: "refusal",
+            category: "cyber",
+            explanation: null,
+          },
+        }),
+      );
+      const res = await turn(firstTurn, "run-refusal");
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({
+        stop_reason: "end_turn",
+        content: [
+          {
+            type: "text",
+            text: "模型拒绝了这次请求（类别：cyber），本次处理结束。",
+          },
+        ],
+      });
+      expect((await sessions.load("run-refusal")).size).toBe(0);
+    });
+
+    it("多个 tool_use 只取第一个，记忆也只到第一个为止（后端只会回一个 tool_result）", async () => {
+      claude.turnScript.push(
+        A.message(
+          [
+            A.thinking("sig-multi"),
+            A.toolUse("toolu_x", "get_recent_messages", { limit: 3 }),
+            A.toolUse("toolu_y", "finish", { summary: "x" }),
+          ],
+          "tool_use",
+        ),
+      );
+      const res = await turn(firstTurn, "run-multi");
+      expect(res.json()).toEqual({
+        stop_reason: "tool_use",
+        content: [
+          {
+            type: "tool_use",
+            id: "toolu_x",
+            name: "get_recent_messages",
+            input: { limit: 3 },
+          },
+        ],
+      });
+      expect(
+        (await sessions.load("run-multi")).get("toolu_x")?.content,
+      ).toEqual([
+        A.thinking("sig-multi"),
+        A.toolUse("toolu_x", "get_recent_messages", { limit: 3 }),
+      ]);
+    });
+
+    it("服务端 fallback：标记块及之前的内容不回传；在工具调用处被 max_tokens 截断 → 502", async () => {
+      claude.turnScript.push(
+        A.message(
+          [
+            {
+              type: "fallback",
+              from: { model: "claude-opus-5-5" },
+              to: { model: "claude-opus-5" },
+            },
+            A.thinking("sig-fb"),
+            A.toolUse("toolu_fb", "get_recent_messages", { limit: 1 }),
+          ],
+          "tool_use",
+          { model: "claude-opus-5" },
+        ),
+      );
+      await turn(firstTurn, "run-fb");
+      expect((await sessions.load("run-fb")).get("toolu_fb")?.content).toEqual([
+        A.thinking("sig-fb"),
+        A.toolUse("toolu_fb", "get_recent_messages", { limit: 1 }),
+      ]);
+
+      claude.turnScript.push(
+        A.message(
+          [
+            A.thinking("s"),
+            A.toolUse("toolu_cut", "send_message", { text: "半" }),
+          ],
+          "max_tokens",
+        ),
+      );
+      const cut = await turn(firstTurn);
+      expect(cut.statusCode).toBe(502);
+      expect(cut.json()).toMatchObject({ error: { code: "UPSTREAM_ERROR" } });
+    });
+
+    it("上游 401 → 502 不重试，报错里回显的 key 被抹掉", async () => {
+      claude.turnScript.push({
+        status: 401,
+        body: A.apiError(
+          "authentication_error",
+          `invalid x-api-key ${API_KEY}`,
+        ),
+      });
+      const res = await turn(firstTurn);
+      expect(res.statusCode).toBe(502);
+      expect(res.json()).toMatchObject({
+        error: { code: "UPSTREAM_ERROR", upstreamStatus: 401 },
+      });
+      expect(res.body).not.toContain(API_KEY);
+      expect(res.body).toContain("***");
+      expect(claude.received).toHaveLength(1);
+    });
+
+    it("持续 5xx：SDK 有界重试（maxRetries=2 → 共 3 次）后 502；429 一次后成功 → 200", async () => {
+      for (let i = 0; i < 3; i += 1) {
+        claude.turnScript.push({
+          status: 529,
+          body: A.apiError("overloaded_error", "Overloaded"),
+        });
+      }
+      const down = await turn(firstTurn);
+      expect(down.statusCode).toBe(502);
+      expect(down.json()).toMatchObject({ error: { upstreamStatus: 529 } });
+      expect(claude.received).toHaveLength(3);
+
+      claude.reset();
+      claude.turnScript.push(
+        { status: 429, body: A.apiError("rate_limit_error", "slow down") },
+        A.say("好"),
+      );
+      expect((await turn(firstTurn)).statusCode).toBe(200);
+      expect(claude.received).toHaveLength(2);
+    });
+
+    it("上游超过预算不返回 → 502（不再重试）", async () => {
+      const slow = await buildTestLlmAgent({
+        store,
+        sessions,
+        anthropicUrl: claude.url,
+        geminiUrl: gemini.url,
+        turnTimeoutMs: 300,
+      });
+      claude.turnScript.push({ hang: true });
+      const res = await slow.inject({
+        method: "POST",
+        url: "/agent/turn",
+        payload: { runId: "run-slow", tools: AGENT_TOOLS, messages: firstTurn },
+      });
+      await slow.close();
+      expect(res.statusCode).toBe(502);
+      expect(
+        res.json<{ error: { message: string } }>().error.message,
+      ).toContain("300ms");
+      expect(claude.received).toHaveLength(1);
+    });
+  });
+
+  describe("Claude /agent/audit", () => {
+    it("pass：审计模型、审核提示词、结构化输出（json_schema，verdict 枚举）、不带 tools", async () => {
+      claude.auditScript.push(A.verdict("pass", "正常问候"));
+      const res = await audit("大家好");
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({ verdict: "pass", reason: "正常问候" });
+      const body = lastClaude();
+      expect(body).toMatchObject({
+        model: "claude-haiku-4-5",
+        system: AUDIT_SYSTEM_PROMPT,
+        thinking: { type: "adaptive" },
+        output_config: {
+          effort: "low",
+          format: {
+            type: "json_schema",
+            schema: {
+              type: "object",
+              properties: {
+                verdict: { type: "string", enum: ["pass", "fail"] },
+                reason: { type: "string" },
+              },
+              required: ["verdict", "reason"],
+              additionalProperties: false,
+            },
+          },
+        },
+      });
+      expect(body.tools).toBeUndefined();
+      expect(body.messages).toEqual([
+        {
+          role: "user",
+          content: JSON.stringify({ groupId: "g-1", text: "大家好" }),
+        },
+      ]);
+    });
+
+    it("fail：kick 的 JSON 文本原样交给模型", async () => {
+      claude.auditScript.push(A.verdict("fail", "理由含糊"));
+      const kickText = JSON.stringify({
+        action: "kick",
+        platform_user_id: "u-9",
+        reason: "不喜欢",
+      });
+      expect((await audit(kickText)).json()).toEqual({
+        verdict: "fail",
+        reason: "理由含糊",
+      });
+      expect(lastClaude().messages).toEqual([
+        {
+          role: "user",
+          content: JSON.stringify({ groupId: "g-1", text: kickText }),
+        },
+      ]);
+    });
+
+    it("拿不到结论 → 500 AUDIT_UNAVAILABLE：不是 JSON / verdict 是别的值 / 拒绝 / 上游持续 503（不宽松解析）", async () => {
+      claude.auditScript.push(
+        A.message([A.text('```json\n{"verdict":"pass","reason":"x"}\n```')]),
+        A.verdict("maybe"),
+        A.message([], "refusal"),
+        ...Array.from({ length: 3 }, () => ({
+          status: 503,
+          body: A.apiError("api_error", "down"),
+        })),
+      );
+      for (let i = 0; i < 4; i += 1) {
+        const res = await audit("hi");
+        expect(res.statusCode).toBe(500);
+        expect(res.json()).toMatchObject({
+          error: { code: "AUDIT_UNAVAILABLE" },
+        });
+      }
+    });
+  });
+
+  // ---- 2. Gemini ---------------------------------------------------------------------------
+
+  describe("Gemini /agent/turn 与 /agent/audit", () => {
+    beforeEach(async () => {
+      await store.save(GEMINI);
+    });
+
+    it("functionDeclarations（input_schema 原样）、systemInstruction、AUTO、Gemini 3 思考等级 LOW、contents 映射、x-goog-api-key", async () => {
+      gemini.turnScript.push(
+        G.candidate([
+          G.functionCall(
+            "get_recent_messages",
+            { limit: 10 },
+            { id: "fc-1", signature: "gsig-1" },
+          ),
+        ]),
+      );
+      const res = await turn(
         [
           ...firstTurn,
-          {
-            role: "user",
-            content: [
-              { type: "text", text: "PROTOCOL_ERROR TURN_TIMEOUT: 超时" },
-            ],
-          },
-          {
-            role: "user",
-            content: [
-              { type: "tool_result", tool_use_id: "tu_x", content: "{}" },
-            ],
-          },
-          {
-            role: "assistant",
-            content: [
-              {
-                type: "tool_use",
-                id: "tu_9",
-                name: "get_recent_messages",
-                input: { limit: 5 },
-              },
-            ],
-          },
+          ...step(
+            "tu_0",
+            "send_message",
+            { text: "在的", idempotency_key: "k-1" },
+            '{"code":"AUDIT_REJECTED"}',
+            true,
+          ),
           {
             role: "user",
             content: [{ type: "text", text: "PROTOCOL_ERROR BAD_JSON: x" }],
           },
         ],
-        "SYS",
+        "run-g-shape",
       );
-      expect(out).toEqual([
-        { role: "system", content: "SYS" },
-        {
-          role: "user",
-          content: `${CONTEXT}\n\nPROTOCOL_ERROR TURN_TIMEOUT: 超时\n\n工具调用 tu_x 的结果：{}`,
-        },
-        {
-          role: "assistant",
-          content: null,
-          tool_calls: [
-            {
-              id: "tu_9",
-              type: "function",
-              function: {
-                name: "get_recent_messages",
-                arguments: '{"limit":5}',
-              },
-            },
-          ],
-        },
-        {
-          role: "tool",
-          tool_call_id: "tu_9",
-          content: JSON.stringify({
-            code: "NO_RESULT",
-            message: "这次工具调用没有返回结果",
-          }),
-        },
-        { role: "user", content: "PROTOCOL_ERROR BAD_JSON: x" },
-      ]);
-    });
-
-    it("服务商参数：DeepSeek / MiMo / kimi-k2.6 关思考，其余 Kimi 模型与未知服务商不加", () => {
-      const off = { thinking: { type: "disabled" } };
-      expect(
-        providerParams("https://api.deepseek.com", "deepseek-flash"),
-      ).toEqual(off);
-      expect(
-        providerParams("https://api.xiaomimimo.com/v1", "mimo-v2.6-flash"),
-      ).toEqual(off);
-      expect(providerParams("https://api.moonshot.ai/v1", "kimi-k2.6")).toEqual(
-        off,
-      );
-      expect(providerParams("https://api.moonshot.ai/v1", "kimi-k3")).toEqual(
-        {},
-      );
-      expect(
-        providerParams(
-          "https://generativelanguage.googleapis.com/v1beta/openai/",
-          "gemini-3.8-flash",
-        ),
-      ).toEqual({});
-      // 主机名要整段匹配：evil-deepseek.com 不算
-      expect(providerParams("https://evil-deepseek.com", "x")).toEqual({});
-    });
-  });
-
-  // ---- /agent/turn：响应方向 -------------------------------------------------------------------
-
-  describe("/agent/turn 响应翻译（OpenAI → 恰好一个块）", () => {
-    it("tool_calls → stop_reason tool_use，id / name / input 对应", async () => {
-      fake.turnScript.push(
-        callTools(toolCall("call_abc", "get_recent_messages", { limit: 20 })),
-      );
-      const res = await turn(firstTurn);
       expect(res.statusCode).toBe(200);
       expect(res.json()).toEqual({
         stop_reason: "tool_use",
         content: [
           {
             type: "tool_use",
-            id: "call_abc",
+            id: "fc-1",
             name: "get_recent_messages",
-            input: { limit: 20 },
+            input: { limit: 10 },
           },
         ],
       });
-    });
-
-    it("多个 tool_calls 只取第一个", async () => {
-      fake.turnScript.push(
-        callTools(
-          toolCall("call_1", "send_message", {
-            text: "a",
-            idempotency_key: "k-a",
-          }),
-          toolCall("call_2", "finish", { summary: "b" }),
-        ),
+      const req = gemini.received[0];
+      expect(req?.url).toBe(
+        "/v1beta/models/gemini-3-flash-preview:generateContent",
       );
-      const res = await turn(firstTurn);
-      const body = res.json<{ content: Json[] }>();
-      expect(body.content).toHaveLength(1);
-      expect(body.content[0]).toMatchObject({
-        id: "call_1",
-        name: "send_message",
+      expect(req?.headers["x-goog-api-key"]).toBe(GEMINI_KEY);
+      const body = req?.body ?? {};
+      expect(body.systemInstruction).toMatchObject({
+        parts: [{ text: TURN_SYSTEM_PROMPT }],
       });
-    });
-
-    it("arguments 不是合法 JSON → 仍是 tool_use，input 为 {}（后端判 INVALID_INPUT 回灌，模型可自纠）", async () => {
-      fake.turnScript.push(
-        callTools(toolCall("call_bad", "send_message", '{"text": "hi", ')),
-      );
-      const res = await turn(firstTurn);
-      expect(res.statusCode).toBe(200);
-      expect(res.json()).toEqual({
-        stop_reason: "tool_use",
-        content: [
-          { type: "tool_use", id: "call_bad", name: "send_message", input: {} },
-        ],
-      });
-    });
-
-    it("upstream 的 tool_call.id 与历史重复或缺失 → 换一个新 id（避免后端判 DUPLICATE_TOOL_USE_ID）", async () => {
-      const history: AnthropicMessage[] = [
-        ...firstTurn,
+      expect(body.tools).toEqual([
         {
-          role: "assistant",
-          content: [
+          functionDeclarations: AGENT_TOOLS.map((t) => ({
+            name: t.name,
+            description: t.description,
+            parametersJsonSchema: t.input_schema,
+          })),
+        },
+      ]);
+      expect(body.toolConfig).toEqual({
+        functionCallingConfig: { mode: "AUTO" },
+      });
+      expect(body.generationConfig).toMatchObject({
+        thinkingConfig: { thinkingLevel: "LOW" },
+      });
+      expect(body.contents).toEqual([
+        { role: "user", parts: [{ text: CONTEXT }] },
+        {
+          role: "model",
+          parts: [
             {
-              type: "tool_use",
-              id: "call_0",
-              name: "get_recent_messages",
-              input: { limit: 5 },
+              functionCall: {
+                id: "tu_0",
+                name: "send_message",
+                args: { text: "在的", idempotency_key: "k-1" },
+              },
+              thoughtSignature: SKIP_THOUGHT_SIGNATURE,
             },
           ],
         },
         {
           role: "user",
-          content: [
-            { type: "tool_result", tool_use_id: "call_0", content: "{}" },
+          parts: [
+            {
+              functionResponse: {
+                id: "tu_0",
+                name: "send_message",
+                response: { error: { code: "AUDIT_REJECTED" } },
+              },
+            },
+            { text: "PROTOCOL_ERROR BAD_JSON: x" },
           ],
         },
-      ];
-      fake.turnScript.push(
-        callTools(toolCall("call_0", "finish", { summary: "x" })),
-      );
-      const dup = (await turn(history)).json<{ content: { id: string }[] }>();
-      expect(dup.content[0]?.id).toMatch(/^call_/);
-      expect(dup.content[0]?.id).not.toBe("call_0");
-
-      fake.turnScript.push(
-        callTools({
-          type: "function",
-          function: { name: "finish", arguments: '{"summary":"y"}' },
-        }),
-      );
-      const missing = (await turn(firstTurn)).json<{
-        content: { id: string }[];
-      }>();
-      expect(missing.content[0]?.id).toMatch(/^call_[0-9a-f]{32}$/);
+      ]);
     });
 
-    it("没有 tool_calls → end_turn + text；text 为空给默认 summary；reasoning_content 不回传", async () => {
-      fake.turnScript.push(
-        completion({ content: "  处理完了  ", reasoning_content: "想了很久" }),
+    it("thoughtSignature 按 runId 回传：上游没给 id 时生成 id，下一轮换回原样的 model Content，functionResponse 不带 id", async () => {
+      gemini.turnScript.push(
+        G.candidate([
+          { text: "想一想", thought: true },
+          G.functionCall(
+            "get_recent_messages",
+            { limit: 5 },
+            { signature: "gsig-A" },
+          ),
+        ]),
       );
-      const res = await turn(firstTurn);
-      expect(res.json()).toEqual({
+      const first = await turn(firstTurn, "run-g-replay");
+      const id =
+        first.json<{ content: { id: string }[] }>().content[0]?.id ?? "";
+      expect(id).toMatch(/^call_/);
+
+      gemini.turnScript.push(G.say("好了"));
+      const second = await turn(
+        [
+          ...firstTurn,
+          ...step(id, "get_recent_messages", { limit: 5 }, '{"messages":[]}'),
+        ],
+        "run-g-replay",
+      );
+      expect(second.json()).toEqual({
         stop_reason: "end_turn",
-        content: [{ type: "text", text: "处理完了" }],
+        content: [{ type: "text", text: "好了" }],
       });
-      expect(res.body).not.toContain("想了很久");
-
-      fake.turnScript.push(say(null));
-      const empty = await turn(firstTurn);
-      expect(
-        empty.json<{ content: { text: string }[] }>().content[0]?.text,
-      ).toBe("模型没有给出总结，本次处理已结束。");
+      const contents = lastGemini().contents as Json[];
+      expect(contents[1]).toEqual({
+        role: "model",
+        parts: [
+          { text: "想一想", thought: true },
+          {
+            functionCall: { name: "get_recent_messages", args: { limit: 5 } },
+            thoughtSignature: "gsig-A",
+          },
+        ],
+      });
+      expect(contents[2]).toEqual({
+        role: "user",
+        parts: [
+          {
+            functionResponse: {
+              name: "get_recent_messages",
+              response: { output: { messages: [] } },
+            },
+          },
+        ],
+      });
+      // end_turn 后记忆清掉
+      expect((await sessions.load("run-g-replay")).size).toBe(0);
     });
-  });
 
-  // ---- /agent/turn：上游失败 ------------------------------------------------------------------
+    it("多个 functionCall 只取第一个；安全拦截 → end_turn 拒绝；MALFORMED_FUNCTION_CALL / 没有候选 → 502", async () => {
+      gemini.turnScript.push(
+        G.candidate([
+          G.functionCall(
+            "get_recent_messages",
+            { limit: 1 },
+            { id: "p-1", signature: "s" },
+          ),
+          G.functionCall("finish", { summary: "x" }, { id: "p-2" }),
+        ]),
+      );
+      expect((await turn(firstTurn, "run-g-multi")).json()).toMatchObject({
+        content: [{ id: "p-1", name: "get_recent_messages" }],
+      });
+      expect(
+        (
+          (await sessions.load("run-g-multi")).get("p-1")?.content as {
+            parts: unknown[];
+          }
+        ).parts,
+      ).toHaveLength(1);
 
-  describe("/agent/turn 上游失败 → 502（后端记 BAD_JSON）", () => {
-    it("持续 500：有界重试（maxRetries=2 → 共 3 次）后 502 UPSTREAM_ERROR", async () => {
+      gemini.turnScript.push(G.candidate([], "SAFETY"));
+      expect((await turn(firstTurn)).json()).toEqual({
+        stop_reason: "end_turn",
+        content: [
+          {
+            type: "text",
+            text: "模型拒绝了这次请求（SAFETY），本次处理结束。",
+          },
+        ],
+      });
+
+      gemini.turnScript.push({
+        body: { promptFeedback: { blockReason: "PROHIBITED_CONTENT" } },
+      });
+      expect(
+        (await turn(firstTurn)).json<{ content: { text: string }[] }>()
+          .content[0]?.text,
+      ).toContain("PROHIBITED_CONTENT");
+
+      gemini.turnScript.push(G.candidate([], "MALFORMED_FUNCTION_CALL"), {
+        body: { candidates: [] },
+      });
+      expect((await turn(firstTurn)).statusCode).toBe(502);
+      expect((await turn(firstTurn)).statusCode).toBe(502);
+    });
+
+    it("上游 401 → 502 不重试（key 抹掉）；持续 503 → 重试后 502；不返回 → 502", async () => {
+      gemini.turnScript.push({
+        status: 401,
+        body: G.geminiError(401, "UNAUTHENTICATED", `bad key ${GEMINI_KEY}`),
+      });
+      const unauthorized = await turn(firstTurn);
+      expect(unauthorized.statusCode).toBe(502);
+      expect(unauthorized.json()).toMatchObject({
+        error: { upstreamStatus: 401 },
+      });
+      expect(unauthorized.body).not.toContain(GEMINI_KEY);
+      expect(gemini.received).toHaveLength(1);
+
+      gemini.reset();
       for (let i = 0; i < 3; i += 1) {
-        fake.turnScript.push({
-          status: 500,
-          body: { error: { message: "boom" } },
+        gemini.turnScript.push({
+          status: 503,
+          body: G.geminiError(503, "UNAVAILABLE", "overloaded"),
         });
       }
-      const res = await turn(firstTurn);
-      expect(res.statusCode).toBe(502);
-      expect(res.json()).toMatchObject({
-        error: { code: "UPSTREAM_ERROR", upstreamStatus: 500, attempts: 3 },
-      });
-      expect(
-        res.json<{ error: { message: string } }>().error.message,
-      ).toContain("boom");
-      expect(fake.received).toHaveLength(3);
-    });
+      expect((await turn(firstTurn)).statusCode).toBe(502);
+      expect(gemini.received).toHaveLength(3);
 
-    it("429 一次后成功 → 200（重试成功）", async () => {
-      fake.turnScript.push(
-        {
-          status: 429,
-          body: { error: { message: "rate limited" } },
-          headers: { "retry-after": "0" },
-        },
-        callTools(toolCall("call_ok", "finish", { summary: "ok" })),
-      );
-      const res = await turn(firstTurn);
-      expect(res.statusCode).toBe(200);
-      expect(fake.received).toHaveLength(2);
-    });
-
-    it("401 不重试，直接 502；上游报错里回显的 key 被抹掉", async () => {
-      fake.turnScript.push({
-        status: 401,
-        body: { error: { message: `Incorrect API key provided: ${API_KEY}` } },
+      const slow = await buildTestLlmAgent({
+        store,
+        sessions,
+        anthropicUrl: claude.url,
+        geminiUrl: gemini.url,
+        turnTimeoutMs: 300,
       });
-      const res = await turn(firstTurn);
-      expect(res.statusCode).toBe(502);
-      expect(res.json()).toMatchObject({
-        error: { upstreamStatus: 401, attempts: 1 },
-      });
-      expect(res.body).not.toContain(API_KEY);
-      expect(res.body).toContain("***");
-      expect(fake.received).toHaveLength(1);
-    });
-
-    it("上游超过预算不返回 → 502，不再重试", async () => {
-      const slow = await buildTestLlmAgent({ store, turnTimeoutMs: 300 });
-      fake.turnScript.push({ hang: true });
+      gemini.turnScript.push({ hang: true });
       const res = await slow.inject({
         method: "POST",
         url: "/agent/turn",
-        payload: turnBody(firstTurn),
+        payload: {
+          runId: "run-g-slow",
+          tools: AGENT_TOOLS,
+          messages: firstTurn,
+        },
       });
       await slow.close();
       expect(res.statusCode).toBe(502);
-      expect(res.json()).toMatchObject({
-        error: { code: "UPSTREAM_ERROR", upstreamStatus: null, attempts: 1 },
-      });
       expect(
         res.json<{ error: { message: string } }>().error.message,
       ).toContain("300ms");
     });
 
-    it("200 但不是 chat completion 形状 / 不是 JSON → 502", async () => {
-      fake.turnScript.push({ body: { error: { message: "quota exceeded" } } });
-      expect((await turn(firstTurn)).statusCode).toBe(502);
-      fake.turnScript.push({ raw: "<html>gateway</html>" });
-      const res = await turn(firstTurn);
-      expect(res.statusCode).toBe(502);
-      expect(res.json<{ error: { message: string } }>().error.message).toBe(
-        "上游响应不是合法 JSON",
+    it("audit：responseMimeType application/json + responseJsonSchema，审计模型缺省同 model；非 JSON → 500", async () => {
+      gemini.auditScript.push(G.verdict("pass", "正常"));
+      expect((await audit("大家好")).json()).toEqual({
+        verdict: "pass",
+        reason: "正常",
+      });
+      const req = gemini.received[0];
+      expect(req?.url).toBe(
+        "/v1beta/models/gemini-3-flash-preview:generateContent",
       );
+      expect(req?.body.systemInstruction).toMatchObject({
+        parts: [{ text: AUDIT_SYSTEM_PROMPT }],
+      });
+      expect(req?.body.generationConfig).toMatchObject({
+        responseMimeType: "application/json",
+        responseJsonSchema: {
+          type: "object",
+          properties: { verdict: { type: "string", enum: ["pass", "fail"] } },
+          required: ["verdict", "reason"],
+        },
+      });
+      expect(req?.body.tools).toBeUndefined();
+
+      gemini.auditScript.push(
+        G.candidate([{ text: "pass" }]),
+        G.candidate([], "SAFETY"),
+      );
+      expect((await audit("hi")).statusCode).toBe(500);
+      const blocked = await audit("hi");
+      expect(blocked.statusCode).toBe(500);
+      expect(
+        blocked.json<{ error: { message: string } }>().error.message,
+      ).toContain("SAFETY");
     });
   });
 
-  describe("/agent/turn 请求校验", () => {
-    it("tools 不是题目规定的 4 个 → 400 TOOLS_INVALID，不调上游", async () => {
-      const res = await turn(firstTurn, AGENT_TOOLS.slice(0, 3));
-      expect(res.statusCode).toBe(400);
-      expect(res.json()).toMatchObject({ error: { code: "TOOLS_INVALID" } });
-      expect(fake.received).toHaveLength(0);
-    });
+  // ---- 3. 请求校验与未配置 ---------------------------------------------------------------------
 
-    it("required 没覆盖全部入参 → 400 TOOLS_INVALID", async () => {
+  describe("请求校验与未配置", () => {
+    it("tools 不是题目规定的 4 个 / required 不全 → 400 TOOLS_INVALID；缺 runId → 400 VALIDATION_ERROR；都不调上游", async () => {
+      const three = await turn(firstTurn, "run-1", AGENT_TOOLS.slice(0, 3));
+      expect(three.statusCode).toBe(400);
+      expect(three.json()).toMatchObject({ error: { code: "TOOLS_INVALID" } });
+
       const tools = AGENT_TOOLS.map((t) =>
         t.name === "send_message"
           ? { ...t, input_schema: { ...t.input_schema, required: ["text"] } }
           : t,
       );
-      const res = await turn(firstTurn, tools);
-      expect(res.statusCode).toBe(400);
-      expect(
-        res.json<{ error: { issues: string[] } }>().error.issues,
-      ).toContain("tools[1].input_schema.required 未覆盖 idempotency_key");
-    });
+      expect((await turn(firstTurn, "run-1", tools)).statusCode).toBe(400);
 
-    it("缺 runId / messages 为空 → 400 VALIDATION_ERROR", async () => {
-      const res = await agent.inject({
+      const noRun = await agent.inject({
         method: "POST",
         url: "/agent/turn",
-        payload: { tools: AGENT_TOOLS, messages: [] },
+        payload: { tools: AGENT_TOOLS, messages: firstTurn },
       });
-      expect(res.statusCode).toBe(400);
-      expect(res.json()).toMatchObject({ error: { code: "VALIDATION_ERROR" } });
-    });
-  });
-
-  // ---- /agent/audit --------------------------------------------------------------------------
-
-  describe("/agent/audit", () => {
-    it("pass：请求用审计模型、审核提示词、json_object、不带 tools；user 消息含 text 与 groupId", async () => {
-      fake.auditScript.push(verdict("pass", "正常问候"));
-      const res = await audit("大家好");
-      expect(res.statusCode).toBe(200);
-      expect(res.json()).toEqual({ verdict: "pass", reason: "正常问候" });
-      const body = lastBody();
-      expect(body).toMatchObject({
-        model: "audit-model",
-        response_format: { type: "json_object" },
+      expect(noRun.json()).toMatchObject({
+        error: { code: "VALIDATION_ERROR" },
       });
-      expect(body).not.toHaveProperty("tools");
-      const messages = body.messages as Json[];
-      expect(messages[0]?.role).toBe("system");
-      expect(messages[0]?.content).toContain("JSON");
-      expect(JSON.parse(String(messages[1]?.content))).toEqual({
-        groupId: "g-1",
-        text: "大家好",
-      });
+      expect(claude.received).toHaveLength(0);
     });
 
-    it("fail：kick 的 JSON 文本原样交给模型", async () => {
-      fake.auditScript.push(verdict("fail", "理由含糊"));
-      const kickText = JSON.stringify({
-        action: "kick",
-        platform_user_id: "u-9",
-        reason: "不喜欢",
-      });
-      const res = await audit(kickText);
-      expect(res.json()).toEqual({ verdict: "fail", reason: "理由含糊" });
-      const user = (lastBody().messages as Json[])[1];
-      expect(JSON.parse(String(user?.content))).toEqual({
-        groupId: "g-1",
-        text: kickText,
-      });
-    });
-
-    it("模型包了代码围栏 → 剥掉后照常解析", async () => {
-      fake.auditScript.push(
-        say('```json\n{"verdict":"pass","reason":"ok"}\n```'),
-      );
-      expect((await audit("hi")).json()).toEqual({
-        verdict: "pass",
-        reason: "ok",
-      });
-    });
-
-    it("前后夹着说明文字（没开 JSON 模式时常见）→ 取出其中的 JSON 对象照常解析", async () => {
-      fake.auditScript.push(
-        say('判定如下：{"verdict":"fail","reason":"含广告链接"}，请知悉。'),
-      );
-      expect((await audit("hi")).json()).toEqual({
-        verdict: "fail",
-        reason: "含广告链接",
-      });
-    });
-
-    it("服务商拒绝 JSON 模式（400）→ 去掉 response_format 重试一次，拿到结论", async () => {
-      fake.auditScript.push({
-        status: 400,
-        body: { error: { message: "response_format is not supported" } },
-      });
-      fake.auditScript.push(say('{"verdict":"pass","reason":"正常内容"}'));
-      const res = await audit("hi");
-      expect(res.statusCode).toBe(200);
-      expect(res.json()).toEqual({ verdict: "pass", reason: "正常内容" });
-      expect(fake.received).toHaveLength(2);
-      expect(fake.received[0]?.body.response_format).toEqual({
-        type: "json_object",
-      });
-      expect(fake.received[1]?.body).not.toHaveProperty("response_format");
-    });
-
-    it("限流 / 故障（429、5xx）不触发去掉 JSON 模式的重试", async () => {
-      for (let i = 0; i < 3; i += 1)
-        fake.auditScript.push({ status: 429, body: {} });
-      const res = await audit("hi");
-      expect(res.statusCode).toBe(500);
-      expect(
-        fake.received.every(
-          (r) =>
-            (r.body.response_format as { type?: string } | undefined)?.type ===
-            "json_object",
-        ),
-      ).toBe(true);
-    });
-
-    it("模型输出不是 JSON / verdict 是别的值 → 500 AUDIT_UNAVAILABLE（后端重试后 blocked）", async () => {
-      fake.auditScript.push(say("我觉得可以"));
-      const notJson = await audit("hi");
-      expect(notJson.statusCode).toBe(500);
-      expect(notJson.json()).toMatchObject({
-        error: { code: "AUDIT_UNAVAILABLE" },
-      });
-
-      fake.auditScript.push(verdict("maybe"));
-      expect((await audit("hi")).statusCode).toBe(500);
-    });
-
-    it("上游持续 503 → 500", async () => {
-      for (let i = 0; i < 3; i += 1)
-        fake.auditScript.push({ status: 503, body: {} });
-      const res = await audit("hi");
-      expect(res.statusCode).toBe(500);
-      expect(fake.received).toHaveLength(3);
-    });
-  });
-
-  // ---- 未配置 ----------------------------------------------------------------------------------
-
-  describe("未配置（没有配置文件）", () => {
-    it("/agent/turn、/agent/audit → 503 LLM_NOT_CONFIGURED，提示去控制台配置，不调上游", async () => {
-      const tmp = await tempConfigFile();
+    it("没有配置文件 → /agent/turn、/agent/audit 503 LLM_NOT_CONFIGURED，不调上游", async () => {
+      const tmp = await tempLlmAgentDir();
       const bare = await buildTestLlmAgent({
-        store: createConfigStore({ filePath: tmp.filePath }),
+        store: tmp.store,
+        sessions: tmp.sessions,
+        anthropicUrl: claude.url,
+        geminiUrl: gemini.url,
       });
       const t = await bare.inject({
         method: "POST",
         url: "/agent/turn",
-        payload: turnBody(firstTurn),
+        payload: { runId: "r", tools: AGENT_TOOLS, messages: firstTurn },
       });
+      expect(t.statusCode).toBe(503);
+      expect(t.json()).toMatchObject({ error: { code: "LLM_NOT_CONFIGURED" } });
+      expect(t.json<{ error: { message: string } }>().error.message).toContain(
+        "模型设置",
+      );
       const a = await bare.inject({
         method: "POST",
         url: "/agent/audit",
         payload: { text: "hi", groupId: "g" },
       });
+      expect(a.statusCode).toBe(503);
       await bare.close();
       await tmp.cleanup();
-      for (const res of [t, a]) {
-        expect(res.statusCode).toBe(503);
-        expect(res.json()).toMatchObject({
-          error: { code: "LLM_NOT_CONFIGURED" },
-        });
-        expect(
-          res.json<{ error: { message: string } }>().error.message,
-        ).toContain("模型设置");
-      }
-      expect(fake.received).toHaveLength(0);
+      expect(claude.received).toHaveLength(0);
+      expect(gemini.received).toHaveLength(0);
     });
   });
 
-  // ---- 管理端点 -------------------------------------------------------------------------------
+  // ---- 4. 管理端点 --------------------------------------------------------------------------
 
   describe("管理端点 /admin/*", () => {
-    let admin: FastifyInstance;
-    let adminFile: string;
-    let adminCleanup: () => Promise<void>;
-
-    beforeEach(async () => {
-      const tmp = await tempConfigFile();
-      adminFile = tmp.filePath;
-      adminCleanup = tmp.cleanup;
-      admin = await buildTestLlmAgent({
-        store: createConfigStore({ filePath: adminFile }),
-        logger: captureLogs,
-      });
-    });
-
-    afterEach(async () => {
-      await admin.close();
-      await adminCleanup();
-    });
-
     const call = async (
       method: "GET" | "PUT" | "POST",
       url: string,
       payload?: Json,
-      token: string | null = ADMIN_TOKEN,
+      token = ADMIN_TOKEN,
     ) => {
-      const res = await admin.inject({
+      const res = await agent.inject({
         method,
         url,
+        headers: { "x-admin-token": token },
         ...(payload ? { payload } : {}),
-        headers: token ? { "x-admin-token": token } : {},
       });
-      // 任何响应里都没有 key 明文
       expect(res.body).not.toContain(API_KEY);
+      expect(res.body).not.toContain(GEMINI_KEY);
       return res;
     };
 
-    const save = (payload: Json) => call("PUT", "/admin/config", payload);
-
     it("没带 / 带错 x-admin-token → 401", async () => {
+      const none = await agent.inject({ method: "GET", url: "/admin/config" });
+      expect(none.statusCode).toBe(401);
       expect(
-        (await call("GET", "/admin/config", undefined, null)).statusCode,
+        (await call("GET", "/admin/config", undefined, "wrong")).statusCode,
       ).toBe(401);
-      const wrong = await call("POST", "/admin/test", undefined, "nope");
-      expect(wrong.statusCode).toBe(401);
-      expect(wrong.json()).toMatchObject({ error: { code: "UNAUTHORIZED" } });
     });
 
-    it("GET 未配置 → source none；PUT 保存 → 视图只有 key 提示；文件 600；重启后读回并立即生效", async () => {
-      const empty = await call("GET", "/admin/config");
-      expect(empty.json()).toEqual({
-        baseUrl: null,
-        model: null,
-        auditModel: null,
-        hasApiKey: false,
-        apiKeyHint: null,
-        updatedAt: null,
-        source: "none",
-      });
-
-      const saved = await save({
-        baseUrl: `${fake.baseUrl}/`,
+    it("PUT 保存 → 视图只有 key 提示；文件 600；服务商切换不沿用 key；同一服务商沿用", async () => {
+      const saved = await call("PUT", "/admin/config", {
+        provider: "anthropic",
         apiKey: API_KEY,
-        model: "turn-model",
+        model: "claude-opus-5-5",
       });
       expect(saved.statusCode).toBe(200);
-      const view = saved.json<Json>();
-      expect(view).toMatchObject({
-        baseUrl: fake.baseUrl, // 末尾的 / 去掉
-        model: "turn-model",
+      expect(saved.json()).toEqual({
+        provider: "anthropic",
+        model: "claude-opus-5-5",
         auditModel: null,
         hasApiKey: true,
         apiKeyHint: "sk-…abcd",
+        updatedAt: expect.any(String) as unknown,
         source: "file",
       });
-      expect(Number.isNaN(Date.parse(String(view.updatedAt)))).toBe(false);
-      expect((await stat(adminFile)).mode & 0o777).toBe(0o600);
+      expect((await stat(filePath)).mode & 0o777).toBe(0o600);
+      expect((await call("GET", "/admin/config")).json()).toEqual(saved.json());
 
-      // 「重启」：同一个文件新建一个实例
-      const restarted = await buildTestLlmAgent({
-        store: createConfigStore({ filePath: adminFile }),
-      });
-      const again = await restarted.inject({
-        method: "GET",
-        url: "/admin/config",
-        headers: { "x-admin-token": ADMIN_TOKEN },
-      });
-      expect(again.json()).toEqual(view);
-      fake.turnScript.push(
-        callTools(toolCall("call_r", "finish", { summary: "ok" })),
-      );
-      const t = await restarted.inject({
-        method: "POST",
-        url: "/agent/turn",
-        payload: turnBody(firstTurn),
-      });
-      await restarted.close();
-      expect(t.statusCode).toBe(200);
-      expect(lastBody().model).toBe("turn-model");
-    });
-
-    it("apiKey 省略：同一 baseUrl 沿用旧 key；换了 baseUrl → 422 LLM_API_KEY_REQUIRED；从未存过 → 422", async () => {
-      const none = await save({ baseUrl: fake.baseUrl, model: "m" });
-      expect(none.statusCode).toBe(422);
-      expect(none.json()).toMatchObject({
-        error: { code: "LLM_API_KEY_REQUIRED" },
-      });
-
-      await save({ baseUrl: fake.baseUrl, apiKey: API_KEY, model: "m1" });
-      const kept = await save({
-        baseUrl: fake.baseUrl,
-        model: "m2",
-        auditModel: "m-audit",
+      const kept = await call("PUT", "/admin/config", {
+        provider: "anthropic",
+        model: "claude-sonnet-5-5",
+        auditModel: "claude-haiku-4-5",
       });
       expect(kept.statusCode).toBe(200);
       expect(kept.json()).toMatchObject({
-        model: "m2",
-        auditModel: "m-audit",
+        model: "claude-sonnet-5-5",
+        auditModel: "claude-haiku-4-5",
         hasApiKey: true,
-        apiKeyHint: "sk-…abcd",
       });
-      // 沿用的确实是旧 key：下一次上游请求带着它，审计用 auditModel
-      fake.auditScript.push(verdict("pass"));
-      await admin.inject({
-        method: "POST",
-        url: "/agent/audit",
-        payload: { text: "hi", groupId: "g" },
-      });
-      expect(fake.received[0]?.headers.authorization).toBe(`Bearer ${API_KEY}`);
-      expect(fake.received[0]?.body.model).toBe("m-audit");
 
-      // 换主机不沿用（防止把已存的 key 发给别的主机），已存的配置不变
-      const other = await save({
-        baseUrl: "https://attacker.example/v1",
-        model: "m3",
-      });
-      expect(other.statusCode).toBe(422);
-      expect(other.json()).toMatchObject({
-        error: { code: "LLM_API_KEY_REQUIRED" },
-      });
+      for (const [url, payload] of [
+        [
+          "/admin/config",
+          { provider: "gemini", model: "gemini-3-flash-preview" },
+        ],
+        ["/admin/models", { provider: "gemini" }],
+      ] as const) {
+        const res = await call(
+          url === "/admin/config" ? "PUT" : "POST",
+          url,
+          payload,
+        );
+        expect(res.statusCode).toBe(422);
+        expect(res.json()).toMatchObject({
+          error: { code: "LLM_API_KEY_REQUIRED" },
+        });
+      }
+      // Claude 的 key 没被发往 Gemini，配置不变
+      expect(gemini.received).toHaveLength(0);
       expect((await call("GET", "/admin/config")).json()).toMatchObject({
-        model: "m2",
+        provider: "anthropic",
       });
 
-      // 形状错 → 400
-      const bad = await save({ baseUrl: "ftp://x", apiKey: "k", model: "m" });
+      const switched = await call("PUT", "/admin/config", {
+        provider: "gemini",
+        apiKey: GEMINI_KEY,
+        model: "gemini-3-flash-preview",
+      });
+      expect(switched.json()).toMatchObject({
+        provider: "gemini",
+        apiKeyHint: "AIz…3210",
+      });
+
+      const bad = await call("PUT", "/admin/config", {
+        provider: "other",
+        apiKey: "k",
+        model: "m",
+      });
       expect(bad.statusCode).toBe(400);
     });
 
-    it("POST /admin/models：按 id 排序、ownedBy；key 沿用规则同 PUT；401 → 422；500 / 非列表 → 502，报错不含 key", async () => {
-      fake.modelsScript.push({
-        body: {
-          object: "list",
-          data: [
-            { id: "z-model", object: "model", owned_by: "acme" },
-            { id: "a-model", object: "model" },
-          ],
-        },
+    it("配置文件是旧格式 → GET 500 LLM_CONFIG_INVALID 并说明怎么修；带 key 重新保存即可覆盖", async () => {
+      await writeFile(
+        filePath,
+        // 更早版本的文件：没有 provider 字段
+        JSON.stringify({
+          apiKey: "k",
+          model: "m",
+          auditModel: null,
+          updatedAt: "t",
+        }),
+      );
+      const broken = await call("GET", "/admin/config");
+      expect(broken.statusCode).toBe(500);
+      expect(broken.json()).toMatchObject({
+        error: { code: "LLM_CONFIG_INVALID" },
       });
-      const ok = await call("POST", "/admin/models", {
-        baseUrl: fake.baseUrl,
+      expect(
+        broken.json<{ error: { message: string } }>().error.message,
+      ).toContain("重新保存");
+      const fixed = await call("PUT", "/admin/config", {
+        provider: "anthropic",
+        apiKey: API_KEY,
+        model: "claude-opus-5-5",
+      });
+      expect(fixed.statusCode).toBe(200);
+    });
+
+    it("POST /admin/models：Claude 只留支持 adaptive 思考 / low effort / 结构化输出的；Gemini 只留支持 generateContent 的", async () => {
+      claude.modelsScript.push(
+        A.modelsPage([
+          A.modelInfo("claude-opus-5-5"),
+          A.modelInfo("claude-old", { adaptive: false }),
+          A.modelInfo("claude-no-schema", { structured: false }),
+          A.modelInfo("claude-haiku-4-5"),
+        ]),
+      );
+      const listed = await call("POST", "/admin/models", {
+        provider: "anthropic",
         apiKey: API_KEY,
       });
-      expect(ok.statusCode).toBe(200);
-      expect(ok.json()).toEqual({
-        models: [
-          { id: "a-model", ownedBy: null },
-          { id: "z-model", ownedBy: "acme" },
+      expect(listed.statusCode).toBe(200);
+      expect(listed.json()).toEqual({
+        items: [
+          { id: "claude-opus-5-5", displayName: "Display claude-opus-5-5" },
+          { id: "claude-haiku-4-5", displayName: "Display claude-haiku-4-5" },
         ],
+        total: 2,
       });
-      expect(fake.received[0]).toMatchObject({
-        method: "GET",
-        url: "/v1/models",
-      });
-      expect(fake.received[0]?.headers.authorization).toBe(`Bearer ${API_KEY}`);
+      expect(claude.received[0]?.headers["x-api-key"]).toBe(API_KEY);
 
-      const noKey = await call("POST", "/admin/models", {
-        baseUrl: fake.baseUrl,
+      gemini.modelsScript.push(
+        G.modelsPage([
+          {
+            name: "models/gemini-3-flash-preview",
+            displayName: "Gemini 3 Flash",
+            methods: ["generateContent", "countTokens"],
+          },
+          { name: "models/text-embedding-005", methods: ["embedContent"] },
+          { name: "models/gemini-2.5-flash", methods: ["generateContent"] },
+        ]),
+      );
+      const g = await call("POST", "/admin/models", {
+        provider: "gemini",
+        apiKey: GEMINI_KEY,
       });
-      expect(noKey.statusCode).toBe(422);
-      expect(noKey.json()).toMatchObject({
-        error: { code: "LLM_API_KEY_REQUIRED" },
+      expect(g.json()).toEqual({
+        items: [
+          { id: "gemini-3-flash-preview", displayName: "Gemini 3 Flash" },
+          { id: "gemini-2.5-flash", displayName: "gemini-2.5-flash" },
+        ],
+        total: 2,
       });
+      expect(gemini.received[0]?.headers["x-goog-api-key"]).toBe(GEMINI_KEY);
+    });
 
-      fake.modelsScript.push({
+    it("POST /admin/models：上游 401 / 403（Gemini 还有 400 API_KEY_INVALID）→ 422 LLM_UPSTREAM_UNAUTHORIZED；其他 4xx / 5xx → 502 LLM_UPSTREAM_ERROR（报错不含 key）", async () => {
+      claude.modelsScript.push({
         status: 401,
-        body: { error: { message: `bad key ${API_KEY}` } },
+        body: A.apiError("authentication_error", `bad ${API_KEY}`),
       });
       const unauthorized = await call("POST", "/admin/models", {
-        baseUrl: fake.baseUrl,
+        provider: "anthropic",
         apiKey: API_KEY,
       });
       expect(unauthorized.statusCode).toBe(422);
@@ -929,12 +1230,69 @@ describe("llm-agent（C2 / #19）", () => {
         error: { code: "LLM_UPSTREAM_UNAUTHORIZED" },
       });
 
-      fake.modelsScript.push({
-        status: 500,
-        body: { error: { message: `down ${API_KEY}` } },
+      gemini.modelsScript.push({
+        status: 403,
+        body: G.geminiError(403, "PERMISSION_DENIED", "nope"),
       });
+      expect(
+        (
+          await call("POST", "/admin/models", {
+            provider: "gemini",
+            apiKey: GEMINI_KEY,
+          })
+        ).statusCode,
+      ).toBe(422);
+
+      // Gemini 对无效 key 回 400 INVALID_ARGUMENT + ErrorInfo.reason API_KEY_INVALID（实测），同样算 key 被拒；
+      // 别的 400 不算
+      gemini.modelsScript.push(
+        {
+          status: 400,
+          body: {
+            error: {
+              code: 400,
+              message: "API key not valid. Please pass a valid API key.",
+              status: "INVALID_ARGUMENT",
+              details: [
+                {
+                  "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                  reason: "API_KEY_INVALID",
+                  domain: "googleapis.com",
+                },
+              ],
+            },
+          },
+        },
+        {
+          status: 400,
+          body: G.geminiError(400, "INVALID_ARGUMENT", "bad request"),
+        },
+      );
+      const invalidKey = await call("POST", "/admin/models", {
+        provider: "gemini",
+        apiKey: GEMINI_KEY,
+      });
+      expect(invalidKey.statusCode).toBe(422);
+      expect(invalidKey.json()).toMatchObject({
+        error: { code: "LLM_UPSTREAM_UNAUTHORIZED" },
+      });
+      expect(
+        (
+          await call("POST", "/admin/models", {
+            provider: "gemini",
+            apiKey: GEMINI_KEY,
+          })
+        ).statusCode,
+      ).toBe(502);
+
+      for (let i = 0; i < 3; i += 1) {
+        claude.modelsScript.push({
+          status: 500,
+          body: A.apiError("api_error", `down ${API_KEY}`),
+        });
+      }
       const down = await call("POST", "/admin/models", {
-        baseUrl: fake.baseUrl,
+        provider: "anthropic",
         apiKey: API_KEY,
       });
       expect(down.statusCode).toBe(502);
@@ -943,83 +1301,76 @@ describe("llm-agent（C2 / #19）", () => {
       });
       expect(
         down.json<{ error: { message: string } }>().error.message,
-      ).toContain("down ***");
-
-      fake.modelsScript.push({ body: { hello: "world" } });
-      const shape = await call("POST", "/admin/models", {
-        baseUrl: fake.baseUrl,
-        apiKey: API_KEY,
-      });
-      expect(shape.statusCode).toBe(502);
+      ).toContain("***");
     });
 
-    it("POST /admin/test：未配置 ok=false；成功时带工具历史的对话 + 审计都走一遍；对话失败 / 审计非 JSON → ok=false", async () => {
-      const unconfigured = await call("POST", "/admin/test");
-      expect(unconfigured.statusCode).toBe(200);
-      expect(unconfigured.json()).toMatchObject({
-        ok: false,
-        model: null,
-        latencyMs: 0,
-      });
-
-      await save({
-        baseUrl: fake.baseUrl,
-        apiKey: API_KEY,
-        model: "turn-model",
-      });
-      fake.reset();
-      fake.turnScript.push(say("连接正常"));
-      fake.auditScript.push(verdict("pass"));
+    it("POST /admin/test：带工具历史的对话 + 审计都走一遍；对话失败 / 审计拿不到结论 → ok=false（仍 200）", async () => {
+      claude.turnScript.push(A.say("连接正常"));
+      claude.auditScript.push(A.verdict("pass"));
       const ok = await call("POST", "/admin/test");
-      expect(ok.json()).toMatchObject({ ok: true, model: "turn-model" });
+      expect(ok.statusCode).toBe(200);
+      expect(ok.json()).toMatchObject({ ok: true, model: "claude-opus-5-5" });
       expect(typeof ok.json<Json>().latencyMs).toBe("number");
-      // 对话请求带着一轮 tool_calls + tool 历史（要求回传思考内容的模型会在这里失败）
-      const probe = fake.received[0]?.body.messages as Json[];
-      expect(probe.map((m) => m.role)).toEqual([
-        "system",
-        "user",
-        "assistant",
-        "tool",
-      ]);
-      expect(fake.received[1]?.body.response_format).toEqual({
-        type: "json_object",
-      });
+      // 对话请求带着一轮 tool_use + tool_result 历史（没有思考块 = 记不到时的真实形状）
+      expect(
+        (claude.received[0]?.body.messages as Json[]).map((m) => m.role),
+      ).toEqual(["user", "assistant", "user"]);
+      expect(claude.received[1]?.body.model).toBe("claude-haiku-4-5");
 
-      fake.turnScript.push({
+      claude.turnScript.push({
         status: 400,
-        body: { error: { message: "reasoning_content must be passed back" } },
+        body: A.apiError("invalid_request_error", "bad thinking"),
       });
       const turnFail = await call("POST", "/admin/test");
-      expect(turnFail.statusCode).toBe(200);
       expect(turnFail.json()).toMatchObject({
         ok: false,
-        model: "turn-model",
+        model: "claude-opus-5-5",
       });
       expect(turnFail.json<{ message: string }>().message).toContain(
-        "reasoning_content",
+        "bad thinking",
       );
 
-      fake.turnScript.push(say("连接正常"));
-      fake.auditScript.push(say("not json"));
+      claude.turnScript.push(A.say("连接正常"));
+      claude.auditScript.push(A.message([A.text("not json")]));
       const auditFail = await call("POST", "/admin/test");
       expect(auditFail.json()).toMatchObject({ ok: false });
       expect(auditFail.json<{ message: string }>().message).toContain("审计");
+
+      await store.save(GEMINI);
+      gemini.turnScript.push(G.say("连接正常"));
+      gemini.auditScript.push(G.verdict("pass"));
+      expect((await call("POST", "/admin/test")).json()).toMatchObject({
+        ok: true,
+        model: "gemini-3-flash-preview",
+      });
+      // 没有签名的历史用文档的占位值
+      const probe = gemini.received[0]?.body.contents as Json[];
+      expect((probe[1]?.parts as Json[])[0]?.thoughtSignature).toBe(
+        SKIP_THOUGHT_SIGNATURE,
+      );
     });
 
-    it("整个文件里 key 明文从未进过 llm-agent 的日志", () => {
+    it("整个文件里 key 明文从未进过 llm-agent 的日志；会话状态目录只有 600 的文件", async () => {
       expect(logLines.length).toBeGreaterThan(0);
-      expect(logLines.filter((l) => l.includes(API_KEY))).toEqual([]);
+      expect(
+        logLines.filter((l) => l.includes(API_KEY) || l.includes(GEMINI_KEY)),
+      ).toEqual([]);
+      const dir = sessionDirFor(filePath);
+      for (const name of await readdir(dir)) {
+        expect((await stat(`${dir}/${name}`)).mode & 0o777).toBe(0o600);
+      }
     });
   });
 });
 
-// ---- 全链路：后端 agent run → llm-agent → 假 OpenAI ------------------------------------------
+// ---- 5. 全链路：后端 agent run → llm-agent → 假 Anthropic ------------------------------------
 
-describe("全链路：后端 AGENT_URL 指向 llm-agent", () => {
+describe("全链路：后端 AGENT_URL 指向 llm-agent（Claude）", () => {
   const silent = logger.child({}, { level: "silent" });
   let now = Date.now();
   const clock: Clock = { now: () => new Date(now) };
-  let fake: FakeOpenAi;
+  let claude: A.FakeAnthropic;
+  let gemini: G.FakeGemini;
   let llmAgent: FastifyInstance;
   let gatewaySim: FastifyInstance;
   let gatewayClient: GatewayClient;
@@ -1027,17 +1378,18 @@ describe("全链路：后端 AGENT_URL 指向 llm-agent", () => {
   let cleanup: () => Promise<void>;
 
   beforeAll(async () => {
-    fake = await startFakeOpenAi();
-    const tmp = await tempConfigFile();
+    claude = await A.startFakeAnthropic();
+    gemini = await G.startFakeGemini();
+    const tmp = await tempLlmAgentDir();
     cleanup = tmp.cleanup;
-    const store = createConfigStore({ filePath: tmp.filePath });
-    await store.save({
-      baseUrl: fake.baseUrl,
-      apiKey: API_KEY,
-      model: "turn-model",
-      auditModel: null,
+    await tmp.store.save({ ...CLAUDE, auditModel: null });
+    llmAgent = await buildTestLlmAgent({
+      store: tmp.store,
+      sessions: tmp.sessions,
+      anthropicUrl: claude.url,
+      geminiUrl: gemini.url,
+      maxRetries: 0,
     });
-    llmAgent = await buildTestLlmAgent({ store, maxRetries: 0 });
     agentUrl = await llmAgent.listen({ port: 0, host: "127.0.0.1" });
     gatewaySim = await buildGatewayApp({ logger: false, clock });
     gatewayClient = createGatewayClient({
@@ -1047,7 +1399,7 @@ describe("全链路：后端 AGENT_URL 指向 llm-agent", () => {
 
   beforeEach(async () => {
     await truncateAll();
-    fake.reset();
+    claude.reset();
     now = Date.now();
     await gatewaySim.inject({ method: "POST", url: "/_sim/reset" });
     await gatewaySim.inject({
@@ -1057,9 +1409,14 @@ describe("全链路：后端 AGENT_URL 指向 llm-agent", () => {
     });
   });
 
+  afterEach(() => {
+    expect(gemini.received).toHaveLength(0);
+  });
+
   afterAll(async () => {
     await llmAgent.close();
-    await fake.app.close();
+    await claude.app.close();
+    await gemini.app.close();
     await gatewaySim.close();
     await cleanup();
     await closeDb();
@@ -1096,7 +1453,7 @@ describe("全链路：后端 AGENT_URL 指向 llm-agent", () => {
     return group;
   }
 
-  it("get_recent_messages → send_message → finish：run finished / final，三步，网关恰好一条，历史里 tool_call_id 对得上", async () => {
+  it("get_recent_messages → send_message → finish：run finished / final，三步，网关恰好一条，第三轮回传了前两轮的思考块", async () => {
     const group = await stageGroup();
     const msg = await makeMessage({
       groupId: group.id,
@@ -1115,17 +1472,17 @@ describe("全链路：后端 AGENT_URL 指向 llm-agent", () => {
     expect(outcome.kind).toBe("run_created");
     if (outcome.kind !== "run_created") throw new Error("unreachable");
 
-    fake.turnScript.push(
-      callTools(toolCall("call_a", "get_recent_messages", { limit: 10 })),
-      callTools(
-        toolCall("call_b", "send_message", {
-          text: "在的，请讲",
-          idempotency_key: "k-1",
-        }),
+    claude.turnScript.push(
+      A.callTool("toolu_a", "get_recent_messages", { limit: 10 }, "sig-a"),
+      A.callTool(
+        "toolu_b",
+        "send_message",
+        { text: "在的，请讲", idempotency_key: "k-1" },
+        "sig-b",
       ),
-      callTools(toolCall("call_c", "finish", { summary: "已回复用户" })),
+      A.callTool("toolu_c", "finish", { summary: "已回复用户" }, "sig-c"),
     );
-    fake.auditScript.push(verdict("pass", "正常回复"));
+    claude.auditScript.push(A.verdict("pass", "正常回复"));
 
     const agentClient = createAgentClient({ baseUrl: agentUrl });
     const outboxTick = () =>
@@ -1164,9 +1521,9 @@ describe("全链路：后端 AGENT_URL 指向 llm-agent", () => {
       orderBy: { index: "asc" },
     });
     expect(steps.map((s) => [s.kind, s.name, s.toolUseId, s.isError])).toEqual([
-      ["tool_use", "get_recent_messages", "call_a", false],
-      ["tool_use", "send_message", "call_b", false],
-      ["final", "finish", "call_c", false],
+      ["tool_use", "get_recent_messages", "toolu_a", false],
+      ["tool_use", "send_message", "toolu_b", false],
+      ["final", "finish", "toolu_c", false],
     ]);
     expect(steps[1]?.auditVerdict).toBe("pass");
 
@@ -1175,30 +1532,35 @@ describe("全链路：后端 AGENT_URL 指向 llm-agent", () => {
     ).json<{ sendCalls: unknown[] }>();
     expect(gw.sendCalls).toHaveLength(1);
 
-    // 上游看到的第三轮历史：tool_calls 与 tool 消息按 id 配对，触发上下文原样
-    const turns = fake.received.filter((r) => Array.isArray(r.body.tools));
+    // 上游看到的第三轮：两个 assistant 回合都换回了带思考块的完整 content，tool_result 按 id 配对
+    const turns = claude.received.filter((r) => Array.isArray(r.body.tools));
     expect(turns).toHaveLength(3);
     const third = turns[2]?.body.messages as Json[];
     expect(third.map((m) => m.role)).toEqual([
-      "system",
       "user",
       "assistant",
-      "tool",
+      "user",
       "assistant",
-      "tool",
+      "user",
     ]);
-    expect(JSON.parse(String(third[1]?.content))).toMatchObject({
+    expect(
+      JSON.parse(String((third[0]?.content as Json[])[0]?.text)),
+    ).toMatchObject({
       groupId: group.gatewayGroupId,
       triggerMessages: [{ text: "有人在吗", senderPlatformUserId: "u-ext-1" }],
     });
-    expect(third[3]?.tool_call_id).toBe("call_a");
-    expect(third[5]?.tool_call_id).toBe("call_b");
-    expect(JSON.parse(String(third[5]?.content))).toMatchObject({
-      deliveryStatus: "accepted",
+    expect(third[1]?.content).toEqual([
+      A.thinking("sig-a"),
+      A.toolUse("toolu_a", "get_recent_messages", { limit: 10 }),
+    ]);
+    expect((third[3]?.content as Json[])[0]).toEqual(A.thinking("sig-b"));
+    expect((third[4]?.content as Json[])[0]).toMatchObject({
+      type: "tool_result",
+      tool_use_id: "toolu_b",
     });
     // auditModel 没设 → 审计用同一个模型
-    const audits = fake.received.filter((r) => !Array.isArray(r.body.tools));
+    const audits = claude.received.filter((r) => !Array.isArray(r.body.tools));
     expect(audits).toHaveLength(1);
-    expect(audits[0]?.body.model).toBe("turn-model");
+    expect(audits[0]?.body.model).toBe("claude-opus-5-5");
   });
 });

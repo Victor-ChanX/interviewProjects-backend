@@ -1,6 +1,7 @@
-// LLM 设置（#19，题目 C2）：后端 /api/llm/* 代理 llm-agent 的 /admin/*。
-// 真链路：后端（buildApp，真库）→ llm-agent（listen(0)，配置文件在临时目录）→ 假 OpenAI（tests/fake-openai.ts）。
-// 覆盖：主流程（读 → 列模型 → 保存 → 测试）、闸门（viewer 只能读）、key 沿用 / 跨主机不沿用、错误码透传、
+// LLM 设置（#19 / #21，题目 C2）：后端 /api/llm/* 代理 llm-agent 的 /admin/*。服务商只有 Claude 与 Gemini。
+// 真链路：后端（buildApp，真库）→ llm-agent（listen(0)，配置文件在临时目录）→ 假 Anthropic / 假 Gemini
+// （tests/fake-anthropic.ts、tests/fake-gemini.ts）。
+// 覆盖：主流程（读 → 列模型 → 保存 → 测试）、闸门（viewer 只能读）、key 沿用 / 换服务商不沿用、错误码透传、
 // supported=false 两个分支（AGENT_URL 指向 Agent 模拟器 / 没配令牌）、令牌不一致、key 明文不出现在任何响应里。
 import { rm } from "node:fs/promises";
 
@@ -9,27 +10,26 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { buildApp } from "../src/app.js";
 import { closeDb } from "../src/db/client.js";
-import { createConfigStore } from "../src/llm-agent/config-store.js";
 import { createLlmAdminClient } from "../src/services/llm-settings-service.js";
 import { buildAgentApp } from "../src/sim/agent/app.js";
+import * as A from "./fake-anthropic.js";
+import * as G from "./fake-gemini.js";
+import { loginAs } from "./factories.js";
 import {
   ADMIN_TOKEN,
   buildTestLlmAgent,
-  say,
-  startFakeOpenAi,
-  tempConfigFile,
-  verdict,
-  type FakeOpenAi,
-} from "./fake-openai.js";
-import { loginAs } from "./factories.js";
+  tempLlmAgentDir,
+} from "./llm-agent-harness.js";
 import { truncateAll } from "./setup.js";
 
 type Json = Record<string, unknown>;
 
-const API_KEY = "sk-settings-key-9876543210wxyz";
+const API_KEY = "sk-ant-settings-key-9876543210wxyz";
+const GEMINI_KEY = "AIza-settings-gemini-key-0123456789";
 
 describe("LLM 设置 /api/llm/*（#19）", () => {
-  let fake: FakeOpenAi;
+  let fake: A.FakeAnthropic;
+  let gemini: G.FakeGemini;
   let llmAgent: FastifyInstance;
   let llmAgentUrl: string;
   let agentSim: FastifyInstance;
@@ -41,12 +41,16 @@ describe("LLM 设置 /api/llm/*（#19）", () => {
   let cleanup: () => Promise<void>;
 
   beforeAll(async () => {
-    fake = await startFakeOpenAi();
-    const tmp = await tempConfigFile();
+    fake = await A.startFakeAnthropic();
+    gemini = await G.startFakeGemini();
+    const tmp = await tempLlmAgentDir();
     filePath = tmp.filePath;
     cleanup = tmp.cleanup;
     llmAgent = await buildTestLlmAgent({
-      store: createConfigStore({ filePath }),
+      store: tmp.store,
+      sessions: tmp.sessions,
+      anthropicUrl: fake.url,
+      geminiUrl: gemini.url,
     });
     llmAgentUrl = await llmAgent.listen({ port: 0, host: "127.0.0.1" });
     agentSim = await buildAgentApp({ logger: false });
@@ -54,7 +58,7 @@ describe("LLM 设置 /api/llm/*（#19）", () => {
     app = await buildApp({
       logger: false,
       llmAdmin: createLlmAdminClient({
-        baseUrl: llmAgentUrl,
+        agentUrl: llmAgentUrl,
         adminToken: ADMIN_TOKEN,
       }),
     });
@@ -64,6 +68,7 @@ describe("LLM 设置 /api/llm/*（#19）", () => {
   beforeEach(async () => {
     await truncateAll();
     fake.reset();
+    gemini.reset();
     await rm(filePath, { force: true });
     admin = await loginAs(app, "admin");
     viewer = await loginAs(app, "viewer");
@@ -74,6 +79,7 @@ describe("LLM 设置 /api/llm/*（#19）", () => {
     await llmAgent.close();
     await agentSim.close();
     await fake.app.close();
+    await gemini.app.close();
     await cleanup();
     await closeDb();
   });
@@ -93,6 +99,7 @@ describe("LLM 设置 /api/llm/*（#19）", () => {
     });
     // 任何响应里都没有 key 明文
     expect(res.body).not.toContain(API_KEY);
+    expect(res.body).not.toContain(GEMINI_KEY);
     return res;
   };
 
@@ -101,7 +108,7 @@ describe("LLM 设置 /api/llm/*（#19）", () => {
     expect(empty.statusCode).toBe(200);
     expect(empty.json()).toEqual({
       supported: true,
-      baseUrl: null,
+      provider: null,
       model: null,
       auditModel: null,
       hasApiKey: false,
@@ -110,35 +117,39 @@ describe("LLM 设置 /api/llm/*（#19）", () => {
       source: "none",
     });
 
-    fake.modelsScript.push({
-      body: { data: [{ id: "m-b", owned_by: "x" }, { id: "m-a" }] },
-    });
+    fake.modelsScript.push(
+      A.modelsPage([
+        A.modelInfo("claude-opus-5-5"),
+        A.modelInfo("claude-legacy", { low: false }),
+        A.modelInfo("claude-haiku-4-5"),
+      ]),
+    );
     const models = await call(app, "POST", "/api/llm/models", admin, {
-      baseUrl: fake.baseUrl,
+      provider: "anthropic",
       apiKey: API_KEY,
     });
     expect(models.statusCode).toBe(200);
     expect(models.json()).toEqual({
       items: [
-        { id: "m-a", ownedBy: null },
-        { id: "m-b", ownedBy: "x" },
+        { id: "claude-opus-5-5", displayName: "Display claude-opus-5-5" },
+        { id: "claude-haiku-4-5", displayName: "Display claude-haiku-4-5" },
       ],
       total: 2,
     });
-    expect(fake.received[0]?.headers.authorization).toBe(`Bearer ${API_KEY}`);
+    expect(fake.received[0]?.headers["x-api-key"]).toBe(API_KEY);
 
     const saved = await call(app, "PUT", "/api/llm/settings", admin, {
-      baseUrl: fake.baseUrl,
+      provider: "anthropic",
       apiKey: API_KEY,
-      model: "m-a",
-      auditModel: "m-b",
+      model: "claude-opus-5-5",
+      auditModel: "claude-haiku-4-5",
     });
     expect(saved.statusCode).toBe(200);
     expect(saved.json()).toMatchObject({
       supported: true,
-      baseUrl: fake.baseUrl,
-      model: "m-a",
-      auditModel: "m-b",
+      provider: "anthropic",
+      model: "claude-opus-5-5",
+      auditModel: "claude-haiku-4-5",
       hasApiKey: true,
       apiKeyHint: "sk-…wxyz",
       source: "file",
@@ -148,12 +159,54 @@ describe("LLM 设置 /api/llm/*（#19）", () => {
     expect(read.json()).toEqual(saved.json());
 
     fake.reset();
-    fake.turnScript.push(say("连接正常"));
-    fake.auditScript.push(verdict("pass"));
+    fake.turnScript.push(A.say("连接正常"));
+    fake.auditScript.push(A.verdict("pass"));
     const test = await call(app, "POST", "/api/llm/test", admin);
     expect(test.statusCode).toBe(200);
-    expect(test.json()).toMatchObject({ ok: true, model: "m-a" });
-    expect(fake.received.map((r) => r.body.model)).toEqual(["m-a", "m-b"]);
+    expect(test.json()).toMatchObject({ ok: true, model: "claude-opus-5-5" });
+    expect(fake.received.map((r) => r.body.model)).toEqual([
+      "claude-opus-5-5",
+      "claude-haiku-4-5",
+    ]);
+  });
+
+  it("Gemini：列模型（只留支持 generateContent 的）→ 保存 → 测试连接", async () => {
+    gemini.modelsScript.push(
+      G.modelsPage([
+        {
+          name: "models/gemini-3-flash-preview",
+          displayName: "Gemini 3 Flash",
+          methods: ["generateContent"],
+        },
+        { name: "models/embedding-001", methods: ["embedContent"] },
+      ]),
+    );
+    const models = await call(app, "POST", "/api/llm/models", admin, {
+      provider: "gemini",
+      apiKey: GEMINI_KEY,
+    });
+    expect(models.json()).toEqual({
+      items: [{ id: "gemini-3-flash-preview", displayName: "Gemini 3 Flash" }],
+      total: 1,
+    });
+    const saved = await call(app, "PUT", "/api/llm/settings", admin, {
+      provider: "gemini",
+      apiKey: GEMINI_KEY,
+      model: "gemini-3-flash-preview",
+    });
+    expect(saved.json()).toMatchObject({
+      provider: "gemini",
+      auditModel: null,
+      apiKeyHint: "AIz…6789",
+    });
+    gemini.turnScript.push(G.say("连接正常"));
+    gemini.auditScript.push(G.verdict("pass"));
+    const test = await call(app, "POST", "/api/llm/test", admin);
+    expect(test.json()).toMatchObject({
+      ok: true,
+      model: "gemini-3-flash-preview",
+    });
+    expect(fake.received).toHaveLength(0);
   });
 
   it("闸门：viewer 能读，写 / 列模型 / 测试 → 403；没登录 → 401", async () => {
@@ -164,9 +217,9 @@ describe("LLM 设置 /api/llm/*（#19）", () => {
       [
         "PUT",
         "/api/llm/settings",
-        { baseUrl: fake.baseUrl, apiKey: API_KEY, model: "m" },
+        { provider: "anthropic", apiKey: API_KEY, model: "m" },
       ],
-      ["POST", "/api/llm/models", { baseUrl: fake.baseUrl, apiKey: API_KEY }],
+      ["POST", "/api/llm/models", { provider: "anthropic", apiKey: API_KEY }],
       ["POST", "/api/llm/test", undefined],
     ] as const) {
       const res = await call(app, method, url, viewer, payload);
@@ -179,9 +232,9 @@ describe("LLM 设置 /api/llm/*（#19）", () => {
     );
   });
 
-  it("apiKey 省略：同一 Base URL 沿用；换 Base URL → 422 LLM_API_KEY_REQUIRED（保存与列模型都一样）", async () => {
+  it("apiKey 省略：同一服务商沿用；换服务商 → 422 LLM_API_KEY_REQUIRED，key 不会发给另一家（保存与列模型都一样）", async () => {
     const first = await call(app, "PUT", "/api/llm/settings", admin, {
-      baseUrl: fake.baseUrl,
+      provider: "anthropic",
       model: "m",
     });
     expect(first.statusCode).toBe(422);
@@ -190,51 +243,52 @@ describe("LLM 设置 /api/llm/*（#19）", () => {
     });
 
     await call(app, "PUT", "/api/llm/settings", admin, {
-      baseUrl: fake.baseUrl,
+      provider: "anthropic",
       apiKey: API_KEY,
       model: "m1",
     });
     const kept = await call(app, "PUT", "/api/llm/settings", admin, {
-      baseUrl: fake.baseUrl,
+      provider: "anthropic",
       model: "m2",
     });
     expect(kept.statusCode).toBe(200);
     expect(kept.json()).toMatchObject({ model: "m2", hasApiKey: true });
 
-    fake.modelsScript.push({ body: { data: [{ id: "m2" }] } });
+    fake.modelsScript.push(A.modelsPage([A.modelInfo("m2")]));
     const reuse = await call(app, "POST", "/api/llm/models", admin, {
-      baseUrl: fake.baseUrl,
+      provider: "anthropic",
     });
     expect(reuse.statusCode).toBe(200);
-    expect(fake.received[0]?.headers.authorization).toBe(`Bearer ${API_KEY}`);
+    expect(fake.received[0]?.headers["x-api-key"]).toBe(API_KEY);
 
     for (const [method, url] of [
       ["PUT", "/api/llm/settings"],
       ["POST", "/api/llm/models"],
     ] as const) {
       const res = await call(app, method, url, admin, {
-        baseUrl: "https://attacker.example/v1",
-        model: "m3",
+        provider: "gemini",
+        model: "gemini-3-flash-preview",
       });
       expect(res.statusCode).toBe(422);
       expect(res.json()).toMatchObject({
         error: { code: "LLM_API_KEY_REQUIRED" },
       });
     }
-    // 没有任何请求被发往别的主机，配置不变
+    // 没有任何请求被发往另一家，配置不变
+    expect(gemini.received).toHaveLength(0);
     expect(fake.received).toHaveLength(1);
     expect(
       (await call(app, "GET", "/api/llm/settings", admin)).json(),
-    ).toMatchObject({ model: "m2" });
+    ).toMatchObject({ provider: "anthropic", model: "m2" });
   });
 
-  it("上游错误码：401 → 422 LLM_UPSTREAM_UNAUTHORIZED；500 → 502 LLM_UPSTREAM_ERROR；形状错 → 400", async () => {
+  it("上游错误码：401 → 422 LLM_UPSTREAM_UNAUTHORIZED；5xx → 502 LLM_UPSTREAM_ERROR；形状错 → 400", async () => {
     fake.modelsScript.push({
       status: 401,
-      body: { error: { message: `invalid key ${API_KEY}` } },
+      body: A.apiError("authentication_error", `invalid key ${API_KEY}`),
     });
     const unauthorized = await call(app, "POST", "/api/llm/models", admin, {
-      baseUrl: fake.baseUrl,
+      provider: "anthropic",
       apiKey: API_KEY,
     });
     expect(unauthorized.statusCode).toBe(422);
@@ -242,9 +296,14 @@ describe("LLM 设置 /api/llm/*（#19）", () => {
       error: { code: "LLM_UPSTREAM_UNAUTHORIZED" },
     });
 
-    fake.modelsScript.push({ status: 500, body: { error: { message: "x" } } });
+    for (let i = 0; i < 3; i += 1) {
+      fake.modelsScript.push({
+        status: 500,
+        body: A.apiError("api_error", "x"),
+      });
+    }
     const down = await call(app, "POST", "/api/llm/models", admin, {
-      baseUrl: fake.baseUrl,
+      provider: "anthropic",
       apiKey: API_KEY,
     });
     expect(down.statusCode).toBe(502);
@@ -253,7 +312,7 @@ describe("LLM 设置 /api/llm/*（#19）", () => {
     });
 
     const bad = await call(app, "PUT", "/api/llm/settings", admin, {
-      baseUrl: "not a url",
+      provider: "other",
       apiKey: API_KEY,
       model: "m",
     });
@@ -273,7 +332,7 @@ describe("LLM 设置 /api/llm/*（#19）", () => {
       const simApp = await buildApp({
         logger: false,
         llmAdmin: createLlmAdminClient({
-          baseUrl: agentSimUrl,
+          agentUrl: agentSimUrl,
           adminToken: ADMIN_TOKEN,
         }),
       });
@@ -282,7 +341,7 @@ describe("LLM 设置 /api/llm/*（#19）", () => {
       expect(read.statusCode).toBe(200);
       expect(read.json()).toEqual({
         supported: false,
-        baseUrl: null,
+        provider: null,
         model: null,
         auditModel: null,
         hasApiKey: false,
@@ -294,9 +353,9 @@ describe("LLM 设置 /api/llm/*（#19）", () => {
         [
           "PUT",
           "/api/llm/settings",
-          { baseUrl: fake.baseUrl, apiKey: API_KEY, model: "m" },
+          { provider: "anthropic", apiKey: API_KEY, model: "m" },
         ],
-        ["POST", "/api/llm/models", { baseUrl: fake.baseUrl, apiKey: API_KEY }],
+        ["POST", "/api/llm/models", { provider: "anthropic", apiKey: API_KEY }],
         ["POST", "/api/llm/test", undefined],
       ] as const) {
         const res = await call(simApp, method, url, simAdmin, payload);
@@ -325,7 +384,7 @@ describe("LLM 设置 /api/llm/*（#19）", () => {
       const wrong = await buildApp({
         logger: false,
         llmAdmin: createLlmAdminClient({
-          baseUrl: llmAgentUrl,
+          agentUrl: llmAgentUrl,
           adminToken: "not-the-token",
         }),
       });

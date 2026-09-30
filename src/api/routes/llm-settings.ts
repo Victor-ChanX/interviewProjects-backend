@@ -43,7 +43,7 @@ export default async function llmSettingsRoutes(
       preHandler: [requireUser],
       schema: {
         summary:
-          "当前的 LLM 设置（Base URL、模型、key 提示）；Agent 服务不是 llm-agent 时 supported=false",
+          "当前的 LLM 设置（服务商 Claude / Gemini、模型、key 提示）；Agent 服务不是 llm-agent 时 supported=false",
         tags: ["llm"],
         response: { 200: LlmSettingsRead },
       },
@@ -57,7 +57,7 @@ export default async function llmSettingsRoutes(
       preHandler: [requireUser, requireRole("admin")],
       schema: {
         summary:
-          "保存 LLM 设置（apiKey 省略时仅在 Base URL 不变时沿用已保存的 key），llm-agent 立即生效",
+          "保存 LLM 设置（apiKey 省略时仅在服务商不变时沿用已保存的 key），llm-agent 立即生效",
         tags: ["llm"],
         body: LlmSettingsUpdate,
         response: { 200: LlmSettingsRead },
@@ -71,7 +71,8 @@ export default async function llmSettingsRoutes(
     {
       preHandler: [requireUser, requireRole("admin")],
       schema: {
-        summary: "用给定的 Base URL 与 key 向服务商获取模型列表（按 id 排序）",
+        summary:
+          "用给定的服务商与 key 获取可用的模型列表（Claude：Models API；Gemini：支持 generateContent 的模型）",
         tags: ["llm"],
         body: LlmModelsRequest,
         response: { 200: LlmModelListResponse },
