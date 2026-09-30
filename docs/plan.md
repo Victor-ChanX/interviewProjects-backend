@@ -96,9 +96,13 @@ backend/ (Fastify + Prisma + PostgreSQL)
 | #17 | B3 会话：refresh token HttpOnly + 轮换 + 复用作废整族；logout 即失效；前端并发 401 只刷一次 | |
 | #18 / 前端 #7 | B4：WS `sinceSeq` 补发（断线 3 秒内补齐不重复）；页面 4 agent 步骤详情、页面 5 序列运行 | |
 
-### 不做（C 组）
+### C 组（选做）
 
-媒体文件下载与清理、真实 LLM 接入、Playwright —— 除非 A/B 全部完成仍有时间。
+| # | 任务 | 状态 |
+|---|---|---|
+| 前端 #8 | C3 Playwright：登录 → 群列表 → 群详情 → agent run 详情看到每一步；viewer 只读。webServer 拉起两个模拟器、后端与 Vite，专用库每次重建；公开 CI 里并排 checkout 后端仓跑 | 已完成 |
+| | C1 媒体文件下载与清理 | 未做（入站事件已把 `mediaUrl` 存进 `messages.media_url` 与原始 payload，下载 worker 可直接接） |
+| | C2 接入真实 LLM | 未做（Agent 客户端只依赖 `AGENT_URL` 与 2.2 的协议，换服务不改后端） |
 
 ## 5. 测试策略
 

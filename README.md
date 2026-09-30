@@ -67,6 +67,9 @@ DATABASE_URL=postgres://<user>@localhost:5432/<db> npm test
 npm run test:coverage
 ```
 
+浏览器端到端（Playwright：登录 → 群详情 → agent run 每一步）在前端仓：并排 checkout 两个仓后在前端仓跑它的 e2e 脚本，
+它会自己拉起本仓的两个模拟器与后端，见前端仓 README「端到端」。
+
 ## 目录
 
 ```
