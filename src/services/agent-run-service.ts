@@ -97,8 +97,14 @@ export const RECENT_TEXT_MAX_CHARS = 500;
 export const RESULT_CONTENT_MAX_BYTES = 8 * 1024;
 export const RESULT_SUMMARY_MAX_CHARS = 200;
 export const RAW_RESPONSE_MAX_BYTES = 2 * 1024;
-/** 心跳超过这么久没更新 = 执行者死了，别的副本可以接手（一步最长 ≈ turn 12s + 审计 3×5s + 等发送 5s） */
-export const STALE_HEARTBEAT_MS = 60_000;
+/**
+ * 心跳超过这么久没更新 = 执行者死了，别的副本可以接手。心跳由 worker 为自己驱动中的 run 定时刷新
+ * （HEARTBEAT_INTERVAL_MS，与步骤进度无关 —— 一步可能要十几秒），所以阈值只需覆盖几次心跳间隔：
+ * 进程被硬杀后最多这么久就有人接着跑（A5 第 8 条）。
+ */
+export const STALE_HEARTBEAT_MS = 15_000;
+/** worker 刷新心跳的间隔 */
+export const HEARTBEAT_INTERVAL_MS = 3_000;
 /** 连续用相同入参调 get_recent_messages 到第几次开始附 hint（A5 第 11 条） */
 export const REPEATED_CALL_HINT_FROM = 3;
 
@@ -581,6 +587,23 @@ export async function releaseRun(
       },
     });
   });
+}
+
+/**
+ * worker 定时为自己驱动中的 run 刷心跳（与步骤无关）：一步在等 turn / 审计时心跳也不会过期。
+ * 只刷仍由本 worker 领着、仍 running 的；返回刷到的条数。
+ */
+export async function heartbeatRuns(
+  runIds: readonly string[],
+  workerId: string,
+  now: Date,
+): Promise<number> {
+  if (runIds.length === 0) return 0;
+  const { count } = await getDb().agentRun.updateMany({
+    where: { id: { in: [...runIds] }, claimedBy: workerId, status: "running" },
+    data: { heartbeatAt: now },
+  });
+  return count;
 }
 
 /** 事务里更新心跳，顺便验证领取仍在本副本手上；不在 → ClaimLostError（调用方停止对这个 run 的写入）。 */

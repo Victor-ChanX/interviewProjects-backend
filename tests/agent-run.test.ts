@@ -35,6 +35,7 @@ import {
 import {
   AGENT_TOOLS,
   type Checkpoint,
+  claimRun,
   fitContent,
   MAX_STEPS,
   onInboundMessage,
@@ -1674,6 +1675,70 @@ describe("agent run（#12 / #13）", () => {
         await worker.stop();
       }
     }, 15_000);
+  });
+
+  describe("心跳", () => {
+    it("worker 为在跑的 run 定时刷心跳：一步挂很久也不被别的副本抢走；硬杀后 STALE_HEARTBEAT_MS（≤ 15 秒）即可接手", async () => {
+      expect(STALE_HEARTBEAT_MS).toBeLessThanOrEqual(15_000);
+      await agentScenario({
+        turn: {
+          steps: [
+            { type: "get_recent_messages", limit: 5, delay_ms: 60_000 },
+            { type: "finish" },
+          ],
+        },
+      });
+      const { group } = await stageGroup();
+      const runId = await startRun(group);
+      const worker = startAgentWorker({
+        clock,
+        agent: agentClient,
+        gateway: gatewayClient,
+        workerId: "w-alive",
+        intervalMs: 20,
+        heartbeatIntervalMs: 20,
+        log: silent,
+        turnTimeoutMs: 15_000,
+        auditTimeoutMs: 2_000,
+        sleep: pollSleep,
+      });
+      try {
+        await vi.waitFor(() => expect(agentSleep.calls).toHaveLength(1));
+        // turn 还挂着，时间过去远超阈值：心跳一直在刷 —— run 仍由 w-alive 领着、只驱动了一次（没刷心跳的话，
+        // 连 w-alive 自己的领取循环都会把它当成没人管的 run 再领一次、并行再驱动一条），别的副本也领不到
+        for (let i = 0; i < 4; i += 1) {
+          clock.advance(STALE_HEARTBEAT_MS);
+          await realSleep(60);
+        }
+        expect(
+          await getDb().agentRun.findUniqueOrThrow({ where: { id: runId } }),
+        ).toMatchObject({ status: "running", claimedBy: "w-alive" });
+        expect(
+          (await agentState()).runs.find((r) => r.runId === runId)?.turns,
+        ).toBe(1);
+        expect(await claimRun("w-other", clock.now())).toBeNull();
+      } finally {
+        agentSleep.flush();
+        await worker.stop();
+      }
+
+      // 硬杀：领取标记还在、心跳停了 —— 过了阈值新进程就能接手
+      const b = await stageGroup();
+      const orphan = await startRun(b.group);
+      await getDb().agentRun.update({
+        where: { id: orphan },
+        data: {
+          claimedBy: "w-killed",
+          heartbeatAt: clock.now(),
+          activeSince: clock.now(),
+        },
+      });
+      clock.advance(STALE_HEARTBEAT_MS - 1_000);
+      expect(await claimRun("w-restarted", clock.now())).toBeNull();
+      clock.advance(1_001);
+      expect(await claimRun("w-restarted", clock.now())).toBe(orphan);
+      expect(runId).toBeTruthy();
+    }, 20_000);
   });
 
   // ---- 重启恢复（A5 第 8 条）+ 多副本 ------------------------------------------------------------------------

@@ -4,7 +4,8 @@
 // （或 stop() / maxStepsPerTick）→ 释放（当前活跃段折进 accumulatedMs，停机期间不计预算）。
 // 常驻循环同时跑最多 maxConcurrentRuns 个 run（各群互不等待）：一个 run 一步可能要十几秒（turn 超时 + 审计），
 // 一次只跑一个的话，同时触发的几个群要排队几分钟，而 60 秒预算从 run 创建起算。
-// 领着的期间每步刷心跳；进程死了，别的副本在 STALE_HEARTBEAT_MS 后接手，从库里的中断处续（每步先落库再产生副作用）。
+// 领着的期间每 heartbeatIntervalMs 为在跑的 run 刷一次心跳（与步骤无关：一步可能要十几秒）；进程死了，别的副本
+// （或重启后的本机新进程）在 STALE_HEARTBEAT_MS 后接手，从库里的中断处续（每步先落库再产生副作用）。
 // 写法是 while + 可打断的 sleep 而不是 setInterval：tick 慢于间隔时不会叠着跑；stop() 打断等待、等在途的步完成
 // （不在 /agent/turn 或网关调用中途退出）后释放 run。
 // 「现在」从 deps.clock 取，等待用 deps.sleep（默认 setTimeout；service 里不许 setTimeout，所以由这里注入）。
@@ -19,6 +20,8 @@ import {
   type AgentRunDeps,
   type Checkpoint,
   claimRun,
+  HEARTBEAT_INTERVAL_MS,
+  heartbeatRuns,
   releaseRun,
   runStep,
   type StepOutcome,
@@ -55,6 +58,8 @@ export type AgentWorkerDeps = AgentTickDeps & {
   intervalMs: number;
   /** 同时跑的 run 数上限；默认 DEFAULT_MAX_CONCURRENT_RUNS */
   maxConcurrentRuns?: number;
+  /** 为在跑的 run 刷心跳的间隔；默认 HEARTBEAT_INTERVAL_MS */
+  heartbeatIntervalMs?: number;
   /** 可注入的可打断等待；默认 setTimeout */
   wait?: (ms: number) => { promise: Promise<void>; cancel: () => void };
 };
@@ -158,8 +163,11 @@ export function startAgentWorker(deps: AgentWorkerDeps): AgentWorkerHandle {
   const maxConcurrent = deps.maxConcurrentRuns ?? DEFAULT_MAX_CONCURRENT_RUNS;
   const workerStartedAt = deps.workerStartedAt ?? deps.clock.now();
   const inflight = new Set<Promise<void>>();
+  /** 正在驱动的 run（刷心跳用）；只属于这个进程，真相仍在库里 */
+  const driving = new Set<string>();
   let stopped = false;
   let pending: { cancel: () => void } | undefined;
+  let heartbeatWait: { cancel: () => void } | undefined;
 
   const tickDeps: AgentTickDeps = {
     ...deps,
@@ -174,6 +182,7 @@ export function startAgentWorker(deps: AgentWorkerDeps): AgentWorkerHandle {
       workerStartedAt,
     });
     if (!runId) return false;
+    driving.add(runId);
     const task: Promise<void> = driveRun(runId, tickDeps)
       .then((result) => {
         log.info(result, "agent run 驱动结束");
@@ -182,6 +191,7 @@ export function startAgentWorker(deps: AgentWorkerDeps): AgentWorkerHandle {
         log.error({ err, runId }, "agent run 驱动失败");
       })
       .finally(() => {
+        driving.delete(runId);
         inflight.delete(task);
         // 跑完一个就立刻看有没有下一个（pending 合并出来的 run 不该等一个间隔）
         pending?.cancel();
@@ -189,6 +199,21 @@ export function startAgentWorker(deps: AgentWorkerDeps): AgentWorkerHandle {
     inflight.add(task);
     return true;
   };
+
+  const heartbeatLoop = (async () => {
+    while (!stopped) {
+      const s = wait(deps.heartbeatIntervalMs ?? HEARTBEAT_INTERVAL_MS);
+      heartbeatWait = s;
+      await s.promise;
+      heartbeatWait = undefined;
+      if (stopped) break;
+      try {
+        await heartbeatRuns([...driving], deps.workerId, deps.clock.now());
+      } catch (err) {
+        log.error({ err }, "刷新 agent run 心跳失败");
+      }
+    }
+  })();
 
   const loop = (async () => {
     while (!stopped) {
@@ -214,7 +239,8 @@ export function startAgentWorker(deps: AgentWorkerDeps): AgentWorkerHandle {
     async stop() {
       stopped = true;
       pending?.cancel();
-      await loop;
+      heartbeatWait?.cancel();
+      await Promise.all([loop, heartbeatLoop]);
     },
   };
 }
