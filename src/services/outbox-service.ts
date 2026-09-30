@@ -18,6 +18,8 @@
 //   SENDER_NOT_IN_GROUP / ACCOUNT_OFFLINE（及其他 4xx）→ failed（同名 failCode）；503 / 5xx / 连不上 → 回 queued，
 //   有界退避（nextAttemptAt），attempts 达上限 → failed GATEWAY_UNAVAILABLE。
 // - message_sent / message_failed 事件的记账入口 applyGatewayDelivery 给入站 worker（#8）调。
+// - 序列（#15）：消息进终局（sent / failed / cancelled）时 settle 在同一事务里调 sequence-service.onOutboundSettled，
+//   把对应的序列步骤改 sent / failed 并排下一步 —— 「发出」= 这条消息变 sent 的时刻。
 //
 // 手写 SQL 用的是数据库列名（@map 的值）；`${}` 是绑定参数。
 import { randomInt, randomUUID } from "node:crypto";
@@ -44,6 +46,7 @@ import {
   GatewayUnreachableError,
 } from "./gateway-client.js";
 import { markGroupUnreachable } from "./group-service.js";
+import { onOutboundSettled } from "./sequence-service.js";
 import { emitWsEvent } from "./ws-events.js";
 
 // ---- 常量（有界重试 / 确认窗口 / 回收阈值）------------------------------------------------
@@ -350,6 +353,7 @@ async function settle(
   workerId: string | null,
   from: DeliveryStatus[],
   data: SettleData,
+  now: Date,
 ): Promise<Message | null> {
   const changed = await tx.message.updateMany({
     where: {
@@ -370,6 +374,9 @@ async function settle(
   }
   const row = await tx.message.findUniqueOrThrow({ where: { id: messageId } });
   await emitMessageEvent(tx, row);
+  // #15：序列步骤跟着这条消息的终局走（同一事务）：sent → 步骤 sent 并以网关 sentAt 为基准排下一步；
+  // failed / cancelled → 步骤 failed 并以此刻为基准继续。不是序列消息 / 步骤已结时是空操作。
+  await onOutboundSettled(tx, row, now);
   return row;
 }
 
@@ -424,11 +431,14 @@ export async function recordAccepted(
       httpStatus: 202,
       errorCode: null,
     });
-    return settle(tx, messageId, workerId, ["queued"], {
-      deliveryStatus: "accepted",
-      acceptedAt: now,
-      lastError: null,
-    });
+    return settle(
+      tx,
+      messageId,
+      workerId,
+      ["queued"],
+      { deliveryStatus: "accepted", acceptedAt: now, lastError: null },
+      now,
+    );
   });
   return row !== null;
 }
@@ -453,6 +463,7 @@ export async function recordFailed(
       workerId,
       opts.from ?? ["queued", "accepted", "unknown"],
       { deliveryStatus: "failed", failCode: code, lastError: code },
+      now,
     );
   });
   return row !== null;
@@ -469,11 +480,14 @@ export async function recordCancelled(
   const now = (deps.clock ?? systemClock).now();
   const row = await getDb().$transaction(async (tx) => {
     await finishAttempt(tx, messageId, now, { httpStatus, errorCode: code });
-    return settle(tx, messageId, workerId, ["queued"], {
-      deliveryStatus: "cancelled",
-      failCode: code,
-      lastError: code,
-    });
+    return settle(
+      tx,
+      messageId,
+      workerId,
+      ["queued"],
+      { deliveryStatus: "cancelled", failCode: code, lastError: code },
+      now,
+    );
   });
   return row !== null;
 }
@@ -488,11 +502,18 @@ export async function recordUnknown(
   const now = (deps.clock ?? systemClock).now();
   const row = await getDb().$transaction(async (tx) => {
     await finishAttempt(tx, messageId, now, reason);
-    return settle(tx, messageId, workerId, ["queued"], {
-      deliveryStatus: "unknown",
-      unknownSince: now,
-      lastError: reason.errorCode,
-    });
+    return settle(
+      tx,
+      messageId,
+      workerId,
+      ["queued"],
+      {
+        deliveryStatus: "unknown",
+        unknownSince: now,
+        lastError: reason.errorCode,
+      },
+      now,
+    );
   });
   return row !== null;
 }
@@ -579,6 +600,7 @@ export async function recordSent(
         nextAttemptAt: null,
         lastError: null,
       },
+      now,
     );
     return row !== null;
   });
