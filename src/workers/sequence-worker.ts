@@ -7,7 +7,8 @@
 // sequence-service（消息终局推进步骤），service 自己 import 会成环。
 //
 // 排期本身在库里（sequence_run_steps.scheduledAt），定时器只是「多久看一次」；「现在」从 deps.clock 取，测试传假时钟
-// 推进。每个 tick 开头刷新库里的调度器心跳（recordSchedulerBeat），拿到最近一次停机空档：到点时刻落在空档里、仍 pending
+// 推进。心跳由独立定时器每 SCHEDULER_HEARTBEAT_INTERVAL_MS 刷新一次（tick 慢不会被误判为停机，后端 #53），每个 tick
+// 开头也刷新一次并拿到最近一次停机空档（recordSchedulerBeat）：到点时刻落在空档里、仍 pending
 // 的当前步是停机期间过期的那一步，service 只重排这一步（rescheduleStaleStep），后续步骤仍按前一步发出后排。
 // workerStartedAt（本实例启动时刻）只在库里还没有任何心跳（第一次启动）时作为空档的终点。
 // 写法是 while + 可打断的 sleep 而不是 setInterval：tick 慢于间隔时不会叠着跑；stop() 立即打断等待、等在途 tick
@@ -20,6 +21,7 @@ import {
   advanceNextDue,
   DEFAULT_BATCH_SIZE,
   recordSchedulerBeat,
+  SCHEDULER_HEARTBEAT_INTERVAL_MS,
 } from "../services/sequence-service.js";
 
 export type SequenceTickDeps = {
@@ -36,6 +38,8 @@ export type SequenceTickDeps = {
 export type SequenceWorkerDeps = Omit<SequenceTickDeps, "workerStartedAt"> & {
   /** 多久看一次（delaySeconds 以秒计，1s 足够） */
   intervalMs: number;
+  /** 调度器心跳间隔；默认 SCHEDULER_HEARTBEAT_INTERVAL_MS */
+  heartbeatIntervalMs?: number;
   /** 可注入的等待；默认 setTimeout。返回 { promise, cancel }：stop() 用 cancel 立刻打断 */
   sleep?: (ms: number) => { promise: Promise<void>; cancel: () => void };
 };
@@ -107,6 +111,30 @@ export function startSequenceWorker(
   const workerStartedAt = deps.clock.now();
   let stopped = false;
   let pending: { cancel: () => void } | undefined;
+  let heartbeatWait: { cancel: () => void } | undefined;
+
+  // 心跳独立于 tick：一个 tick 推进很多 run、或库慢时 tick 可能远超间隔，那不是停机，心跳照跳
+  const heartbeat = (async () => {
+    while (!stopped) {
+      try {
+        await recordSchedulerBeat(deps.clock.now(), {
+          workerStartedAt,
+          ...(deps.downtimeGapMs !== undefined
+            ? { gapMs: deps.downtimeGapMs }
+            : {}),
+        });
+      } catch (err) {
+        log.error({ err }, "调度器心跳写入失败");
+      }
+      if (stopped) break;
+      const s = sleep(
+        deps.heartbeatIntervalMs ?? SCHEDULER_HEARTBEAT_INTERVAL_MS,
+      );
+      heartbeatWait = s;
+      await s.promise;
+      heartbeatWait = undefined;
+    }
+  })();
 
   const loop = (async () => {
     while (!stopped) {
@@ -134,7 +162,8 @@ export function startSequenceWorker(
     async stop() {
       stopped = true;
       pending?.cancel();
-      await loop;
+      heartbeatWait?.cancel();
+      await Promise.all([loop, heartbeat]);
     },
   };
 }

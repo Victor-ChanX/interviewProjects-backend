@@ -1079,6 +1079,23 @@ describe("定时序列（#15）", () => {
     const liveTick = (startedAt: Date = workerStartedAt) =>
       tick(startedAt, SCHEDULER_DOWNTIME_GAP_MS);
 
+    it("几秒的短重启也算停机：停机期间到点的第 2 步按「重启时刻 + delay2」重排，不在重启后立刻发出", async () => {
+      const { runId, scheduled2 } = await _atStep2();
+      await liveTick(); // 停机前最后一次心跳
+      // 进程停了 6 秒（超过心跳阈值，远小于一次「长停机」）；第 2 步在这期间到点
+      clock.advance(sec(6));
+      const restartedAt = clock.now();
+      expect(scheduled2.getTime()).toBeLessThan(restartedAt.getTime());
+
+      expect((await liveTick(restartedAt)).results).toEqual([
+        { runId, stepIndex: 2, outcome: "rescheduled" },
+      ]);
+      expect((await stepOf(runId, 2)).scheduledAt?.getTime()).toBe(
+        restartedAt.getTime() + sec(5),
+      );
+      expect(await getDb().message.count()).toBe(1);
+    });
+
     it("停机期间第 2 步过期：新 worker 接手时只把第 2 步改到「重启时刻 + delay2」，不发；第 3 步仍等第 2 步发出后 delay3", async () => {
       const { runId, scheduled2 } = await _atStep2();
       await liveTick(); // 停机前调度器最后一次心跳

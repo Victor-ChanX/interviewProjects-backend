@@ -29,8 +29,10 @@
 //
 // 重启后只重排最早一个已过期的步骤（rescheduleStaleStep）：到点时刻落在「调度器停机空档」里、仍 pending 的当前步
 // = 停机期间过期的那一步，改为 now + 该步 delaySeconds；后续步骤仍按「前一步发出后」排，不会一次性全发。
-// 停机空档来自库里的调度器心跳（recordSchedulerBeat，scheduler_heartbeats）：任一实例每次 tick 刷新心跳，两次心跳
-// 之间隔了超过 SCHEDULER_DOWNTIME_GAP_MS 才算停过，这段空档记为 (downFrom, downUntil)。不按单个实例的启动时刻判 ——
+// 停机空档来自库里的调度器心跳（recordSchedulerBeat，scheduler_heartbeats）：任一实例每 SCHEDULER_HEARTBEAT_INTERVAL_MS
+// 刷新一次心跳（独立于 tick 的定时器：tick 慢不会被误判为停机），两次心跳之间隔了超过 SCHEDULER_DOWNTIME_GAP_MS 才算
+// 停过，这段空档记为 (downFrom, downUntil)。阈值只比心跳间隔大一点：几秒的普通重启同样算停机，停机期间到点的那一步按
+// 「重启时刻 + delay」重排（后端 #53；此前阈值 10 秒，短重启里到点的步骤会被直接发出）。不按单个实例的启动时刻判 ——
 // 多副本滚动发布时新实例刚启动就领到一个 0.3 秒前才到点的步骤，那不是停机，不能顺延整整 delaySeconds。
 // 重排后 scheduledAt > downUntil，同一步不会再被判为过期。
 //
@@ -457,8 +459,10 @@ function logAdvance(deps: SequenceAdvanceDeps, result: AdvanceResult): void {
   deps.log?.info(result, "序列运行已推进");
 }
 
-/** 两次调度器心跳之间隔了超过这么久 = 调度器停过（tick 间隔 1 秒，留足慢 tick 的余量） */
-export const SCHEDULER_DOWNTIME_GAP_MS = 10_000;
+/** 调度器心跳间隔：worker 用独立定时器按它刷新心跳，不依赖 tick（tick 慢不算停机） */
+export const SCHEDULER_HEARTBEAT_INTERVAL_MS = 1_000;
+/** 两次调度器心跳之间隔了超过这么久 = 调度器停过（心跳间隔的 3 倍：容得下一次心跳写库慢，短重启也认得出） */
+export const SCHEDULER_DOWNTIME_GAP_MS = 3_000;
 const SEQUENCE_SCHEDULER = "sequence";
 
 /**
