@@ -54,6 +54,8 @@ curl -s localhost:8000/api/health  # {"ok":true,"schemaVersion":"…"}
 | `AGENT_TURN_TIMEOUT_MS` | 12000 | 每轮等 `/agent/turn` 的时间，只能在 10000–15000（题目 A5） |
 | `AGENT_AUDIT_TIMEOUT_MS` | 5000 | 等 `/agent/audit` 的时间 |
 | `MEDIA_DIR` / `MEDIA_RETENTION_DAYS` | `media` / 30 | 媒体文件（题目 C1）的存放目录与保留天数 |
+| `MEDIA_MAX_BYTES` | 10485760 | 单个媒体文件的大小上限，超过的不下载（记 `MEDIA_TOO_LARGE`） |
+| `CORS_ORIGINS` | 不设（不开 CORS） | 允许跨域调用的来源，逗号分隔；控制台走同源反代，用不到 |
 | `LLM_AGENT_ADMIN_TOKEN` 等 | — | 真实 LLM 版 Agent 的配置，见下文「接入真实 LLM」 |
 | `SIM_GATEWAY_PORT` / `SIM_AGENT_PORT` | 8100 / 8200 | 两个模拟器的端口 |
 | `SIM_GATEWAY_STATE_FILE` | 不设（纯内存） | 网关模拟器的状态文件：设了则重启不丢账号、群与事件历史（Docker Compose 部署设在 `gateway-data` 卷） |
@@ -63,6 +65,7 @@ curl -s localhost:8000/api/health  # {"ok":true,"schemaVersion":"…"}
 - **启动报「数据库 schema 落后于代码 / 比代码新」**：启动门禁发现库的迁移记录与本地 `prisma/migrations/` 对不上。
   落后：`npm run db:deploy` 或直接重启（启动时会自动前滚）；比代码新：代码版本比库旧（切回了旧分支 / 回滚部署），换回新代码或重建库。
 - **控制台里外部消息不出现、Agent 不触发**：多半是只重启了网关模拟器没重置库，见上面「重启了网关模拟器」。
+- **登录报「登录失败次数过多」（429）**：同一用户名 10 分钟内失败 5 次会锁 1 分钟，等提示的秒数后再试。
 - **`npm test` 报没有 DATABASE_URL**：测试不读 .env，见下文「测试」。
 
 ## 部署（Docker Compose / Dokploy）

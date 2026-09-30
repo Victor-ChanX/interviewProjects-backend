@@ -125,7 +125,11 @@ export async function buildApp(
   app.setValidatorCompiler(validatorCompiler);
   app.setSerializerCompiler(serializerCompiler);
 
-  await app.register(fastifyCors, { origin: true });
+  // CORS 只放行显式配置的来源（后端 #56）：控制台经同源反代（nginx / Vite）访问，默认不需要跨域；{ origin: true }
+  // 会反射任意来源
+  await app.register(fastifyCors, {
+    origin: config.corsOrigins.length > 0 ? config.corsOrigins : false,
+  });
   // refresh token cookie（#17）：解析 request.cookies、提供 reply.setCookie / clearCookie。不签名：值本身是随机 32 字节，
   // 库里只存哈希，签名不增加什么。
   await app.register(fastifyCookie);

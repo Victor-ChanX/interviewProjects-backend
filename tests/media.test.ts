@@ -148,7 +148,10 @@ describe("媒体文件（C1）", () => {
 
       expect(await download()).toMatchObject({ claimed: 1, downloaded: 1 });
       const done = await row(msg.id);
-      expect(done.localFilePath).toBe(join(dir, `${msg.id}.png`));
+      // 文件名 = 消息 id + 每次下载一个随机后缀（两个副本同时下同一条时各写各的，#56）
+      expect(done.localFilePath).toMatch(
+        new RegExp(`^${join(dir, msg.id)}-[0-9a-f]{8}\\.png$`),
+      );
       expect(done.mediaFetchedAt).toEqual(clock.now());
       expect(done.mediaNextAttemptAt).toBeNull();
       expect(await readFile(done.localFilePath!)).toEqual(PNG);
@@ -249,6 +252,57 @@ describe("媒体文件（C1）", () => {
       mediaNextAttemptAt: null,
     });
     expect((await row(bad.id)).mediaError).toContain(MEDIA_ERRORS.writeFailed);
+  });
+
+  it("超过大小上限（MEDIA_MAX_BYTES）：不下载、不写盘，放弃记 MEDIA_TOO_LARGE", async () => {
+    const msg = await pushMedia();
+    const r = await downloadDueMedia({
+      clock,
+      gateway: client,
+      store,
+      log: silent,
+      maxBytes: PNG.length - 1,
+    });
+    expect(r).toMatchObject({ claimed: 1, abandoned: 1, downloaded: 0 });
+    expect(await row(msg.id)).toMatchObject({
+      localFilePath: null,
+      mediaNextAttemptAt: null,
+      mediaError: MEDIA_ERRORS.tooLarge,
+    });
+    expect(await store.list()).toEqual([]);
+  });
+
+  it("同一条消息每次下载都用新文件名：两个副本（租约过期后重领）同时下时各写各的，记账输的一方删自己那份不会删到赢家的", async () => {
+    const msg = await pushMedia();
+    const names: string[] = [];
+    const recording: MediaStore = {
+      ...store,
+      async write(name, bytes) {
+        names.push(name);
+        return store.write(name, bytes);
+      },
+    };
+    await downloadDueMedia({
+      clock,
+      gateway: client,
+      store: recording,
+      log: silent,
+    });
+    const first = (await row(msg.id)).localFilePath!;
+    // 模拟另一个副本对同一条再下一次（它读到的是记账前的状态）
+    await getDb().message.update({
+      where: { id: msg.id },
+      data: { localFilePath: null, mediaNextAttemptAt: clock.now() },
+    });
+    await downloadDueMedia({
+      clock,
+      gateway: client,
+      store: recording,
+      log: silent,
+    });
+    expect(names).toHaveLength(2);
+    expect(names[0]).not.toBe(names[1]);
+    expect(await readFile(first)).toEqual(PNG); // 第一份没被第二次覆盖 / 删除
   });
 
   describe("清理", () => {

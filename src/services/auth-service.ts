@@ -25,7 +25,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 
 import type { Clock } from "../core/clock.js";
 import { config } from "../core/config.js";
-import { Unauthorized } from "../core/errors.js";
+import { TooManyRequests, Unauthorized } from "../core/errors.js";
 import { type Principal, signAccessToken } from "../core/jwt.js";
 import { UNUSABLE_PASSWORD_HASH, verifyPassword } from "../core/password.js";
 import { getDb } from "../db/client.js";
@@ -36,6 +36,15 @@ export const REFRESH_COOKIE_NAME = "refresh_token";
 export const REFRESH_COOKIE_PATH = "/api/auth";
 /** refresh token 有效期（题目没规定；每次刷新换新一枚、期限重新起算）：7 天。 */
 export const REFRESH_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60;
+
+/**
+ * 登录失败节流（后端 #56）：同一用户名 LOGIN_WINDOW_MS 内失败 LOGIN_MAX_FAILURES 次 → 锁 LOGIN_LOCK_MS（429）。
+ * 按用户名而不是按 IP：站点在 CDN / 反代后面，拿到的 IP 不可信。锁得短：挡住暴力尝试，又不至于让人恶意把 admin
+ * 锁住很久。计数在库里（login_throttles），重启不清零、多副本共用。
+ */
+export const LOGIN_MAX_FAILURES = 5;
+export const LOGIN_WINDOW_MS = 10 * 60_000;
+export const LOGIN_LOCK_MS = 60_000;
 
 /**
  * cookie 属性（Set-Cookie 与清除都用同一组，否则浏览器认为是两个不同的 cookie 而清不掉）。
@@ -84,6 +93,13 @@ export async function login(
   password: string,
   deps: Deps = {},
 ): Promise<LoginResult> {
+  const at0 = now(deps);
+  const throttle = await getDb().loginThrottle.findUnique({
+    where: { username },
+  });
+  if (throttle?.lockedUntil && throttle.lockedUntil > at0) {
+    throw lockedError(throttle.lockedUntil, at0);
+  }
   const user = await getDb().user.findUnique({
     where: { username },
     select: { id: true, username: true, passwordHash: true, role: true },
@@ -94,8 +110,11 @@ export async function login(
     user?.passwordHash ?? UNUSABLE_PASSWORD_HASH,
   );
   if (!user || !valid) {
+    const lockedUntil = await recordLoginFailure(username, at0);
+    if (lockedUntil) throw lockedError(lockedUntil, at0);
     throw new Unauthorized("UNAUTHORIZED", "用户名或密码错误");
   }
+  await getDb().loginThrottle.deleteMany({ where: { username } });
   const at = now(deps);
   const token = newRefreshToken();
   const refreshExpiresAt = new Date(
@@ -305,4 +324,43 @@ export async function isSessionActive(sessionId: string): Promise<boolean> {
     select: { revokedAt: true },
   });
   return row !== null && row.revokedAt === null;
+}
+
+function lockedError(lockedUntil: Date, at: Date): TooManyRequests {
+  const retryAfterSeconds = Math.max(
+    1,
+    Math.ceil((lockedUntil.getTime() - at.getTime()) / 1000),
+  );
+  return new TooManyRequests(
+    "LOGIN_THROTTLED",
+    `登录失败次数过多，请 ${retryAfterSeconds} 秒后再试`,
+    { retryAfterSeconds },
+  );
+}
+
+/**
+ * 记一次失败（一条语句原子累加，窗口过期则从 1 重新计）；到上限就上锁并清零计数，返回锁到什么时候，否则 null。
+ * 手写 SQL 用数据库列名。
+ */
+async function recordLoginFailure(
+  username: string,
+  at: Date,
+): Promise<Date | null> {
+  const windowStart = new Date(at.getTime() - LOGIN_WINDOW_MS);
+  const rows = await getDb().$queryRaw<{ failures: number }[]>`
+    INSERT INTO login_throttles (username, failures, window_started_at, locked_until)
+    VALUES (${username}, 1, ${at}, NULL)
+    ON CONFLICT (username) DO UPDATE SET
+      failures = CASE WHEN login_throttles.window_started_at < ${windowStart}
+        THEN 1 ELSE login_throttles.failures + 1 END,
+      window_started_at = CASE WHEN login_throttles.window_started_at < ${windowStart}
+        THEN ${at} ELSE login_throttles.window_started_at END
+    RETURNING failures`;
+  if ((rows[0]?.failures ?? 0) < LOGIN_MAX_FAILURES) return null;
+  const lockedUntil = new Date(at.getTime() + LOGIN_LOCK_MS);
+  await getDb().loginThrottle.update({
+    where: { username },
+    data: { failures: 0, windowStartedAt: at, lockedUntil },
+  });
+  return lockedUntil;
 }

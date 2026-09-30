@@ -71,6 +71,10 @@ export type Config = {
   simControlsEnabled: boolean;
   /** 网关模拟器的状态文件（SIM_GATEWAY_STATE_FILE，#49）：设了则重启不丢状态；不设 = 纯内存 */
   simGatewayStateFile: string | undefined;
+  /** 允许跨域调用本服务的来源（CORS_ORIGINS，逗号分隔）；默认空 = 不开 CORS（控制台经同源反代访问，用不到） */
+  corsOrigins: string[];
+  /** C1：单个媒体文件的大小上限（MEDIA_MAX_BYTES，字节），默认 10 MB；超过的不下载，记 MEDIA_TOO_LARGE */
+  mediaMaxBytes: number;
 };
 
 function readMs(
@@ -159,4 +163,13 @@ export const config: Readonly<Config> = Object.freeze({
   ),
   simControlsEnabled: process.env.SIM_CONTROLS_ENABLED === "1",
   simGatewayStateFile: process.env.SIM_GATEWAY_STATE_FILE || undefined,
+  corsOrigins: (process.env.CORS_ORIGINS ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s !== ""),
+  mediaMaxBytes: readPositiveInt(
+    process.env.MEDIA_MAX_BYTES,
+    "MEDIA_MAX_BYTES",
+    10 * 1024 * 1024,
+  ),
 });

@@ -29,11 +29,13 @@ import {
 import { extname, join } from "node:path";
 
 import { type Clock, systemClock } from "../core/clock.js";
+import { config } from "../core/config.js";
 import type { Logger } from "../core/logger.js";
 import { getDb } from "../db/client.js";
 import {
   type GatewayClient,
   GatewayResponseError,
+  MediaTooLargeError,
   UntrustedMediaUrlError,
 } from "./gateway-client.js";
 
@@ -57,6 +59,7 @@ export const MEDIA_ERRORS = Object.freeze({
   unavailable: "MEDIA_UNAVAILABLE",
   untrusted: "MEDIA_URL_UNTRUSTED",
   writeFailed: "MEDIA_WRITE_FAILED",
+  tooLarge: "MEDIA_TOO_LARGE",
 });
 
 // ---- 存储 ------------------------------------------------------------------------------
@@ -120,6 +123,8 @@ export type MediaDeps = {
   clock?: Clock;
   log?: Pick<Logger, "info" | "warn" | "error">;
   store: MediaStore;
+  /** 单个文件大小上限（字节）；默认 config.mediaMaxBytes */
+  maxBytes?: number;
 };
 
 export type DownloadResult = {
@@ -158,7 +163,9 @@ function fileNameFor(
     byUrl = "";
   }
   const ext = byType ?? (/^\.[a-z0-9]{1,8}$/.test(byUrl) ? byUrl : "");
-  return `${messageId}${ext}`;
+  // 每次下载一个新文件名：两个副本（租约过期后重领）同时下同一条时各写各的文件，记账输的一方删自己那份，
+  // 不会删掉赢的一方记录指向的文件（后端 #56）
+  return `${messageId}-${randomBytes(4).toString("hex")}${ext}`;
 }
 
 function retryDelay(attempts: number): number {
@@ -215,8 +222,18 @@ async function downloadOne(
   const ctx = { messageId: row.id, mediaUrl: row.media_url };
   let file: { bytes: Buffer; contentType: string | null };
   try {
-    file = await deps.gateway.downloadMedia(row.media_url);
+    file = await deps.gateway.downloadMedia(row.media_url, {
+      maxBytes: deps.maxBytes ?? config.mediaMaxBytes,
+    });
   } catch (err) {
+    if (err instanceof MediaTooLargeError) {
+      await abandon(row.id, MEDIA_ERRORS.tooLarge);
+      deps.log?.warn(
+        { ...ctx, maxBytes: err.maxBytes },
+        "媒体文件超过大小上限，不下载",
+      );
+      return "abandoned";
+    }
     if (err instanceof UntrustedMediaUrlError) {
       await abandon(row.id, MEDIA_ERRORS.untrusted);
       deps.log?.warn({ ...ctx }, "mediaUrl 不是网关的地址，不下载");

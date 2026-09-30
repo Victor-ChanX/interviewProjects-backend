@@ -67,10 +67,12 @@ export type GatewayClient = {
   /**
    * GET <mediaUrl>（message 事件的 mediaUrl，指向网关的 /media/:id）→ 文件字节（C1）。只接受网关自己的地址：
    * 相对路径按 base url 解析，绝对地址必须与 base url 同源，否则抛 UntrustedMediaUrlError —— 不替事件里的任意
-   * URL 发请求。过期 / 不存在 → GatewayResponseError 404。
+   * URL 发请求。过期 / 不存在 → GatewayResponseError 404。opts.maxBytes：超过就停止读取、抛 MediaTooLargeError
+   * （按 Content-Length 先判，没有或不可信时边读边数），不把任意大的响应整个读进内存（后端 #56）。
    */
   downloadMedia(
     mediaUrl: string,
+    opts?: { maxBytes?: number },
   ): Promise<{ bytes: Buffer; contentType: string | null }>;
   /**
    * POST /groups/:groupId/kick { byAccountId, targetPlatformUserId } → 200 { kicked: true }（agent 的 kick_user，#12）。
@@ -158,6 +160,17 @@ export class GatewayUnreachableError extends Error {
 }
 
 /** mediaUrl 不是网关自己的地址：不下载。 */
+/** 媒体文件超过大小上限（下载已中止，没有读进内存） */
+export class MediaTooLargeError extends Error {
+  constructor(
+    readonly mediaUrl: string,
+    readonly maxBytes: number,
+  ) {
+    super(`媒体文件超过 ${maxBytes} 字节上限，不下载：${mediaUrl}`);
+    this.name = "MediaTooLargeError";
+  }
+}
+
 export class UntrustedMediaUrlError extends Error {
   constructor(mediaUrl: string) {
     super(`mediaUrl 不是网关的地址，不下载：${mediaUrl}`);
@@ -350,7 +363,7 @@ export function createGatewayClient(
         return typeof platformUserId === "string" ? [{ platformUserId }] : [];
       });
     },
-    async downloadMedia(mediaUrl) {
+    async downloadMedia(mediaUrl, opts) {
       let url: URL;
       try {
         url = new URL(mediaUrl, `${baseUrl}/`);
@@ -370,12 +383,34 @@ export function createGatewayClient(
         const body: unknown = await res.json().catch(() => null);
         throw new GatewayResponseError("GET", url.pathname, res.status, body);
       }
+      const maxBytes = opts?.maxBytes ?? Number.POSITIVE_INFINITY;
+      const declared = Number(res.headers.get("content-length"));
+      if (Number.isFinite(declared) && declared > maxBytes) {
+        await res.body?.cancel();
+        throw new MediaTooLargeError(mediaUrl, maxBytes);
+      }
       try {
+        const chunks: Uint8Array[] = [];
+        let total = 0;
+        if (res.body) {
+          const reader = (res.body as ReadableStream<Uint8Array>).getReader();
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            total += value.byteLength;
+            if (total > maxBytes) {
+              await reader.cancel().catch(() => undefined);
+              throw new MediaTooLargeError(mediaUrl, maxBytes);
+            }
+            chunks.push(value);
+          }
+        }
         return {
-          bytes: Buffer.from(await res.arrayBuffer()),
+          bytes: Buffer.concat(chunks),
           contentType: res.headers.get("content-type"),
         };
       } catch (err) {
+        if (err instanceof MediaTooLargeError) throw err;
         throw new GatewayUnreachableError("GET", url.pathname, err, {
           responded: true,
         });
@@ -548,7 +583,7 @@ export function gatewayClientFromConfig(): GatewayClient {
     joinGroup: (groupId, input) => resolve().joinGroup(groupId, input),
     promote: (groupId, input) => resolve().promote(groupId, input),
     listMembers: (groupId) => resolve().listMembers(groupId),
-    downloadMedia: (mediaUrl) => resolve().downloadMedia(mediaUrl),
+    downloadMedia: (mediaUrl, opts) => resolve().downloadMedia(mediaUrl, opts),
     kick: (groupId, input, opts) => resolve().kick(groupId, input, opts),
     leave: (groupId, input) => resolve().leave(groupId, input),
   };

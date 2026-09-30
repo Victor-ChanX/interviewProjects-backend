@@ -645,6 +645,17 @@ model Session {
   @@map("sessions")
 }
 
+/// 登录失败节流（后端 #56）：按用户名计数，窗口内失败次数到上限就锁一小段时间（429）。落库而不是进程内计数：
+/// 重启不清零、多副本共用一份。成功登录删掉该行；过了窗口且没锁着的行由保留期清理删掉。
+model LoginThrottle {
+  username        String    @id
+  failures        Int       @default(0)
+  windowStartedAt DateTime  @map("window_started_at") @db.Timestamptz
+  lockedUntil     DateTime? @map("locked_until") @db.Timestamptz
+
+  @@map("login_throttles")
+}
+
 // ---- WebSocket 事件日志（A4 / B4）------------------------------------------------
 
 /// 推给前端的每个事件先落库再推：seq 全局单调、连续，重连按 sinceSeq 补发。

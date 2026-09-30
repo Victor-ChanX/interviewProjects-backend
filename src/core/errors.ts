@@ -8,6 +8,8 @@
 
 export type ErrorCode =
   | "UNAUTHORIZED"
+  // 同一用户名短时间内登录失败太多次（429，后端 #56）：等 retryAfterSeconds 再试
+  | "LOGIN_THROTTLED"
   | "FORBIDDEN"
   | "VALIDATION_ERROR"
   | "INTERNAL"
@@ -119,6 +121,13 @@ export class NotFound extends DomainError {
 export class Conflict extends DomainError {
   constructor(code: ErrorCode, message: string, extra?: ErrorExtra) {
     super(409, code, message, extra);
+  }
+}
+
+/** 429：请求太频繁（登录节流）；extra 里带 retryAfterSeconds */
+export class TooManyRequests extends DomainError {
+  constructor(code: ErrorCode, message: string, extra?: ErrorExtra) {
+    super(429, code, message, extra);
   }
 }
 

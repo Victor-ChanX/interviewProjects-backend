@@ -20,7 +20,12 @@ import {
   UNUSABLE_PASSWORD_HASH,
   verifyPassword,
 } from "../src/core/password.js";
-import { closeDb } from "../src/db/client.js";
+import { closeDb, getDb } from "../src/db/client.js";
+import {
+  LOGIN_LOCK_MS,
+  LOGIN_MAX_FAILURES,
+  LOGIN_WINDOW_MS,
+} from "../src/services/auth-service.js";
 import { authHeaders, login, loginAs } from "./factories.js";
 import { truncateAll } from "./setup.js";
 
@@ -85,6 +90,68 @@ describe("auth", () => {
       expect(res.json()).toMatchObject({
         error: { code: "UNAUTHORIZED", message: "用户名或密码错误" },
       });
+    });
+
+    it(`节流：同一用户名连续失败 ${LOGIN_MAX_FAILURES} 次 → 429 LOGIN_THROTTLED（带 retryAfterSeconds），锁定期间对的密码也不行`, async () => {
+      await loginAs(app, "admin");
+      for (let i = 1; i < LOGIN_MAX_FAILURES; i += 1) {
+        const r = await login(app, { username: "admin", password: "wrong" });
+        expect(r.statusCode).toBe(401);
+      }
+      const locked = await login(app, { username: "admin", password: "wrong" });
+      expect(locked.statusCode).toBe(429);
+      expect(locked.json()).toMatchObject({
+        error: {
+          code: "LOGIN_THROTTLED",
+          retryAfterSeconds: LOGIN_LOCK_MS / 1000,
+        },
+      });
+      const right = await login(app, { username: "admin", password: "admin" });
+      expect(right.statusCode).toBe(429);
+      // 别的用户名不受影响
+      await loginAs(app, "viewer");
+    });
+
+    it("节流：锁过期后能登录，登录成功清掉计数；窗口外的旧失败不累计", async () => {
+      await loginAs(app, "admin");
+      await getDb().loginThrottle.create({
+        data: {
+          username: "admin",
+          failures: 0,
+          windowStartedAt: new Date(Date.now() - LOGIN_LOCK_MS - 1_000),
+          lockedUntil: new Date(Date.now() - 1_000),
+        },
+      });
+      const ok = await login(app, { username: "admin", password: "admin" });
+      expect(ok.statusCode).toBe(200);
+      expect(await getDb().loginThrottle.count()).toBe(0);
+
+      // 窗口外（很久以前）已有 LOGIN_MAX_FAILURES - 1 次失败：这次失败从 1 重新计，不上锁
+      await getDb().loginThrottle.create({
+        data: {
+          username: "admin",
+          failures: LOGIN_MAX_FAILURES - 1,
+          windowStartedAt: new Date(Date.now() - LOGIN_WINDOW_MS - 60_000),
+        },
+      });
+      const r = await login(app, { username: "admin", password: "wrong" });
+      expect(r.statusCode).toBe(401);
+      expect(
+        (
+          await getDb().loginThrottle.findUniqueOrThrow({
+            where: { username: "admin" },
+          })
+        ).failures,
+      ).toBe(1);
+    });
+
+    it("CORS：默认不放行任何跨域来源（控制台走同源反代）", async () => {
+      const res = await app.inject({
+        method: "GET",
+        url: "/api/health",
+        headers: { origin: "https://evil.test" },
+      });
+      expect(res.headers["access-control-allow-origin"]).toBeUndefined();
     });
 
     it("用户名不存在也跑一遍 scrypt：占位哈希格式合法、任何口令都验不过", async () => {
