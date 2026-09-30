@@ -1,7 +1,18 @@
 // 工作台概览（#22：GET /api/dashboard/summary）的 zod schema。控制台首页一眼看出平台在干什么、哪里需要处理。
-// 全是计数（整数），字段恒下发、不带 default；「今日」按业务时区自然日（src/core/business-day.ts），
+// 全是计数（整数），字段恒下发、不带 default；「今日」按查询参数 timeZone 的自然日（src/core/time-zone.ts，不传按 UTC），
 // 本次统计用的起点与时区随响应下发（dayStart / timeZone），前端展示「今日（自 … 起）」不用自己算。
 import { z } from "zod";
+
+import { isTimeZone } from "../core/time-zone.js";
+
+/** 「今日」按哪个时区算：控制台传浏览器时区；不传按 UTC */
+export const DashboardQuery = z.object({
+  timeZone: z
+    .string()
+    .refine(isTimeZone, "timeZone 不是合法的 IANA 时区名（如 Asia/Shanghai）")
+    .optional(),
+});
+export type DashboardQuery = z.infer<typeof DashboardQuery>;
 
 /** 账号六态各自的数量 + 合计（题目 A1） */
 export const DashboardAccounts = z
@@ -82,9 +93,9 @@ export const DashboardSummary = z
     sequenceRuns: DashboardSequenceRuns,
     jobs: DashboardJobs,
     inconsistencies: DashboardInconsistencies,
-    /** 「今日」的起点：业务时区当天 00:00 对应的 UTC 时刻 */
+    /** 「今日」的起点：timeZone 当天 00:00 对应的 UTC 时刻 */
     dayStart: z.iso.datetime(),
-    /** 业务时区（IANA 名，如 Asia/Shanghai） */
+    /** 本次「今日」用的时区（IANA 名，如 Asia/Shanghai；请求没传时为 UTC） */
     timeZone: z.string(),
     generatedAt: z.iso.datetime(),
   })

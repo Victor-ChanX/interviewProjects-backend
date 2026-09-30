@@ -1,14 +1,23 @@
-// 业务时区与「今日」口径（#22 工作台概览）。
+// 按时区求「今日」起点（工作台概览：后端 #22、#47）。
 //
-// 工作台的「今日入站 / 出站 / finished / failed」按运营所在地的自然日算，不按 UTC 日 ——
-// 按 UTC 算的话北京时间 00:00–08:00 的记录会被算进「昨天」，早班看到的数整整少了 8 小时。
-// 常量放 core：service 与测试从同一处取（测试造「今日边界」的数据要与被测代码同一口径，不在测试里复制一份）。
+// 工作台的「今日入站 / 出站 / finished / failed」按**查看者所在时区**的自然日算：控制台把浏览器时区作为
+// `timeZone` 查询参数传上来，不传按 UTC。写死某个业务时区的话，不在那个时区的人看到的「今日」和他的今天对不上。
 //
-// 只用标准库 Intl 求时区偏移，不引依赖；Asia/Shanghai 当前无夏令时，但实现不假定固定 +08:00，
-// 换成有夏令时的时区也按当天零点那一刻的偏移算（夏令时恰在零点切换的极端情况不处理）。
+// 只用标准库 Intl 求时区偏移，不引依赖；不假定固定偏移，有夏令时的时区也按当天零点那一刻的偏移算
+// （夏令时恰在零点切换的极端情况不处理）。
 
-/** 业务时区（IANA 名）：工作台「今日」的自然日边界按它算 */
-export const BUSINESS_TIME_ZONE = "Asia/Shanghai";
+/** 不传时区时的「今日」口径 */
+export const DEFAULT_TIME_ZONE = "UTC";
+
+/** 是不是运行时认得的时区名（IANA 名，如 Asia/Shanghai、America/New_York） */
+export function isTimeZone(timeZone: string): boolean {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /** instant 在 timeZone 里的挂钟时间，按 UTC 编码成毫秒（即 Date.UTC(当地年, 月, 日, 时, 分, 秒)） */
 function wallClockAsUtcMs(instant: Date, timeZone: string): number {
@@ -43,13 +52,10 @@ function offsetMs(instant: Date, timeZone: string): number {
 }
 
 /**
- * now 所在的业务自然日的起点（该时区当天 00:00 对应的 UTC 时刻）。
- * 「今日」= [startOfBusinessDay(now), now]；例：北京时间 07:00 的记录在 UTC 是前一天 23:00，仍算今日。
+ * now 在 timeZone 里所在自然日的起点（该时区当天 00:00 对应的 UTC 时刻）。
+ * 「今日」= [startOfDay(now, tz), now]；例：北京时间 07:00 的记录在 UTC 是前一天 23:00，按 Asia/Shanghai 仍算今日。
  */
-export function startOfBusinessDay(
-  now: Date,
-  timeZone: string = BUSINESS_TIME_ZONE,
-): Date {
+export function startOfDay(now: Date, timeZone: string): Date {
   const local = wallClockAsUtcMs(now, timeZone);
   const localMidnight =
     local - (((local % 86_400_000) + 86_400_000) % 86_400_000);

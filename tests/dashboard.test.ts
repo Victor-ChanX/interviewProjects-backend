@@ -1,6 +1,6 @@
 // issue #22：工作台概览 GET /api/dashboard/summary。
 // 真库（tests/setup.ts 的临时 schema），直接写库造各状态的数据，断言每组的精确计数。
-// 「今日」按业务时区（src/core/business-day.ts）：日期边界从「现在」推导（startOfBusinessDay），不写死年月；
+// 「今日」按请求的 timeZone（src/core/time-zone.ts）：日期边界从「现在」推导（startOfDay），不写死年月；
 // 时区判别用例直接调 service 并注入假时钟（北京时间 07:00 在 UTC 是前一天、00:30 在 UTC 仍是前一天的下午）。
 import { randomUUID } from "node:crypto";
 
@@ -8,10 +8,10 @@ import type { FastifyInstance } from "fastify";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { buildApp } from "../src/app.js";
-import {
-  BUSINESS_TIME_ZONE,
-  startOfBusinessDay,
-} from "../src/core/business-day.js";
+import { startOfDay } from "../src/core/time-zone.js";
+
+/** 主流程用的查看者时区：东八区的零点在 UTC 是前一天 16:00，能区分「按 UTC 日」与「按查看者日」 */
+const TZ = "Asia/Shanghai";
 import type { Clock } from "../src/core/clock.js";
 import { closeDb, getDb } from "../src/db/client.js";
 import type { Prisma } from "../src/db/generated/client.js";
@@ -99,11 +99,18 @@ describe("GET /api/dashboard/summary", () => {
     await closeDb();
   });
 
-  const summary = (headers: Record<string, string> = viewer) =>
-    app.inject({ method: "GET", url: "/api/dashboard/summary", headers });
+  const summary = (
+    headers: Record<string, string> = viewer,
+    query = `?timeZone=${encodeURIComponent(TZ)}`,
+  ) =>
+    app.inject({
+      method: "GET",
+      url: `/api/dashboard/summary${query}`,
+      headers,
+    });
 
   it("主流程：各状态各造几笔（含昨天的与不计入的状态），每组计数精确", async () => {
-    const dayStart = startOfBusinessDay(new Date());
+    const dayStart = startOfDay(new Date(), TZ);
     const today = new Date(dayStart.getTime() + MINUTE);
     const yesterday = new Date(dayStart.getTime() - MINUTE);
 
@@ -230,7 +237,7 @@ describe("GET /api/dashboard/summary", () => {
     expect(body.sequenceRuns).toEqual({ running: 1 });
     expect(body.jobs).toEqual({ running: 1, todayFailed: 1 });
     expect(body.inconsistencies).toEqual({ unresolved: 2 });
-    expect(body.timeZone).toBe(BUSINESS_TIME_ZONE);
+    expect(body.timeZone).toBe(TZ);
     expect(body.dayStart).toBe(dayStart.toISOString());
     expect(Date.parse(body.generatedAt)).toBeGreaterThanOrEqual(
       dayStart.getTime(),
@@ -286,9 +293,9 @@ describe("GET /api/dashboard/summary", () => {
     expect((await summary(viewer)).statusCode).toBe(200);
   });
 
-  describe("今日按业务时区自然日（假时钟）", () => {
-    it("业务时区 12:00：当天 07:00 与 00:30（UTC 都还是前一天）算今日，前一天 23:30 不算", async () => {
-      const dayStart = startOfBusinessDay(new Date());
+  describe("今日按查看者时区的自然日（假时钟）", () => {
+    it("东八区 12:00：当天 07:00 与 00:30（UTC 都还是前一天）算今日，前一天 23:30 不算", async () => {
+      const dayStart = startOfDay(new Date(), TZ);
       const clock = fixedClock(new Date(dayStart.getTime() + 12 * HOUR));
       const group = await makeGroup();
       const at0030 = new Date(dayStart.getTime() + 30 * MINUTE);
@@ -311,7 +318,7 @@ describe("GET /api/dashboard/summary", () => {
       await _makeJob("failed", at0700);
       await _makeJob("failed", prev2330);
 
-      const s = await getDashboardSummary({ clock });
+      const s = await getDashboardSummary({ clock, timeZone: TZ });
       expect(s.dayStart).toBe(dayStart.toISOString());
       expect(s.generatedAt).toBe(clock.now().toISOString());
       expect(s.messages.todayInbound).toBe(2);
@@ -319,8 +326,8 @@ describe("GET /api/dashboard/summary", () => {
       expect(s.jobs.todayFailed).toBe(1);
     });
 
-    it("业务时区 03:00（UTC 还是前一天）：前一天 23:30 不算今日，当天 00:30 算", async () => {
-      const dayStart = startOfBusinessDay(new Date());
+    it("东八区 03:00（UTC 还是前一天）：前一天 23:30 不算今日，当天 00:30 算", async () => {
+      const dayStart = startOfDay(new Date(), TZ);
       const clock = fixedClock(new Date(dayStart.getTime() + 3 * HOUR));
       const group = await makeGroup();
       await makeMessage({
@@ -332,18 +339,65 @@ describe("GET /api/dashboard/summary", () => {
         sentAt: new Date(dayStart.getTime() + 30 * MINUTE),
       });
 
-      const s = await getDashboardSummary({ clock });
+      const s = await getDashboardSummary({ clock, timeZone: TZ });
       expect(s.messages.todayInbound).toBe(1);
     });
 
-    it("startOfBusinessDay：结果是业务时区的 00:00（Asia/Shanghai 为 UTC+8），且不晚于 now、相差不足一天", () => {
+    it("startOfDay：结果是该时区的 00:00（Asia/Shanghai 为 UTC+8），且不晚于 now、相差不足一天", () => {
       const now = new Date();
-      const start = startOfBusinessDay(now);
+      const start = startOfDay(now, TZ);
       expect((start.getTime() + 8 * HOUR) % (24 * HOUR)).toBe(0);
       expect(start.getTime()).toBeLessThanOrEqual(now.getTime());
       expect(now.getTime() - start.getTime()).toBeLessThan(24 * HOUR);
       // 恰在零点：起点就是自己
-      expect(startOfBusinessDay(start).getTime()).toBe(start.getTime());
+      expect(startOfDay(start, TZ).getTime()).toBe(start.getTime());
+    });
+
+    it("同一时刻，时区不同「今日」就不同：东八区 03:00 的前一天 23:30 记录，按 UTC 算是今日", async () => {
+      const dayStart = startOfDay(new Date(), TZ);
+      const clock = fixedClock(new Date(dayStart.getTime() + 3 * HOUR));
+      const group = await makeGroup();
+      await makeMessage({
+        groupId: group.id,
+        sentAt: new Date(dayStart.getTime() - 30 * MINUTE),
+      });
+
+      const shanghai = await getDashboardSummary({ clock, timeZone: TZ });
+      const utc = await getDashboardSummary({ clock, timeZone: "UTC" });
+      expect(shanghai.messages.todayInbound).toBe(0);
+      expect(utc.messages.todayInbound).toBe(1);
+      expect(utc.dayStart).toBe(startOfDay(clock.now(), "UTC").toISOString());
+      expect(utc.timeZone).toBe("UTC");
+    });
+  });
+
+  describe("timeZone 参数", () => {
+    it("不传：按 UTC，响应回显 UTC", async () => {
+      const res = await summary(viewer, "");
+      expect(res.statusCode).toBe(200);
+      const body = res.json<DashboardSummary>();
+      expect(body.timeZone).toBe("UTC");
+      expect(new Date(body.dayStart).getUTCHours()).toBe(0);
+    });
+
+    it("有夏令时的时区：dayStart 是当地 00:00，响应回显该时区", async () => {
+      const res = await summary(viewer, "?timeZone=America%2FNew_York");
+      expect(res.statusCode).toBe(200);
+      const body = res.json<DashboardSummary>();
+      expect(body.timeZone).toBe("America/New_York");
+      const local = new Intl.DateTimeFormat("en-US", {
+        timeZone: "America/New_York",
+        hourCycle: "h23",
+        hour: "2-digit",
+        minute: "2-digit",
+      }).format(new Date(body.dayStart));
+      expect(local).toBe("00:00");
+    });
+
+    it("不是合法时区名：400 VALIDATION_ERROR", async () => {
+      const res = await summary(viewer, "?timeZone=Mars%2FOlympus");
+      expect(res.statusCode).toBe(400);
+      expect(res.json<ErrorBody>().error.code).toBe("VALIDATION_ERROR");
     });
   });
 });

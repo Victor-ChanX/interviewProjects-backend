@@ -4,8 +4,8 @@
 // 不会出现「账号合计按旧快照、分状态按新快照」这类对不上的数。每组是一条 count / groupBy（固定条数，无 N+1）。
 // 交互式事务里查询在同一条连接上串行执行，所以逐条 await，不 Promise.all。
 //
-// 「今日」= 业务时区（src/core/business-day.ts 的 BUSINESS_TIME_ZONE）的自然日：[startOfBusinessDay(now), …)。
-// 「现在」从可注入的 Clock 取（测试用假时钟造今日边界），dayStart 随响应下发。
+// 「今日」= 调用方给的时区（查看者的浏览器时区；不给按 UTC）的自然日：[startOfDay(now, timeZone), …)。
+// 「现在」从可注入的 Clock 取（测试用假时钟造今日边界），dayStart 与实际用的 timeZone 随响应下发。
 //
 // 各项口径（与 src/schemas/dashboard.ts 的注释一致）：
 // - messages.todayInbound / todayOutbound：sentAt（时间线排序键）落在今日；出站 = outbox 行（deliveryStatus 非空），
@@ -14,16 +14,17 @@
 // - inconsistencies.unresolved：resolvedAt 为 null。
 //
 // 数据范围：只有 admin / viewer 两种角色，登录用户都看全平台，没有归属键。
-import {
-  BUSINESS_TIME_ZONE,
-  startOfBusinessDay,
-} from "../core/business-day.js";
 import { type Clock, systemClock } from "../core/clock.js";
+import { DEFAULT_TIME_ZONE, startOfDay } from "../core/time-zone.js";
 import { getDb } from "../db/client.js";
 import { AccountStatus, GroupStatus } from "../db/generated/enums.js";
 import type { DashboardSummary } from "../schemas/dashboard.js";
 
-export type DashboardDeps = { clock?: Clock };
+export type DashboardDeps = {
+  clock?: Clock;
+  /** 「今日」按哪个时区的自然日（IANA 名，调用方已校验）；不给按 UTC */
+  timeZone?: string;
+};
 
 /** groupBy 的结果按 key 摊成计数表，没出现的状态记 0 */
 function tally<K extends string>(
@@ -45,7 +46,8 @@ export async function getDashboardSummary(
   deps: DashboardDeps = {},
 ): Promise<DashboardSummary> {
   const now = (deps.clock ?? systemClock).now();
-  const dayStart = startOfBusinessDay(now);
+  const timeZone = deps.timeZone ?? DEFAULT_TIME_ZONE;
+  const dayStart = startOfDay(now, timeZone);
   const today = { gte: dayStart };
 
   return getDb().$transaction(
@@ -138,7 +140,7 @@ export async function getDashboardSummary(
         jobs: { running: jobsRunning, todayFailed: jobsTodayFailed },
         inconsistencies: { unresolved },
         dayStart: dayStart.toISOString(),
-        timeZone: BUSINESS_TIME_ZONE,
+        timeZone,
         generatedAt: now.toISOString(),
       };
     },
