@@ -1,6 +1,8 @@
 node_modules
 dist/
 coverage/
+# 媒体文件（C1）下载目录（MEDIA_DIR 默认值）
+media/
 # prisma generate 的产物：npm install 的 postinstall / CI 的 db:generate 重新生成，不进 git
 src/db/generated/
 .env

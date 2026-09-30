@@ -85,6 +85,11 @@ services:
       LLM_AGENT_ADMIN_TOKEN: ${LLM_AGENT_ADMIN_TOKEN}
       # 站点没配 HTTPS 时设成 0，否则浏览器不保存 refresh cookie（刷新页面会掉登录）
       COOKIE_SECURE: ${COOKIE_SECURE:-1}
+      # 媒体文件（题目 C1）下载到 media-data 卷里：重新部署 / 换容器都还在
+      MEDIA_DIR: /data/media
+      MEDIA_RETENTION_DAYS: ${MEDIA_RETENTION_DAYS:-30}
+    volumes:
+      - media-data:/data
     expose:
       - "8000"
     depends_on:
@@ -104,3 +109,4 @@ services:
 volumes:
   pgdata:
   llm-data:
+  media-data:

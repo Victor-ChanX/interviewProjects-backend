@@ -18,6 +18,7 @@ export type DeliveryStatus = z.infer<typeof DeliveryStatus>;
  * - clientMsgId：出站幂等键；入站行为 null。
  * - deliveryStatus / failCode：仅出站行有值。
  * - sentAt：时间线排序键；出站行先是受理时刻，发出后改为网关的 sentAt。
+ * - mediaUrl / localFilePath（题目 C1）：网关给的附件地址；下载到本地后的路径（没下载 / 下载放弃 / 已过保留期被清理为 null）。
  */
 export const MessageRead = z
   .object({
@@ -29,6 +30,8 @@ export const MessageRead = z
     sentAt: z.iso.datetime(),
     deliveryStatus: DeliveryStatus.nullable(),
     failCode: z.string().nullable(),
+    mediaUrl: z.string().nullable(),
+    localFilePath: z.string().nullable(),
   })
   .meta({ id: "MessageRead" });
 export type MessageRead = z.infer<typeof MessageRead>;

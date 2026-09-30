@@ -65,6 +65,14 @@ export type GatewayClient = {
   /** GET /groups/:groupId/members → [{ platformUserId }]：网关视角的当前成员。 */
   listMembers(groupId: string): Promise<{ platformUserId: string }[]>;
   /**
+   * GET <mediaUrl>（message 事件的 mediaUrl，指向网关的 /media/:id）→ 文件字节（C1）。只接受网关自己的地址：
+   * 相对路径按 base url 解析，绝对地址必须与 base url 同源，否则抛 UntrustedMediaUrlError —— 不替事件里的任意
+   * URL 发请求。过期 / 不存在 → GatewayResponseError 404。
+   */
+  downloadMedia(
+    mediaUrl: string,
+  ): Promise<{ bytes: Buffer; contentType: string | null }>;
+  /**
    * POST /groups/:groupId/kick { byAccountId, targetPlatformUserId } → 200 { kicked: true }（agent 的 kick_user，#12）。
    * 目标在 200 返回前已从成员列表移除。同步错误按 GatewayResponseError 抛：409 OWNER_LEFT（群主已退群）/
    * 403 NO_PERMISSION（by 不是群主也没被 promote）/ 409 ACCOUNT_OFFLINE / 504 NETWORK_TIMEOUT（结果未知：
@@ -144,6 +152,14 @@ export class GatewayUnreachableError extends Error {
     super(`网关 ${method} ${path} 请求失败`, { cause });
     this.name = "GatewayUnreachableError";
     this.responded = opts.responded ?? false;
+  }
+}
+
+/** mediaUrl 不是网关自己的地址：不下载。 */
+export class UntrustedMediaUrlError extends Error {
+  constructor(mediaUrl: string) {
+    super(`mediaUrl 不是网关的地址，不下载：${mediaUrl}`);
+    this.name = "UntrustedMediaUrlError";
   }
 }
 
@@ -331,6 +347,37 @@ export function createGatewayClient(
         return typeof platformUserId === "string" ? [{ platformUserId }] : [];
       });
     },
+    async downloadMedia(mediaUrl) {
+      let url: URL;
+      try {
+        url = new URL(mediaUrl, `${baseUrl}/`);
+      } catch {
+        throw new UntrustedMediaUrlError(mediaUrl);
+      }
+      if (url.origin !== new URL(baseUrl).origin) {
+        throw new UntrustedMediaUrlError(mediaUrl);
+      }
+      let res: Response;
+      try {
+        res = await fetchImpl(url, { signal: AbortSignal.timeout(timeoutMs) });
+      } catch (err) {
+        throw new GatewayUnreachableError("GET", url.pathname, err);
+      }
+      if (!res.ok) {
+        const body: unknown = await res.json().catch(() => null);
+        throw new GatewayResponseError("GET", url.pathname, res.status, body);
+      }
+      try {
+        return {
+          bytes: Buffer.from(await res.arrayBuffer()),
+          contentType: res.headers.get("content-type"),
+        };
+      } catch (err) {
+        throw new GatewayUnreachableError("GET", url.pathname, err, {
+          responded: true,
+        });
+      }
+    },
     async kick(groupId, input) {
       await request(
         "POST",
@@ -497,6 +544,7 @@ export function gatewayClientFromConfig(): GatewayClient {
     joinGroup: (groupId, input) => resolve().joinGroup(groupId, input),
     promote: (groupId, input) => resolve().promote(groupId, input),
     listMembers: (groupId) => resolve().listMembers(groupId),
+    downloadMedia: (mediaUrl) => resolve().downloadMedia(mediaUrl),
     kick: (groupId, input) => resolve().kick(groupId, input),
     leave: (groupId, input) => resolve().leave(groupId, input),
   };

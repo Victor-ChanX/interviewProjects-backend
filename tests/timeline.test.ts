@@ -112,6 +112,8 @@ describe("GET /api/groups/:id/messages", () => {
       sentAt: own.sentAt.toISOString(),
       deliveryStatus: "queued",
       failCode: null,
+      mediaUrl: null,
+      localFilePath: null,
     });
     expect(body.items[2]).toEqual({
       msgId: "gw-1",
@@ -122,6 +124,8 @@ describe("GET /api/groups/:id/messages", () => {
       sentAt: older.sentAt.toISOString(),
       deliveryStatus: null,
       failCode: null,
+      mediaUrl: null,
+      localFilePath: null,
     });
     expect(body.items[0]).toMatchObject({
       deliveryStatus: "failed",

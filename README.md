@@ -98,6 +98,14 @@ npm run dev                     # 后端照常；控制台的模型设置经后�
 要各小 1–2 秒，让它在后端放弃之前自己回 502 / 500。模型慢（「测试连接」返回的 `latencyMs` 接近 `LLM_TIMEOUT_MS`）时两边一起调大，
 例如 `AGENT_TURN_TIMEOUT_MS=15000` + `LLM_TIMEOUT_MS=13000`；再慢就换更快的模型 —— run 另有 60 秒总预算，单轮太慢步数就不够用了。
 
+## 媒体文件（题目 C1）
+
+`message` 事件带 `mediaUrl` 时，后端的 media worker 把文件下载到 `MEDIA_DIR`（默认 `media/`），路径记在消息的
+`localFilePath`；只下载网关自己的地址，网关 404（已过期）即放弃。超过 `MEDIA_RETENTION_DAYS`（默认 30）天的文件每小时
+清理一次：先清记录、再删文件，所在群有运行中的 agent run 的跳过。部署时 `MEDIA_DIR` 放在持久卷上
+（`docker-compose.yml` 的 `media-data`），否则重新部署文件就没了；真丢了也不会留下指向不存在文件的记录，清理步骤会
+对账并重新下载。
+
 ## 测试
 
 全部跑真实 PostgreSQL：每个测试文件在 `DATABASE_URL` 所在库里建一个临时 schema、跑迁移链、结束后删掉；

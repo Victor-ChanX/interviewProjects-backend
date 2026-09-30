@@ -19,9 +19,11 @@ import {
   defaultAgentWorkerId,
   startAgentWorker,
 } from "./workers/agent-worker.js";
+import { localMediaStore } from "./services/media-service.js";
 import { startInboundRetryWorker } from "./workers/inbound-retry-worker.js";
 import { startInboundWorker } from "./workers/inbound-worker.js";
 import { defaultJobWorkerId, startJobWorker } from "./workers/job-worker.js";
+import { startMediaWorker } from "./workers/media-worker.js";
 import { defaultWorkerId, startOutboxWorker } from "./workers/outbox-worker.js";
 import { startRateLimitWorker } from "./workers/rate-limit-worker.js";
 import { startSequenceWorker } from "./workers/sequence-worker.js";
@@ -86,6 +88,16 @@ async function main(): Promise<void> {
     intervalMs: 200,
   });
 
+  // 媒体文件（C1）：下载排期在 messages.mediaNextAttemptAt，每秒看一眼；清理（保留期 MEDIA_RETENTION_DAYS）每小时一次
+  const mediaWorker = startMediaWorker({
+    clock: systemClock,
+    gateway,
+    store: localMediaStore(config.mediaDir),
+    retentionDays: config.mediaRetentionDays,
+    downloadIntervalMs: 1_000,
+    purgeIntervalMs: 60 * 60_000,
+  });
+
   // 定时序列（#15）：排期在 sequence_run_steps.scheduledAt（以秒计），这里每秒看一眼；启动时刻即「重启时刻」，
   // 停机期间过期的当前步只重排那一步（sequence-service.rescheduleStaleStep）
   const sequenceWorker = startSequenceWorker({
@@ -100,6 +112,7 @@ async function main(): Promise<void> {
       rateLimitWorker.stop(),
       inboundWorker.stop(),
       inboundRetryWorker.stop(),
+      mediaWorker.stop(),
       wsBroadcastWorker.stop(),
       jobWorker.stop(),
       agentWorker.stop(),

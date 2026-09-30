@@ -20,7 +20,7 @@ refresh cookie 也落在前端域名下。后端域名同时可以直接调接�
 
 | 服务 | 作用 | 对外 |
 | --- | --- | --- |
-| `backend` | API + 全部 worker；启动时前滚迁移、跑幂等种子 | **配域名，端口 8000** |
+| `backend` | API + 全部 worker；启动时前滚迁移、跑幂等种子；媒体文件（C1）存 `media-data` 卷 | **配域名，端口 8000** |
 | `postgres` | 数据库（`postgres:17-alpine`），数据在 `pgdata` 卷 | 只在内网 |
 | `gateway-sim` | 消息网关模拟器（状态在内存） | 只在内网 |
 | `agent-sim` | Agent 服务模拟器，默认的 `AGENT_URL` | 只在内网 |
@@ -86,6 +86,18 @@ AG=http://agent-sim:8200
 3. Deploy。新库由后端启动时的迁移和种子重建；模拟器随容器重启清空。前端不用动。
 
 `llm-data`（模型配置）不用删，除非想清掉 API Key。
+`media-data`（媒体文件，题目 C1）随 `pgdata` 一起删；只删了它、库还在也没关系 —— 后端的清理步骤会发现记录指向的文件
+不在了，清掉路径并重新下载（网关那边已过期的记 `MEDIA_EXPIRED`）。
+
+## 用完后彻底清理
+
+数据全在三个命名卷里（`pgdata` 数据库、`llm-data` 模型配置与 API Key、`media-data` 媒体文件），容器和镜像之外不落任何东西：
+
+1. Dokploy：删除后端这个 Compose 应用时勾选删除卷（Delete volumes）；前端的 Application 直接删除（它没有数据）。
+   或在服务器上进到应用目录执行 `docker compose down -v --rmi local`（`-v` 删卷，`--rmi local` 删本地构建的镜像）。
+2. 确认没有残留：`docker volume ls | grep <项目名>` 为空。
+3. 域名解析与 Dokploy 里配的域名一并删掉；控制台「模型设置」里填过的 API Key 随 `llm-data` 卷一起没了，
+   如仍担心可在服务商后台吊销那把 Key。
 
 ## 本机用 Docker 跑
 

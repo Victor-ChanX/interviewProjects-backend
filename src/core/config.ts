@@ -60,6 +60,10 @@ export type Config = {
    * 本服务还在重试，答案到了也被丢弃。留 1–2 秒给本服务自身与网络。
    */
   llmTimeoutMs: number;
+  /** C1：媒体文件下载到的目录（相对启动目录），默认 media；消息的 localFilePath 以它开头 */
+  mediaDir: string;
+  /** C1：媒体文件保留天数（MEDIA_RETENTION_DAYS，正整数），默认 30；超过的由 media-worker 删除 */
+  mediaRetentionDays: number;
 };
 
 function readMs(
@@ -91,6 +95,19 @@ export function parseAgentTurnTimeout(raw: string | undefined): number {
     throw new Error(
       `AGENT_TURN_TIMEOUT_MS 必须在 ${AGENT_TURN_TIMEOUT_RANGE_MS.min}–${AGENT_TURN_TIMEOUT_RANGE_MS.max} 之间（题目 A5：每轮 10–15 秒）：${raw}`,
     );
+  }
+  return n;
+}
+
+function readPositiveInt(
+  raw: string | undefined,
+  name: string,
+  fallback: number,
+): number {
+  if (raw === undefined || raw === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n <= 0) {
+    throw new Error(`${name} 必须是正整数：${raw}`);
   }
   return n;
 }
@@ -127,4 +144,10 @@ export const config: Readonly<Config> = Object.freeze({
   llmAgentAdminToken: process.env.LLM_AGENT_ADMIN_TOKEN || undefined,
   llmAgentConfigFile: process.env.LLM_AGENT_CONFIG_FILE || ".llm-agent.json",
   llmTimeoutMs: readMs(process.env.LLM_TIMEOUT_MS, "LLM_TIMEOUT_MS", 10_000),
+  mediaDir: process.env.MEDIA_DIR || "media",
+  mediaRetentionDays: readPositiveInt(
+    process.env.MEDIA_RETENTION_DAYS,
+    "MEDIA_RETENTION_DAYS",
+    30,
+  ),
 });

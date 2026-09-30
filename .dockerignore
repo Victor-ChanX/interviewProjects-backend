@@ -3,6 +3,7 @@
 node_modules
 dist
 coverage
+media
 .git
 .github
 # 生成物（给 agent 与 CI 读的索引 / 快照），运行时不用

@@ -158,6 +158,17 @@ model Message {
   isOwn                Boolean         @default(false) @map("is_own")
   text                 String
   mediaUrl             String?         @map("media_url")
+  /// C1：mediaUrl 的文件下载到本地后的路径（MEDIA_DIR 下，如 media/<id>.png）；没下载 / 下载放弃 / 已过保留期被清理时为 null
+  localFilePath        String?         @map("local_file_path")
+  /// 下一次尝试下载的时刻，media-worker 按它领取；null = 不需要下载（没有 mediaUrl / 已下载 / 已放弃 / 已清理）
+  mediaNextAttemptAt   DateTime?       @map("media_next_attempt_at") @db.Timestamptz
+  mediaAttempts        Int             @default(0) @map("media_attempts")
+  /// 放弃下载的原因：MEDIA_EXPIRED（网关 404，已过期）/ MEDIA_UNAVAILABLE（重试耗尽）/ MEDIA_URL_UNTRUSTED（不是网关的地址）
+  mediaError           String?         @map("media_error")
+  /// 下载完成的时刻；保留期从这里算
+  mediaFetchedAt       DateTime?       @map("media_fetched_at") @db.Timestamptz
+  /// 超过保留期、文件已删的时刻（localFilePath 同一事务里置空）
+  mediaPurgedAt        DateTime?       @map("media_purged_at") @db.Timestamptz
   /// 时间线排序键。出站行先用受理时刻，message_sent 后改为网关的 sentAt
   sentAt               DateTime        @map("sent_at") @db.Timestamptz
   /// 仅出站行有值
@@ -196,6 +207,8 @@ model Message {
   @@index([deliveryStatus, nextAttemptAt])
   /// 账号进终态时把它排队中的消息置 cancelled
   @@index([accountId, deliveryStatus])
+  @@index([mediaNextAttemptAt])
+  @@index([mediaFetchedAt])
   @@map("messages")
 }
 

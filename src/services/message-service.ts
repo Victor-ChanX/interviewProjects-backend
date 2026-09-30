@@ -46,6 +46,8 @@ export function toMessageRead(row: Message): MessageRead {
     sentAt: row.sentAt.toISOString(),
     deliveryStatus: row.deliveryStatus,
     failCode: row.failCode,
+    mediaUrl: row.mediaUrl,
+    localFilePath: row.localFilePath,
   };
 }
 

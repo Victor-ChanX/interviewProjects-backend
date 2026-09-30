@@ -519,6 +519,11 @@ async function handleMessage(
     select: { id: true },
   });
   const isOwn = account !== null;
+  // C1：带 mediaUrl 的消息排上下载（media-worker 按 mediaNextAttemptAt 领取，不在这个事务里下载）
+  const mediaSchedule =
+    data.mediaUrl !== undefined
+      ? { mediaUrl: data.mediaUrl, mediaNextAttemptAt: ctx.clock.now() }
+      : {};
 
   let created: boolean;
   if (isOwn) {
@@ -530,11 +535,7 @@ async function handleMessage(
     if (existing) {
       await tx.message.update({
         where: { id: existing.id },
-        data: {
-          isOwn: true,
-          text: data.text,
-          ...(data.mediaUrl !== undefined ? { mediaUrl: data.mediaUrl } : {}),
-        },
+        data: { isOwn: true, text: data.text, ...mediaSchedule },
       });
       created = false;
     } else {
@@ -546,7 +547,7 @@ async function handleMessage(
           senderPlatformUserId: data.senderPlatformUserId,
           isOwn: true,
           text: data.text,
-          mediaUrl: data.mediaUrl ?? null,
+          ...mediaSchedule,
           sentAt: data.sentAt,
         },
         skipDuplicates: true,
@@ -562,7 +563,7 @@ async function handleMessage(
         senderPlatformUserId: data.senderPlatformUserId,
         isOwn: false,
         text: data.text,
-        mediaUrl: data.mediaUrl ?? null,
+        ...mediaSchedule,
         sentAt: data.sentAt,
       },
       skipDuplicates: true,
