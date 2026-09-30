@@ -11,6 +11,7 @@ import { type Clock, systemClock } from "../../core/clock.js";
 import { registerAdminRoutes } from "./admin.js";
 import { GatewayError } from "./errors.js";
 import { disconnectStreams } from "./events.js";
+import { attachStateFile } from "./persistence.js";
 import { registerGatewayRoutes } from "./routes.js";
 import { createContext, createRng, cryptoUnit } from "./state.js";
 
@@ -23,6 +24,11 @@ export type BuildGatewayAppOptions = {
   random?: () => number;
   /** mediaUrl 的前缀，例如 http://localhost:8100；不给则 mediaUrl 是相对路径 /media/:id */
   publicUrl?: string;
+  /**
+   * 状态文件（#49）：给了就启动时恢复、之后按间隔落盘、关闭时再写一次 —— 重启 / 重新部署不丢账号、群与事件历史。
+   * 不给 = 纯内存（测试与本地默认）。见 persistence.ts。
+   */
+  stateFile?: string;
 };
 
 export async function buildGatewayApp(
@@ -93,9 +99,15 @@ export async function buildGatewayApp(
   registerGatewayRoutes(app, ctx);
   registerAdminRoutes(app, ctx);
 
+  const persister = opts.stateFile
+    ? attachStateFile(ctx, opts.stateFile)
+    : null;
+
   app.addHook("onClose", async () => {
     ctx.timers.clearAll();
     disconnectStreams(ctx);
+    persister?.stop();
+    persister?.flush();
   });
 
   return app;

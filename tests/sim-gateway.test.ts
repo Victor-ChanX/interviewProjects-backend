@@ -1,6 +1,10 @@
 // 消息网关模拟器（src/sim/gateway）自带用例：逐条对照题目 2.1 的接口与时序契约。
 // 时间：vi.useFakeTimers 只假 setTimeout / Date（Fastify inject 不依赖它们），延时全部用 advanceTimersByTimeAsync 推进，
 // 不真 sleep。SSE 一节要真 socket（reply.raw 写流），用 listen(0) + fetch，真定时器，场景延时设为 0 / 很小。
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import type { FastifyInstance } from "fastify";
 import {
   afterAll,
@@ -1139,5 +1143,84 @@ describe("网关模拟器：SSE 事件流（真 socket）", () => {
       sentAt: original?.data.sentAt,
       text: "old",
     });
+  });
+});
+
+describe("网关模拟器：状态落盘（#49，重启 / 重新部署不丢）", () => {
+  let dir: string;
+  let file: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "gw-state-"));
+    file = join(dir, "gateway-sim.json");
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("关掉再起：账号在线状态、群与成员、消息、事件历史都在，eventId 接着往上走", async () => {
+    const first = await buildGatewayApp({ logger: false, stateFile: file });
+    const { body: connected } = await call(
+      first,
+      "POST",
+      "/accounts/acc-1/connect",
+    );
+    const { body: created } = await call(first, "POST", "/groups", {
+      creatorAccountId: "acc-1",
+    });
+    const groupId = created.groupId as string;
+    const { body: pushed } = await call(first, "POST", "/_sim/push", {
+      kind: "message",
+      groupId,
+      senderPlatformUserId: "ext-alice",
+      text: "重启前",
+    });
+    const before = (pushed.eventIds as number[]).at(-1)!;
+    await first.close();
+
+    const second = await buildGatewayApp({ logger: false, stateFile: file });
+    const { body: state } = await call(second, "GET", "/_sim/state");
+    expect(state.accounts).toEqual([
+      expect.objectContaining({
+        accountId: "acc-1",
+        platformUserId: connected.platformUserId,
+        online: true,
+      }),
+    ]);
+    expect(state.groups).toEqual([
+      expect.objectContaining({
+        groupId,
+        members: [{ platformUserId: connected.platformUserId, isAdmin: true }],
+      }),
+    ]);
+    expect(state.messages).toEqual([
+      expect.objectContaining({ groupId, text: "重启前" }),
+    ]);
+    expect((state as unknown as State).events.lastEventId).toBe(before);
+
+    const { status, body: again } = await call(second, "POST", "/_sim/push", {
+      kind: "message",
+      groupId,
+      senderPlatformUserId: "ext-alice",
+      text: "重启后",
+    });
+    expect(status).toBe(200);
+    expect((again.eventIds as number[])[0]).toBeGreaterThan(before);
+    await second.close();
+  });
+
+  it("不给 stateFile：纯内存，不写任何文件", async () => {
+    const app = await buildGatewayApp({ logger: false });
+    await call(app, "POST", "/accounts/acc-1/connect");
+    await app.close();
+    expect(existsSync(file)).toBe(false);
+  });
+
+  it("状态文件格式不认识：启动直接失败（不带着对不上的状态继续跑）", async () => {
+    writeFileSync(file, JSON.stringify({ version: 999 }));
+    await expect(
+      buildGatewayApp({ logger: false, stateFile: file }),
+    ).rejects.toThrow(/状态文件版本 999/);
   });
 });

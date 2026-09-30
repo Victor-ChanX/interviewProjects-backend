@@ -21,7 +21,7 @@ refresh cookie 也落在前端域名下。后端域名同时可以直接调接�
 | 服务 | 作用 | 对外 |
 | --- | --- | --- |
 | `backend` | API + 全部 worker；启动时前滚迁移、跑幂等种子；媒体文件（C1）存 `media-data` 卷 | **配域名，端口 8000** |
-| `gateway-sim` | 消息网关模拟器（状态在内存） | 只在内网 |
+| `gateway-sim` | 消息网关模拟器，状态（账号、群、消息、事件历史）落盘在 `gateway-data` 卷，重新部署不丢 | 只在内网 |
 | `agent-sim` | Agent 服务模拟器，默认的 `AGENT_URL` | 只在内网 |
 | `llm-agent` | 真实 LLM 版 Agent，模型配置存 `llm-data` 卷 | 只在内网 |
 
@@ -96,12 +96,14 @@ AG=http://agent-sim:8200
 
 ## 重置数据
 
-网关模拟器的状态在内存里，而后端把见过的事件编号记在库里，所以**两边要一起清**（原因见手册 0.2）：
+网关模拟器的状态（在 `gateway-data` 卷里）和后端的库是配对的：后端记着模拟器上哪些账号连着、有哪些群、见过的最大事件编号，
+所以**两边要一起清**，只清一边就对不上（旧群发不了消息、新事件被当成重复丢掉，原因见手册 0.2）。平时重新部署不用清 —— 两边都落盘了。
 
-1. Dokploy 里 Stop 后端这个 Compose 应用。
-2. 清空数据库：删掉 Dokploy 里那个 PostgreSQL 服务再按第 0 步建一个新的（`DATABASE_URL` 换成新的），
-   或在它的终端里 `psql -U postgres -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;'`（URL 不变）。
-3. Deploy 后端。新库由后端启动时的迁移和种子重建；模拟器随容器重启清空。前端不用动。
+1. 清空网关模拟器：在 Dokploy 里打开 `backend` 容器的终端，`curl -s -X POST http://gateway-sim:8100/_sim/reset`
+   （清空内存，半秒内写回状态文件）。
+2. 清空数据库：在 Dokploy 数据库的终端里 `psql -U postgres -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;'`
+   （URL 不变）；或删掉那个 PostgreSQL 服务按第 0 步重建（`DATABASE_URL` 换成新的）。
+3. Deploy 后端。新库由后端启动时的迁移和种子重建。前端不用动。
 
 `llm-data`（模型配置）不用删，除非想清掉 API Key。
 `media-data`（媒体文件，题目 C1）随数据库一起删；只删了它、库还在也没关系 —— 后端的清理步骤会发现记录指向的文件
@@ -109,7 +111,8 @@ AG=http://agent-sim:8200
 
 ## 用完后彻底清理
 
-数据在 Dokploy 的 PostgreSQL 服务和后端的两个命名卷里（`llm-data` 模型配置与 API Key、`media-data` 媒体文件），
+数据在 Dokploy 的 PostgreSQL 服务和后端的三个命名卷里（`gateway-data` 网关模拟器状态、`llm-data` 模型配置与 API Key、
+`media-data` 媒体文件），
 容器和镜像之外不落任何东西：
 
 1. Dokploy：删除后端这个 Compose 应用时勾选删除卷（Delete volumes）；删除第 0 步建的 PostgreSQL 服务（连同它的卷）；

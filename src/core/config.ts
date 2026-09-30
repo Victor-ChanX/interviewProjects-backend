@@ -69,6 +69,8 @@ export type Config = {
    * 只在 GATEWAY_URL 指向模拟器时打开 —— 真网关没有 /_sim/*。
    */
   simControlsEnabled: boolean;
+  /** 网关模拟器的状态文件（SIM_GATEWAY_STATE_FILE，#49）：设了则重启不丢状态；不设 = 纯内存 */
+  simGatewayStateFile: string | undefined;
 };
 
 function readMs(
@@ -156,4 +158,5 @@ export const config: Readonly<Config> = Object.freeze({
     30,
   ),
   simControlsEnabled: process.env.SIM_CONTROLS_ENABLED === "1",
+  simGatewayStateFile: process.env.SIM_GATEWAY_STATE_FILE || undefined,
 });

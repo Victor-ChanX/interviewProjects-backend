@@ -6,9 +6,11 @@ import { buildGatewayApp } from "./app.js";
 
 async function main(): Promise<void> {
   const port = config.simGatewayPort;
+  const stateFile = config.simGatewayStateFile;
   const app = await buildGatewayApp({
     logger: true,
     publicUrl: `http://localhost:${port}`,
+    stateFile,
   });
 
   const shutdown = async (signal: string): Promise<void> => {
@@ -20,7 +22,12 @@ async function main(): Promise<void> {
   process.once("SIGINT", () => void shutdown("SIGINT"));
 
   await app.listen({ port, host: "0.0.0.0" });
-  logger.info({ port }, "网关模拟器已启动（场景端点 /_sim/*，事件流 /events）");
+  logger.info(
+    { port, stateFile: stateFile ?? null },
+    stateFile
+      ? "网关模拟器已启动（状态落盘，重启不丢；场景端点 /_sim/*，事件流 /events）"
+      : "网关模拟器已启动（纯内存；场景端点 /_sim/*，事件流 /events）",
+  );
 }
 
 main().catch((err: unknown) => {

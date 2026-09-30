@@ -32,13 +32,17 @@ services:
       timeout: 3s
       retries: 20
 
-  # 消息网关模拟器（题目 2.1）：状态在内存里，重启即清空（与数据库要一起重置，见 docs/deploy.md）
+  # 消息网关模拟器（题目 2.1）：状态（账号、群、消息、事件历史）落盘在 gateway-data 卷里，重新部署不丢；
+  # 要清空时与数据库一起重置，见 docs/deploy.md「重置数据」
   gateway-sim:
     <<: *server
     command: ["node", "dist/sim/gateway/main.js"]
     environment:
       <<: *server-env
       SIM_GATEWAY_PORT: "8100"
+      SIM_GATEWAY_STATE_FILE: /data/gateway-sim.json
+    volumes:
+      - gateway-data:/data
     expose:
       - "8100"
     healthcheck:
@@ -117,5 +121,6 @@ services:
 
 volumes:
   pgdata:
+  gateway-data:
   llm-data:
   media-data:

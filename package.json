@@ -21,8 +21,8 @@
     "db:deploy": "prisma migrate deploy",
     "db:seed": "tsx prisma/seed.ts",
     "postinstall": "prisma generate",
-    "sim:gateway": "tsx src/sim/gateway/main.ts",
-    "sim:agent": "tsx src/sim/agent/main.ts",
+    "sim:gateway": "tsx --env-file-if-exists=.env src/sim/gateway/main.ts",
+    "sim:agent": "tsx --env-file-if-exists=.env src/sim/agent/main.ts",
     "llm-agent": "tsx --env-file-if-exists=.env src/llm-agent/main.ts"
   },
   "dependencies": {

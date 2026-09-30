@@ -34,8 +34,9 @@ curl -s localhost:8000/api/health  # {"ok":true,"schemaVersion":"…"}
 （详见前端仓 README）。群详情右上角的「模拟外部发言」能以外部成员身份往群里推消息、触发 Agent（`.env.example` 里
 `SIM_CONTROLS_ENABLED=1` 已打开，见下文「演示：模拟外部成员发言」）。
 
-**重启了网关模拟器，就要连库一起重置**：模拟器的事件编号在内存里从 1 重新开始，而后端把见过的编号记在库里，
-新事件会被当成重复推送丢掉。做法见 [docs/manual-testing.md](docs/manual-testing.md)「0.2 每轮测试前重置」。
+**重启了网关模拟器，就要连库一起重置**：模拟器默认只在内存里记状态，事件编号从 1 重新开始，而后端把见过的编号记在库里，
+新事件会被当成重复推送丢掉。做法见 [docs/manual-testing.md](docs/manual-testing.md)「0.2 每轮测试前重置」；
+不想每次重置就在 .env 里给 `SIM_GATEWAY_STATE_FILE` 设一个文件名（例如 .gateway-sim.json），模拟器重启就不丢状态。
 
 ### 环境变量
 
@@ -55,6 +56,7 @@ curl -s localhost:8000/api/health  # {"ok":true,"schemaVersion":"…"}
 | `MEDIA_DIR` / `MEDIA_RETENTION_DAYS` | `media` / 30 | 媒体文件（题目 C1）的存放目录与保留天数 |
 | `LLM_AGENT_ADMIN_TOKEN` 等 | — | 真实 LLM 版 Agent 的配置，见下文「接入真实 LLM」 |
 | `SIM_GATEWAY_PORT` / `SIM_AGENT_PORT` | 8100 / 8200 | 两个模拟器的端口 |
+| `SIM_GATEWAY_STATE_FILE` | 不设（纯内存） | 网关模拟器的状态文件：设了则重启不丢账号、群与事件历史（Docker Compose 部署设在 `gateway-data` 卷） |
 
 ### 常见问题
 
