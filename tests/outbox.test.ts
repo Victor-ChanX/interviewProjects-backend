@@ -23,10 +23,12 @@ import type {
 import {
   enterTerminalInTx,
   recoverRateLimited,
+  transition,
 } from "../src/services/account-service.js";
 import {
   createGatewayClient,
   type GatewayClient,
+  GatewayUnreachableError,
 } from "../src/services/gateway-client.js";
 import {
   claimBatch,
@@ -784,6 +786,137 @@ describe("outbox（#7）", () => {
       expect((await row(messageId)).resendCount).toBe(1);
     });
 
+    it("504 后账号被标终态：确认没发出也不再重发，和其余排队的一样 cancelled ACCOUNT_TERMINAL", async () => {
+      const { group, creator } = await stageGroup();
+      await scenario({
+        send: { responses: [{ status: 504, landAfterMs: null }] },
+      });
+      const { messageId } = await enqueue(group, creator);
+      await tick();
+      expect((await row(messageId)).deliveryStatus).toBe("unknown");
+      // 级联只取消 queued；unknown 这条要等确认。确认没发出之后不能再从终态账号发出去
+      await transition(creator.id, {
+        to: "suspended",
+        expectedFrom: "online",
+        source: "operator",
+      });
+      clock.advance(CONFIRM_WINDOW_MS + 1);
+      await tick();
+      await tick();
+      expect(await row(messageId)).toMatchObject({
+        deliveryStatus: "cancelled",
+        failCode: "ACCOUNT_TERMINAL",
+        claimedBy: null,
+      });
+      expect((await simState()).sendCalls).toHaveLength(1);
+    });
+
+    it("send 的响应头已到、读响应体失败：请求已送达，按结果不明（unknown）确认，不直接重试", async () => {
+      const { group, creator } = await stageGroup();
+      const { clientMsgId, messageId } = await enqueue(group, creator);
+      const bodyLost: GatewayClient = {
+        ...gatewayClient,
+        async send(input) {
+          await gatewayClient.send(input); // 网关其实收下了
+          throw new GatewayUnreachableError(
+            "POST",
+            "/send",
+            new Error("reset"),
+            {
+              responded: true,
+            },
+          );
+        },
+      };
+      const s = await runOutboxTick({
+        clock,
+        gateway: bodyLost,
+        workerId: "w1",
+        log: silent,
+      });
+      expect(s.outcomes.unknown).toBe(1);
+      expect((await row(messageId)).deliveryStatus).toBe("unknown");
+      await sleepMs(20);
+      await tick(); // by-client-id 200 → sent，不重发
+      expect((await row(messageId)).deliveryStatus).toBe("sent");
+      expect(
+        (await simState()).sendCalls.filter(
+          (c) => c.clientMsgId === clientMsgId,
+        ),
+      ).toHaveLength(1);
+    });
+
+    it("网关客户端：2xx 的响应体读失败 / 不是 JSON → GatewayUnreachableError 且 responded = true", async () => {
+      const broken = new ReadableStream({
+        start(controller) {
+          controller.error(new Error("socket reset"));
+        },
+      });
+      for (const response of [
+        new Response(broken, { status: 202 }),
+        new Response("not json", { status: 202 }),
+      ]) {
+        const client = createGatewayClient({
+          baseUrl: "http://gateway.test",
+          fetch: async () => response,
+        });
+        const err: unknown = await client
+          .send({ groupId: "g", accountId: "a", clientMsgId: "c", text: "t" })
+          .catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(GatewayUnreachableError);
+        expect((err as GatewayUnreachableError).responded).toBe(true);
+      }
+    });
+
+    it("多副本：拿着旧快照的确认晚到（别的副本已重发过一次、这条又 unknown）不再放回 queued —— 总共只重发一次", async () => {
+      const { group, creator } = await stageGroup();
+      await scenario({
+        send: {
+          responses: [
+            { status: 504, landAfterMs: null },
+            { status: 504, landAfterMs: null },
+          ],
+        },
+      });
+      const { clientMsgId, messageId } = await enqueue(group, creator);
+      await tick("w1");
+      clock.advance(CONFIRM_WINDOW_MS + 1);
+      // w1 的确认查询在途时，w2 抢先确认 → 重发 → 又 504：这条回到 unknown，resendCount = 1
+      let interleaved = false;
+      const slow: GatewayClient = {
+        ...gatewayClient,
+        async getMessageByClientId(groupId, id) {
+          const landing = await gatewayClient.getMessageByClientId(groupId, id);
+          if (!interleaved) {
+            interleaved = true;
+            await tick("w2");
+          }
+          return landing;
+        },
+      };
+      await runConfirmTick({
+        clock,
+        gateway: slow,
+        workerId: "w1",
+        log: silent,
+      });
+      await runDispatchTick({
+        clock,
+        gateway: gatewayClient,
+        workerId: "w1",
+        log: silent,
+      });
+      expect(await row(messageId)).toMatchObject({
+        deliveryStatus: "unknown",
+        resendCount: 1,
+      });
+      expect(
+        (await simState()).sendCalls.filter(
+          (c) => c.clientMsgId === clientMsgId,
+        ),
+      ).toHaveLength(2);
+    });
+
     it("重发后仍 504 + 404 → failed NETWORK_TIMEOUT，总共只重发一次", async () => {
       const { group, creator } = await stageGroup();
       await scenario({
@@ -1164,6 +1297,25 @@ describe("outbox（#7）", () => {
   // ---- 领取顺序 / 回收 ---------------------------------------------------------------------
 
   describe("领取与回收", () => {
+    it("账号被操作员标离线后，还排着的消息不再发：failed ACCOUNT_OFFLINE（本地状态是真相，网关 disconnect 失败也一样）", async () => {
+      const { group, creator } = await stageGroup();
+      const { messageId } = await enqueue(group, creator);
+      // 不给 gateway：模拟网关侧 disconnect 没做成、网关仍认为它在线
+      await transition(creator.id, {
+        to: "disconnected",
+        expectedFrom: "online",
+        source: "operator",
+      });
+      const s = await tick();
+      expect(s.outcomes.failed).toBe(1);
+      expect(await row(messageId)).toMatchObject({
+        deliveryStatus: "failed",
+        failCode: "ACCOUNT_OFFLINE",
+        claimedBy: null,
+      });
+      expect((await simState()).sendCalls).toHaveLength(0);
+    });
+
     it("领取后被别的副本按过期回收（→ unknown）：原 worker 调网关前发现领取已丢，不发；确认未发出后只重发一次", async () => {
       const { group, creator } = await stageGroup();
       const { clientMsgId, messageId } = await enqueue(group, creator);

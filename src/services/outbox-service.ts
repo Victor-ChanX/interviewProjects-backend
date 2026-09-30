@@ -75,6 +75,8 @@ export const NETWORK_TIMEOUT_CODE = "NETWORK_TIMEOUT";
 export const CLAIM_LOST_CODE = "CLAIM_LOST";
 /** outbound_attempts.errorCode：调网关前发现这条已不是 queued（被级联取消等），没有发 */
 export const NOT_DISPATCHED_CODE = "NOT_DISPATCHED";
+/** 账号被本地标离线（idle / disconnected）时不再发，按网关同名错误码记 failed（A2 错误表） */
+export const ACCOUNT_OFFLINE_CODE = "ACCOUNT_OFFLINE";
 export const GATEWAY_UNAVAILABLE_FAIL_CODE = "GATEWAY_UNAVAILABLE";
 
 // ---- 类型 ------------------------------------------------------------------------------
@@ -686,6 +688,8 @@ function backoffAt(now: Date, attempts: number): Date {
 
 /** 连不上里的哪些是「可能已发出」：请求已经出去了才超时 / 被重置；ECONNREFUSED 这类肯定没出去。 */
 function isAmbiguousNetworkError(err: GatewayUnreachableError): boolean {
+  // 网关已经回了响应头（请求确定送达、可能已被处理），只是响应体没读完 / 不是 JSON
+  if (err.responded) return true;
   const cause = err.cause as { name?: unknown; code?: unknown } | undefined;
   const name = typeof cause?.name === "string" ? cause.name : "";
   const code = typeof cause?.code === "string" ? cause.code : "";
@@ -728,28 +732,66 @@ export async function dispatchOne(
     return "failed";
   }
 
-  // 调网关前续约并确认领取还在手上：领取之后这条可能已被别的副本按过期领取回收成 unknown（它会按 by-client-id
-  // 确认后重发），或被级联取消。领取时的快照不作数 —— 照发就是「一条记录对应两条消息」。
-  const renewed = await getDb().message.updateMany({
-    where: { id: msg.id, claimedBy: workerId, deliveryStatus: "queued" },
-    data: { lockedAt: (deps.clock ?? systemClock).now() },
-  });
-  if (renewed.count === 0) {
-    // 还挂着本 worker 的领取标记（行被级联取消）就释放它、给这次投递记录收尾；已被别的副本回收的，回收步骤收过尾了
-    await getDb().$transaction(async (tx) => {
+  // 调网关前的最后一道关（一个事务，先锁账号行再碰消息行，与级联同序）：
+  // 1. 续约并确认领取还在手上：领取之后这条可能已被别的副本按过期领取回收成 unknown（它会按 by-client-id 确认后
+  //    重发），或被级联取消。领取时的快照不作数 —— 照发就是「一条记录对应两条消息」。
+  // 2. 按账号**此刻**的状态放行：终态 → 和其余排队的一样 cancelled / ACCOUNT_TERMINAL（A1）；被操作员标离线
+  //    （idle / disconnected）→ failed ACCOUNT_OFFLINE，不发。504 后确认没发出、回 queued 重发的那条也走这里，
+  //    所以进终态 / 离线之后不会再从这个账号发出任何东西。
+  const gate = await getDb().$transaction(async (tx) => {
+    const now = (deps.clock ?? systemClock).now();
+    const account = await tx.$queryRaw<{ status: string }[]>`
+      SELECT status FROM accounts WHERE id = ${msg.accountId} FOR SHARE`;
+    const renewed = await tx.message.updateMany({
+      where: { id: msg.id, claimedBy: workerId, deliveryStatus: "queued" },
+      data: { lockedAt: now },
+    });
+    const releaseUndispatched = async (): Promise<void> => {
+      // 还挂着本 worker 的领取标记就释放它、给这次投递记录收尾；已被别的副本回收的，回收步骤收过尾了
       const released = await tx.message.updateMany({
         where: { id: msg.id, claimedBy: workerId },
         data: { claimedBy: null, lockedAt: null },
       });
       if (released.count > 0) {
-        await finishAttempt(tx, msg.id, (deps.clock ?? systemClock).now(), {
+        await finishAttempt(tx, msg.id, now, {
           httpStatus: null,
           errorCode: NOT_DISPATCHED_CODE,
         });
       }
-    });
-    log?.warn(ctx, "领取已不在本 worker 手上（被回收 / 被取消），不发");
-    return "lost";
+    };
+    if (renewed.count === 0) {
+      await releaseUndispatched();
+      return "lost" as const;
+    }
+    const status = account[0]?.status;
+    if (status === "suspended" || status === "session_expired") {
+      await cancelQueuedSends(tx, msg.accountId, now);
+      await releaseUndispatched();
+      return "cancelled" as const;
+    }
+    if (status === "idle" || status === "disconnected") {
+      await recordFailedInTx(
+        tx,
+        msg.id,
+        workerId,
+        ACCOUNT_OFFLINE_CODE,
+        { from: ["queued"] },
+        now,
+      );
+      return "failed" as const;
+    }
+    return "send" as const;
+  });
+  if (gate !== "send") {
+    log?.warn(
+      { ...ctx, gate },
+      gate === "lost"
+        ? "领取已不在本 worker 手上（被回收 / 被取消），不发"
+        : gate === "cancelled"
+          ? "账号已进终态，不发，随级联 cancelled"
+          : "账号已被标离线，不发，failed ACCOUNT_OFFLINE",
+    );
+    return gate;
   }
 
   try {
@@ -907,14 +949,16 @@ async function handleSendError(
     );
   }
 
-  // 编程错误 / 数据库错：不让行停在「已领未记」，退避后再试，错误原样进日志
-  log?.error({ ...ctx, err }, "派发出站消息时异常");
-  return backoffOrFail(
-    msg,
-    { httpStatus: null, errorCode: "INTERNAL", detail: String(err) },
-    ctx,
+  // 认不出的异常（客户端自身的 bug 等）：请求可能已经发出去了，按结果不明处理 —— 确认没发出才重发，
+  // 不能直接退避重试（那是「不经确认就重发」）
+  log?.error({ ...ctx, err }, "派发出站消息时异常，按结果不明处理");
+  await recordUnknown(
+    msg.id,
+    workerId,
+    { httpStatus: null, errorCode: NETWORK_TIMEOUT_CODE, detail: String(err) },
     deps,
   );
+  return "unknown";
 }
 
 async function backoffOrFail(
@@ -1017,8 +1061,15 @@ export async function resolveUnknown(
     }
     if (row.resendCount === 0) {
       const changed = await getDb().$transaction(async (tx) => {
+        // 条件带上读到的 resendCount / unknownSince：多副本下别的副本可能已经确认、重发过一次、这条又进了 unknown，
+        // 拿着旧快照的这一次不能再把它放回 queued（那是第三次发送）
         const n = await tx.message.updateMany({
-          where: { id: row.id, deliveryStatus: "unknown" },
+          where: {
+            id: row.id,
+            deliveryStatus: "unknown",
+            resendCount: 0,
+            unknownSince: row.unknownSince,
+          },
           data: {
             deliveryStatus: "queued",
             resendCount: 1,

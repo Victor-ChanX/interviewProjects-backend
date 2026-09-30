@@ -129,9 +129,21 @@ export class GatewayResponseError extends Error {
 
 /** 连不上 / 超时 / 响应不是 JSON：结果未知。 */
 export class GatewayUnreachableError extends Error {
-  constructor(method: string, path: string, cause: unknown) {
+  /**
+   * true = 网关已经回了响应头（请求确定送达、可能已被处理），失败的是读响应体 / 响应体不是 JSON。
+   * 对有副作用的请求（send）这就是「结果不明」，不能当成没发出去重试。
+   */
+  readonly responded: boolean;
+
+  constructor(
+    method: string,
+    path: string,
+    cause: unknown,
+    opts: { responded?: boolean } = {},
+  ) {
     super(`网关 ${method} ${path} 请求失败`, { cause });
     this.name = "GatewayUnreachableError";
+    this.responded = opts.responded ?? false;
   }
 }
 
@@ -173,12 +185,22 @@ export function createGatewayClient(
     } catch (err) {
       throw new GatewayUnreachableError(method, path, err);
     }
-    const text = await res.text();
+    let text: string;
+    try {
+      text = await res.text();
+    } catch (err) {
+      // 响应头已到、读响应体时断了 / 超时了：请求确定送达
+      throw new GatewayUnreachableError(method, path, err, { responded: true });
+    }
     let body: unknown;
     try {
       body = text.trim() === "" ? {} : (JSON.parse(text) as unknown);
     } catch (err) {
-      if (res.ok) throw new GatewayUnreachableError(method, path, err);
+      if (res.ok) {
+        throw new GatewayUnreachableError(method, path, err, {
+          responded: true,
+        });
+      }
       body = text;
     }
     if (!res.ok) throw new GatewayResponseError(method, path, res.status, body);
