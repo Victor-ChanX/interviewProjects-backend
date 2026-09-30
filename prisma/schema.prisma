@@ -663,6 +663,20 @@ model WsEvent {
   @@map("ws_events")
 }
 
+// ---- 调度器心跳（B1 重启重排）-----------------------------------------------------
+
+/// 定时序列调度器的心跳，单行（name = sequence）。任一实例每次 tick 刷新 beatAt；两次心跳之间的空档超过阈值 =
+/// 调度器确实停过，这段空档记成 (downFrom, downUntil)，到点时刻落在其中的步骤才是「停机期间过期」（只重排那一步）。
+/// 多副本滚动发布时总有实例在 tick，不会出现空档，新实例也就不会把刚到点的步骤误判为过期。
+model SchedulerHeartbeat {
+  name      String    @id
+  beatAt    DateTime  @map("beat_at") @db.Timestamptz
+  downFrom  DateTime? @map("down_from") @db.Timestamptz
+  downUntil DateTime? @map("down_until") @db.Timestamptz
+
+  @@map("scheduler_heartbeats")
+}
+
 // ---- 不一致记录（A2）------------------------------------------------------------
 
 /// 处理网关事件时写库失败等「事件不能丢、处理不能断」的情况：原文留在这里并推 inconsistency 事件给操作员。

@@ -27,9 +27,12 @@
 // - 群 unreachable → run stopped 由 group-service.markGroupUnreachable 做（同事务写 ws_events）；推进时发现群已不是
 //   active（例如 leave-all 后 left）→ run failed。
 //
-// 重启后只重排最早一个已过期的步骤（rescheduleStaleStep）：worker 实例启动时刻 workerStartedAt 之前就已到点、
-// 仍 pending 的当前步 = 停机期间过期的那一步，改为 now + 该步 delaySeconds；后续步骤仍按「前一步发出后」排，
-// 不会一次性全发。判定只看库里的 scheduledAt 与 workerStartedAt，重排后 scheduledAt > workerStartedAt，天然只做一次。
+// 重启后只重排最早一个已过期的步骤（rescheduleStaleStep）：到点时刻落在「调度器停机空档」里、仍 pending 的当前步
+// = 停机期间过期的那一步，改为 now + 该步 delaySeconds；后续步骤仍按「前一步发出后」排，不会一次性全发。
+// 停机空档来自库里的调度器心跳（recordSchedulerBeat，scheduler_heartbeats）：任一实例每次 tick 刷新心跳，两次心跳
+// 之间隔了超过 SCHEDULER_DOWNTIME_GAP_MS 才算停过，这段空档记为 (downFrom, downUntil)。不按单个实例的启动时刻判 ——
+// 多副本滚动发布时新实例刚启动就领到一个 0.3 秒前才到点的步骤，那不是停机，不能顺延整整 delaySeconds。
+// 重排后 scheduledAt > downUntil，同一步不会再被判为过期。
 //
 // 手写 SQL 用的是数据库列名（@map 的值）；`${}` 是绑定参数。
 import { randomUUID } from "node:crypto";
@@ -99,11 +102,14 @@ export type SequenceEnqueue = (
 export type SequenceAdvanceDeps = SequenceServiceDeps & {
   enqueue: SequenceEnqueue;
   /**
-   * 本 worker 实例的启动时刻：在它之前就已到点、仍 pending 的当前步视为「停机期间过期」，只重排这一步
-   * （rescheduleStaleStep）。不传 = 不做重启重排（直接调 advanceRun 的测试 / 脚本）。
+   * 最近一次调度器停机空档（recordSchedulerBeat 返回）：到点时刻落在其中、仍 pending 的当前步视为「停机期间过期」，
+   * 只重排这一步（rescheduleStaleStep）。不传 = 不做重启重排（直接调 advanceRun 的测试 / 脚本）。
    */
-  workerStartedAt?: Date;
+  downtime?: DowntimeWindow;
 };
+
+/** 调度器停机空档：(from, until)；from 为 null = 从头算（第一次启动，之前没有任何心跳） */
+export type DowntimeWindow = { from: Date | null; until: Date };
 
 export type ResolvedStep = {
   index: number;
@@ -451,20 +457,65 @@ function logAdvance(deps: SequenceAdvanceDeps, result: AdvanceResult): void {
   deps.log?.info(result, "序列运行已推进");
 }
 
+/** 两次调度器心跳之间隔了超过这么久 = 调度器停过（tick 间隔 1 秒，留足慢 tick 的余量） */
+export const SCHEDULER_DOWNTIME_GAP_MS = 10_000;
+const SEQUENCE_SCHEDULER = "sequence";
+
 /**
- * 「已过期」判定 + 重排，只在 worker 实例首次接手这一步时生效：步骤 pending、已排期、且排定时刻早于本 worker
- * 实例的启动时刻 —— 到点时没有任何进程活着，就是停机期间过期的那一步。改为 now + 该步 delaySeconds（重启时刻 +
- * delay），返回 true；后续步骤的 scheduledAt 仍为 null，等它发出后再按「前一步发出后 + delay」排。
- * 重排后 scheduledAt > workerStartedAt，同一步不会再被判为过期；本 worker 启动之后才排定的步（scheduledAt ≥
- * workerStartedAt）到点就发，不受影响。
+ * 每次 tick 开头调：刷新调度器心跳，返回最近一次停机空档。一个事务、锁心跳行，多副本串行：
+ * - 没有心跳行（第一次启动）：空档 = (−∞, workerStartedAt]，与「在本实例启动之前就到点的都算过期」一致；
+ * - 距上次心跳超过 gapMs：调度器停过，空档 = (上次心跳, now]；
+ * - 否则只刷新心跳，沿用记下的空档（它的效果已经在重排里用掉了：重排后的步骤都晚于它）。
+ */
+export async function recordSchedulerBeat(
+  now: Date,
+  opts: { workerStartedAt: Date; gapMs?: number },
+): Promise<DowntimeWindow> {
+  const gapMs = opts.gapMs ?? SCHEDULER_DOWNTIME_GAP_MS;
+  return getDb().$transaction(async (tx) => {
+    await tx.$executeRaw`
+      INSERT INTO scheduler_heartbeats (name, beat_at, down_from, down_until)
+      VALUES (${SEQUENCE_SCHEDULER}, ${now}, NULL, ${opts.workerStartedAt})
+      ON CONFLICT (name) DO NOTHING`;
+    const rows = await tx.$queryRaw<
+      { beat_at: Date; down_from: Date | null; down_until: Date | null }[]
+    >`SELECT beat_at, down_from, down_until FROM scheduler_heartbeats
+      WHERE name = ${SEQUENCE_SCHEDULER} FOR UPDATE`;
+    const row = rows[0]!;
+    let downFrom = row.down_from;
+    let downUntil = row.down_until;
+    if (now.getTime() - row.beat_at.getTime() > gapMs) {
+      downFrom = row.beat_at;
+      downUntil = now;
+    }
+    await tx.schedulerHeartbeat.update({
+      where: { name: SEQUENCE_SCHEDULER },
+      data: {
+        beatAt: now.getTime() > row.beat_at.getTime() ? now : row.beat_at,
+        downFrom,
+        downUntil,
+      },
+    });
+    return { from: downFrom, until: downUntil ?? opts.workerStartedAt };
+  });
+}
+
+/**
+ * 「已过期」判定 + 重排：步骤 pending、已排期、且到点时刻落在调度器停机空档 (from, until) 里 —— 到点时没有任何
+ * 实例在跑，就是停机期间过期的那一步。改为 now + 该步 delaySeconds（重启时刻 + delay），返回新的排期；后续步骤的
+ * scheduledAt 仍为 null，等它发出后再按「前一步发出后 + delay」排。重排后 scheduledAt > until，不会再被判为过期；
+ * 调度器活着期间到点的步（包括刚到点、正被另一个实例处理的）到点就发，不受影响。
  */
 export function rescheduleStaleStep(
   step: Pick<SequenceRunStep, "status" | "scheduledAt" | "delaySeconds">,
   now: Date,
-  workerStartedAt: Date,
+  downtime: DowntimeWindow,
 ): Date | null {
   if (step.status !== "pending" || step.scheduledAt === null) return null;
-  if (step.scheduledAt.getTime() >= workerStartedAt.getTime()) return null;
+  const at = step.scheduledAt.getTime();
+  if (downtime.from !== null && at <= downtime.from.getTime()) return null;
+  // 到点时刻在空档终点（重启那一刻）或之后：那时已经有实例在跑，不算过期
+  if (at >= downtime.until.getTime()) return null;
   return addSeconds(now, step.delaySeconds);
 }
 
@@ -513,8 +564,8 @@ export async function advanceRunInTx(
     return done("rescheduled");
   }
   // 3. 重启重排：停机期间过期的当前步只重排这一步
-  if (deps.workerStartedAt) {
-    const rescheduled = rescheduleStaleStep(step, now, deps.workerStartedAt);
+  if (deps.downtime) {
+    const rescheduled = rescheduleStaleStep(step, now, deps.downtime);
     if (rescheduled) {
       await tx.sequenceRunStep.update({
         where: { id: step.id },

@@ -34,6 +34,7 @@ import {
   RATE_LIMIT_RECHECK_MS,
   renderTemplate,
   resolveVars,
+  SCHEDULER_DOWNTIME_GAP_MS,
   startRun,
 } from "../src/services/sequence-service.js";
 import { buildGatewayApp } from "../src/sim/gateway/app.js";
@@ -352,8 +353,20 @@ describe("定时序列（#15）", () => {
     return runId;
   }
 
-  const tick = (startedAt: Date = workerStartedAt) =>
-    runSequenceTick({ clock, log: silent, workerStartedAt: startedAt });
+  /**
+   * 一次序列 tick。用例用假时钟一跳就是几秒到一小时、中间并不 tick —— 默认把「停过」的阈值放得很大，免得普通用例
+   * 被当成停机；重启恢复的用例显式传真实阈值 SCHEDULER_DOWNTIME_GAP_MS。
+   */
+  const tick = (
+    startedAt: Date = workerStartedAt,
+    downtimeGapMs: number = 365 * 86_400_000,
+  ) =>
+    runSequenceTick({
+      clock,
+      log: silent,
+      workerStartedAt: startedAt,
+      downtimeGapMs,
+    });
   const outboxTick = () =>
     runOutboxTick({
       clock,
@@ -1062,14 +1075,19 @@ describe("定时序列（#15）", () => {
       return { runId, scheduled2 };
     }
 
+    /** 真实阈值下的一次 tick：调度器「活着」= 间隔 ≤ 阈值地 tick；「停机」= 超过阈值不 tick */
+    const liveTick = (startedAt: Date = workerStartedAt) =>
+      tick(startedAt, SCHEDULER_DOWNTIME_GAP_MS);
+
     it("停机期间第 2 步过期：新 worker 接手时只把第 2 步改到「重启时刻 + delay2」，不发；第 3 步仍等第 2 步发出后 delay3", async () => {
       const { runId, scheduled2 } = await _atStep2();
-      // 停机一小时后进程回来
+      await liveTick(); // 停机前调度器最后一次心跳
+      // 停机一小时后进程回来（这一小时里没有任何实例 tick）
       clock.advance(sec(3_600));
       const restartedAt = clock.now();
       expect(scheduled2.getTime()).toBeLessThan(restartedAt.getTime());
 
-      const first = await tick(restartedAt);
+      const first = await liveTick(restartedAt);
       expect(first.results).toEqual([
         { runId, stepIndex: 2, outcome: "rescheduled" },
       ]);
@@ -1084,13 +1102,13 @@ describe("定时序列（#15）", () => {
       expect(r.steps[2]!.scheduledAt).toBeNull();
       expect(await getDb().message.count()).toBe(1);
       // 只重排一次：再 tick 不会再推
-      expect((await tick(restartedAt)).advanced).toBe(0);
+      expect((await liveTick(restartedAt)).advanced).toBe(0);
 
       // 到新的排期才发第 2 步；第 3 步按第 2 步 sent 后 + 3s，不是一次性全发
       clock.advance(sec(5) - 1);
-      expect((await tick(restartedAt)).advanced).toBe(0);
+      expect((await liveTick(restartedAt)).advanced).toBe(0);
       clock.advance(1);
-      expect((await tick(restartedAt)).results).toEqual([
+      expect((await liveTick(restartedAt)).results).toEqual([
         { runId, stepIndex: 2, outcome: "enqueued" },
       ]);
       const s2 = await stepOf(runId, 2);
@@ -1102,14 +1120,18 @@ describe("定时序列（#15）", () => {
       expect(r.steps[2]!.scheduledAt?.getTime()).toBe(
         sentAt2.getTime() + sec(3),
       );
-      expect((await tick(restartedAt)).advanced).toBe(0);
+      expect((await liveTick(restartedAt)).advanced).toBe(0);
       expect(await getDb().message.count()).toBe(2);
     });
 
-    it("没有停机（worker 早于排期启动）：到点就发，不重排", async () => {
+    it("没有停机（调度器一直在 tick）：到点就发，不重排", async () => {
       const { runId, scheduled2 } = await _atStep2();
-      clock.advance(sec(3_600));
-      expect((await tick(workerStartedAt)).results).toEqual([
+      let result = await liveTick();
+      for (let i = 0; i < 5 && result.advanced === 0; i += 1) {
+        clock.advance(sec(1));
+        result = await liveTick();
+      }
+      expect(result.results).toEqual([
         { runId, stepIndex: 2, outcome: "enqueued" },
       ]);
       const s2 = await stepOf(runId, 2);
@@ -1117,16 +1139,45 @@ describe("定时序列（#15）", () => {
       expect(s2.scheduledAt).toEqual(scheduled2);
     });
 
-    it("停机时第 2 步还没到点：不算过期，按原排期发", async () => {
+    it("多副本滚动发布：新实例刚启动就领到一个刚到点的步骤 —— 旧实例一直在 tick，不是停机，按原排期发、不顺延", async () => {
       const { runId, scheduled2 } = await _atStep2();
-      clock.advance(sec(2));
-      const restartedAt = clock.now();
-      expect((await tick(restartedAt)).advanced).toBe(0);
-      clock.advance(sec(3));
-      expect((await tick(restartedAt)).results).toEqual([
+      // 旧实例每秒 tick，直到第 2 步到点前一刻
+      await liveTick();
+      for (let i = 0; i < 4; i += 1) {
+        clock.advance(sec(1));
+        await liveTick();
+      }
+      // 到点 0.3 秒后新实例启动（它的启动时刻晚于到点时刻），抢先领到这一步
+      clock.advance(sec(1) + 300);
+      const newReplicaStartedAt = clock.now();
+      expect(scheduled2.getTime()).toBeLessThan(newReplicaStartedAt.getTime());
+      expect((await liveTick(newReplicaStartedAt)).results).toEqual([
         { runId, stepIndex: 2, outcome: "enqueued" },
       ]);
       expect((await stepOf(runId, 2)).scheduledAt).toEqual(scheduled2);
+    });
+
+    it("停机时第 2 步还没到点：不算过期，按原排期发", async () => {
+      const { runId, scheduled2 } = await _atStep2();
+      await liveTick();
+      clock.advance(sec(2));
+      const restartedAt = clock.now();
+      expect((await liveTick(restartedAt)).advanced).toBe(0);
+      clock.advance(sec(3));
+      expect((await liveTick(restartedAt)).results).toEqual([
+        { runId, stepIndex: 2, outcome: "enqueued" },
+      ]);
+      expect((await stepOf(runId, 2)).scheduledAt).toEqual(scheduled2);
+    });
+
+    it("第一次启动（库里还没有任何调度器心跳）：在本实例启动之前就到点的当前步算停机期间过期", async () => {
+      const { runId } = await _atStep2();
+      await getDb().schedulerHeartbeat.deleteMany();
+      clock.advance(sec(60));
+      const firstStart = clock.now();
+      expect((await liveTick(firstStart)).results).toEqual([
+        { runId, stepIndex: 2, outcome: "rescheduled" },
+      ]);
     });
   });
 

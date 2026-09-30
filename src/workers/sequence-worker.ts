@@ -7,8 +7,9 @@
 // sequence-service（消息终局推进步骤），service 自己 import 会成环。
 //
 // 排期本身在库里（sequence_run_steps.scheduledAt），定时器只是「多久看一次」；「现在」从 deps.clock 取，测试传假时钟
-// 推进。workerStartedAt = 本实例启动时刻（startSequenceWorker 里取 clock.now()）：在它之前就到点、仍 pending 的
-// 当前步是停机期间过期的那一步，service 只重排这一步（rescheduleStaleStep），后续步骤仍按前一步发出后排。
+// 推进。每个 tick 开头刷新库里的调度器心跳（recordSchedulerBeat），拿到最近一次停机空档：到点时刻落在空档里、仍 pending
+// 的当前步是停机期间过期的那一步，service 只重排这一步（rescheduleStaleStep），后续步骤仍按前一步发出后排。
+// workerStartedAt（本实例启动时刻）只在库里还没有任何心跳（第一次启动）时作为空档的终点。
 // 写法是 while + 可打断的 sleep 而不是 setInterval：tick 慢于间隔时不会叠着跑；stop() 立即打断等待、等在途 tick
 // 完成后返回。runSequenceTick 单独导出，测试直接 await 它，不起循环。
 import type { Clock } from "../core/clock.js";
@@ -18,12 +19,15 @@ import {
   type AdvanceResult,
   advanceNextDue,
   DEFAULT_BATCH_SIZE,
+  recordSchedulerBeat,
 } from "../services/sequence-service.js";
 
 export type SequenceTickDeps = {
   clock: Clock;
-  /** 本 worker 实例的启动时刻（重启重排的判据）；不传 = 不做重启重排 */
+  /** 本 worker 实例的启动时刻：第一次启动（库里没有心跳）时作为停机空档的终点；不传 = 不做重启重排 */
   workerStartedAt?: Date;
+  /** 两次心跳之间隔多久算停过；默认 SCHEDULER_DOWNTIME_GAP_MS */
+  downtimeGapMs?: number;
   log?: Pick<Logger, "info" | "warn" | "error">;
   /** 一次 tick 最多推进几个 run */
   batchSize?: number;
@@ -50,6 +54,14 @@ export async function runSequenceTick(
   const log = deps.log ?? logger.child({ worker: "sequence" });
   const stats: SequenceTickStats = { advanced: 0, results: [] };
   const limit = deps.batchSize ?? DEFAULT_BATCH_SIZE;
+  const downtime = deps.workerStartedAt
+    ? await recordSchedulerBeat(deps.clock.now(), {
+        workerStartedAt: deps.workerStartedAt,
+        ...(deps.downtimeGapMs !== undefined
+          ? { gapMs: deps.downtimeGapMs }
+          : {}),
+      })
+    : undefined;
   for (let i = 0; i < limit; i += 1) {
     let result: AdvanceResult | null;
     try {
@@ -57,7 +69,7 @@ export async function runSequenceTick(
         clock: deps.clock,
         log,
         enqueue: enqueueMessageInTx,
-        workerStartedAt: deps.workerStartedAt,
+        ...(downtime ? { downtime } : {}),
       });
     } catch (err) {
       // 推进本身抛了（库不可用 / 约束冲突）：事务已回滚，run 留在原状态，下个 tick 再试
@@ -91,7 +103,7 @@ export function startSequenceWorker(
 ): SequenceWorkerHandle {
   const log = deps.log ?? logger.child({ worker: "sequence" });
   const sleep = deps.sleep ?? defaultSleep;
-  // 启动时刻只取一次：它就是「重启时刻」，停机期间过期的步按它 + delay 重排
+  // 启动时刻只取一次：库里还没有任何调度器心跳（第一次启动）时，它是停机空档的终点
   const workerStartedAt = deps.clock.now();
   let stopped = false;
   let pending: { cancel: () => void } | undefined;
