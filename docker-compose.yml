@@ -1,6 +1,6 @@
-# 整套部署（Dokploy 的 Docker Compose 应用直接用这个文件；本机 docker compose up 也能跑）。
-# 对外只需要给 web 配域名（端口 80）：它托管控制台静态页，并把 /api、/ws 反代到 backend。
-# 其余服务只在 compose 内网里互相访问（expose，不映射到宿主机）。
+# 后端这一侧的整套服务（Dokploy 的 Docker Compose 应用直接用这个文件；本机 docker compose up 也能跑）。
+# 控制台（前端）是另一个独立部署的服务，见前端仓 README「部署」：它把 /api、/ws 转发到这里的 backend。
+# 对外只需要给 backend 配域名（端口 8000）；其余服务只在 compose 内网里互相访问（expose，不映射到宿主机）。
 # 变量从同目录 .env 读（Dokploy 的 Environment 页面写的就是它），清单见 .env.deploy.example。
 
 x-server: &server
@@ -71,7 +71,8 @@ services:
     expose:
       - "8300"
 
-  # 后端 API + 全部 worker：启动时自己前滚迁移、跑幂等种子（预置 admin / viewer 与 acc-1…acc-5）
+  # 后端 API + 全部 worker：启动时自己前滚迁移、跑幂等种子（预置 admin / viewer 与 acc-1…acc-5）。
+  # 在 Dokploy 里给它配域名（端口 8000），前端的 BACKEND_URL 就填这个域名
   backend:
     <<: *server
     environment:
@@ -99,19 +100,6 @@ services:
       timeout: 5s
       retries: 30
       start_period: 20s
-
-  # 控制台：从前端公开仓库直接构建（nginx 托管静态页 + 反代 /api、/ws）
-  web:
-    build:
-      context: ${FRONTEND_GIT_URL:-https://github.com/Victor-ChanX/interviewProjects-frontend.git#main}
-    restart: unless-stopped
-    environment:
-      BACKEND_UPSTREAM: backend:8000
-    expose:
-      - "80"
-    depends_on:
-      backend:
-        condition: service_healthy
 
 volumes:
   pgdata:
