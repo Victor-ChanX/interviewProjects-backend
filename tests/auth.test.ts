@@ -211,6 +211,26 @@ describe("auth", () => {
       expect(res.headers["x-request-id"]).toBe("gw-abc-123");
     });
 
+    it("请求体解析失败（声明 JSON 却是空体 / 坏 JSON）→ 400 VALIDATION_ERROR，不是 500", async () => {
+      for (const payload of ["", "{bad"]) {
+        const res = await app.inject({
+          method: "POST",
+          url: PROBE_WRITE,
+          headers: {
+            ...(await authHeaders("u1", ["admin"])),
+            "content-type": "application/json",
+          },
+          payload,
+        });
+        expect(res.statusCode).toBe(400);
+        const { error } = res.json<{
+          error: { code: string; reason: string };
+        }>();
+        expect(error.code).toBe("VALIDATION_ERROR");
+        expect(error.reason).toMatch(/^FST_ERR_/);
+      }
+    });
+
     it("没传 x-request-id 时自生成，信封与响应头是同一个", async () => {
       const res = await app.inject({ method: "GET", url: PROBE_READ });
       const { requestId } = res.json<ErrorEnvelope>().error;

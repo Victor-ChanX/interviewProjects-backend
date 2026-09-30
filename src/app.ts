@@ -161,6 +161,13 @@ export async function buildApp(
       });
       return;
     }
+    // Fastify 自己在解析请求体时拒掉的（空 JSON 体、坏 JSON、类型不支持、体积超限）：是调用方的错，不是 500
+    if (isFastifyClientError(err)) {
+      envelope(err.statusCode, "VALIDATION_ERROR", "请求体不合法", {
+        reason: err.code,
+      });
+      return;
+    }
     if (isResponseSerializationError(err)) {
       req.log.error({ err, requestId }, "响应不符合声明的 schema");
       envelope(500, "INTERNAL", "服务内部错误");
@@ -200,4 +207,19 @@ export async function buildApp(
   void app.register(activityRoutes);
 
   return app;
+}
+
+/** Fastify 内置的 4xx（FST_ERR_CTP_* 等请求体解析错误），带 statusCode。 */
+function isFastifyClientError(
+  err: unknown,
+): err is { statusCode: number; code: string } {
+  if (typeof err !== "object" || err === null) return false;
+  const { statusCode, code } = err as { statusCode?: unknown; code?: unknown };
+  return (
+    typeof statusCode === "number" &&
+    statusCode >= 400 &&
+    statusCode < 500 &&
+    typeof code === "string" &&
+    code.startsWith("FST_ERR_")
+  );
 }
