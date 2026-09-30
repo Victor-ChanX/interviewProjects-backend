@@ -6,6 +6,9 @@
 import { readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
+import { ServiceUnavailable } from "../core/errors.js";
+import { assertSchemaCurrent, getDb } from "../db/client.js";
+
 const MIGRATIONS_DIR = fileURLToPath(
   new URL("../../prisma/migrations", import.meta.url),
 );
@@ -20,4 +23,61 @@ export function getSchemaVersion(): string {
     throw new Error("prisma/migrations 下没有任何迁移目录");
   }
   return latest;
+}
+
+/** 调度器心跳多久以内算 worker 还活着（心跳每秒一次，见 sequence-service） */
+export const READY_HEARTBEAT_MAX_AGE_MS = 10_000;
+
+export type ReadinessChecks = {
+  database: "ok" | "fail";
+  schema: "ok" | "fail";
+  scheduler: "ok" | "fail";
+};
+
+/**
+ * 就绪检查（后端 #57）：与上面的探活不同，它真的去碰依赖 —— 数据库能查、库的迁移状态与代码一致、后台 worker 在跳
+ * 调度器心跳（scheduler_heartbeats，任一副本在跳即可）。有一项不行就 503 NOT_READY，extra.checks 说明是哪项。
+ */
+export async function checkReadiness(now: Date): Promise<ReadinessChecks> {
+  const checks: ReadinessChecks = {
+    database: "fail",
+    schema: "fail",
+    scheduler: "fail",
+  };
+  try {
+    await getDb().$queryRaw`SELECT 1`;
+    checks.database = "ok";
+  } catch {
+    throw notReady(checks);
+  }
+  try {
+    await assertSchemaCurrent();
+    checks.schema = "ok";
+  } catch {
+    // 记下后继续看调度器
+  }
+  const beat = await getDb().schedulerHeartbeat.findFirst({
+    orderBy: { beatAt: "desc" },
+    select: { beatAt: true },
+  });
+  if (
+    beat &&
+    now.getTime() - beat.beatAt.getTime() <= READY_HEARTBEAT_MAX_AGE_MS
+  ) {
+    checks.scheduler = "ok";
+  }
+  if (checks.schema !== "ok" || checks.scheduler !== "ok")
+    throw notReady(checks);
+  return checks;
+}
+
+function notReady(checks: ReadinessChecks): ServiceUnavailable {
+  const failed = Object.entries(checks)
+    .filter(([, v]) => v !== "ok")
+    .map(([k]) => k);
+  return new ServiceUnavailable(
+    "NOT_READY",
+    `服务未就绪：${failed.join("、")} 检查未通过`,
+    { checks },
+  );
 }

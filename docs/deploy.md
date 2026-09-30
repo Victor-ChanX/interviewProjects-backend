@@ -48,7 +48,8 @@ refresh cookie 也落在前端域名下。后端域名同时可以直接调接�
    **Advanced 里不要开 Isolated Deployment**：开了之后 Dokploy 不再给服务挂 `dokploy-network`，后端解析不到数据库的主机名。
 4. **Domains**：Add Domain → Service 选 `backend`，Container Port `8000`，填后端域名（如 `api.example.com`），
    HTTPS 选 Let's Encrypt。Dokploy 部署时自己加 Traefik 路由，compose 文件里不用写 labels。
-5. **Deploy**。首次要编译镜像，几分钟。验证：`curl https://api.example.com/api/health` → `{"ok":true,…}`。
+5. **Deploy**。首次要编译镜像，几分钟。验证：`curl https://api.example.com/api/health` → `{"ok":true,…}`；
+   `/api/health/ready` 还会检查数据库、迁移状态与后台 worker 心跳，全部 ok 才 200（不就绪是 503 并指出哪项）。
 
 ## 2. 部署前端（Dokploy Application）
 

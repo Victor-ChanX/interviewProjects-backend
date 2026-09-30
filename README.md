@@ -24,7 +24,8 @@ npm run sim:agent               # Agent 服务模拟器 http://localhost:8200
 npm run dev                     # 后端 http://localhost:8000（读 .env；启动时前滚迁移 → 校验 schema → 幂等种子 → 起 worker → listen）
 
 # 4. 验证
-curl -s localhost:8000/api/health  # {"ok":true,"schemaVersion":"…"}
+curl -s localhost:8000/api/health  # 探活：{"ok":true,"schemaVersion":"…"}
+curl -s localhost:8000/api/health/ready  # 就绪：数据库 / schema / worker 心跳，都 ok 才 200，否则 503 并指出哪项
 ```
 
 启动即预置：账号 `acc-1` … `acc-5`（`idle`）、用户 `admin/admin`（全部权限）、`viewer/viewer`（只读）。

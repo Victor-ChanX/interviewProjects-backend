@@ -26,6 +26,7 @@ import { defaultJobWorkerId, startJobWorker } from "./workers/job-worker.js";
 import { startMediaWorker } from "./workers/media-worker.js";
 import { defaultWorkerId, startOutboxWorker } from "./workers/outbox-worker.js";
 import { startRateLimitWorker } from "./workers/rate-limit-worker.js";
+import { startRetentionWorker } from "./workers/retention-worker.js";
 import { startSequenceWorker } from "./workers/sequence-worker.js";
 import { startWsBroadcastWorker } from "./workers/ws-broadcast-worker.js";
 
@@ -105,6 +106,12 @@ async function main(): Promise<void> {
     intervalMs: 1_000,
   });
 
+  // 事件类表的保留期清理（#57）：每小时一次，启动时先跑一次
+  const retentionWorker = startRetentionWorker({
+    clock: systemClock,
+    intervalMs: 60 * 60_000,
+  });
+
   const shutdown = async (signal: string): Promise<void> => {
     logger.info({ signal }, "收到停机信号，开始优雅停机");
     await Promise.all([
@@ -117,6 +124,7 @@ async function main(): Promise<void> {
       jobWorker.stop(),
       agentWorker.stop(),
       sequenceWorker.stop(),
+      retentionWorker.stop(),
     ]);
     // 先关 WS 连接再关 HTTP：客户端收到 1001 后按 sinceSeq 重连到别的副本
     await wsHub.stop();
