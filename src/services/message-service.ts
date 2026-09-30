@@ -71,6 +71,23 @@ export async function listMessages(
 
   const where: Prisma.MessageWhereInput = {
     groupId,
+    // 自己消息的回流行（回流的 message 事件先于 message_sent 到、还没合并进出站行）：同一账号在本群还有没落定的
+    // 出站行时先不列出，等 message_sent 把它合并掉 —— 一条消息只有一行（2.3）。没有待定出站行（不是经本系统发的、
+    // 或出站行已落定）就照常列出。
+    NOT: {
+      isOwn: true,
+      clientMsgId: null,
+      deliveryStatus: null,
+      account: {
+        messages: {
+          some: {
+            groupId,
+            msgId: null,
+            deliveryStatus: { in: ["queued", "accepted", "unknown"] },
+          },
+        },
+      },
+    },
     ...(cursor
       ? {
           OR: [

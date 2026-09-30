@@ -8,7 +8,10 @@
 //   游标是 c 时收到 c + 1 —— 两个整数之间没有别的 id，前进（接着看已收到的 c + 2 …）。遇到空洞不按时间越过：
 //   「收到之后过了多久」量不出比它小的事件到没到 —— 处理慢的时候，晚到的小 id 可能还躺在 socket 缓冲里没读。
 //   代价：网关的 id 若本身不连续，游标停在空洞前，重连时从那里重放，由事件级去重吃掉；只会多处理，不会漏。
-//   首次连接（库里还没有游标、不带 since = 从当前时刻开始）以收到的第一条为起点。
+//   首次连接（库里还没有游标、不带 since = 从当前时刻开始）以收到的第一条为起点，而且在处理它**之前**就把起点落库：
+//   崩在第一条处理中途，重启后带着起点补拉，不会退回「从当前时刻开始」而丢掉中间的事件。
+// - 空闲超时：一条流 SSE_IDLE_TIMEOUT_MS 内一帧都没有就主动断开重连（按游标补拉，去重吃掉重复）—— TCP 半开时
+//   读永远不返回，不设超时入站就一直卡着。
 // - 一条一条处理：ingest 自己吞掉「处理失败」（入册 + 不一致记录 + 排重试，重试见 inbound-retry-worker），
 //   只在库不可用时抛；那时断开这条流、退避后从游标重连，事件不会丢（游标没推进）。
 // - 退避有界：min(base × 2^n, cap) + 抖动；一条流只要收到过帧就把 n 清零。
@@ -26,6 +29,9 @@ import {
   readCursor,
 } from "../services/inbound-service.js";
 
+/** 一条流这么久一帧都没收到就断开重连 */
+export const SSE_IDLE_TIMEOUT_MS = 60_000;
+
 /** 退避常量（毫秒）：首次 1s，翻倍到 30s 封顶，再加 0–500ms 抖动 */
 export const RECONNECT_BASE_MS = 1_000;
 export const RECONNECT_CAP_MS = 30_000;
@@ -38,6 +44,8 @@ export type InboundWorkerDeps = {
   applyGatewayDelivery?: ApplyGatewayDelivery;
   /** 退避等待；测试注入立即返回的实现。signal abort 时应立刻 resolve */
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
+  /** 一条流空闲多久断开重连；默认 SSE_IDLE_TIMEOUT_MS */
+  idleTimeoutMs?: number;
   /** 读 / 写游标；默认走 inbound-service（库）。测试可替换 */
   cursorStore?: {
     read(): Promise<number | null>;
@@ -111,12 +119,36 @@ export async function consumeOnce(
     advance: (eventId) => advanceCursor(eventId, { clock: deps.clock }),
   };
   let frames = 0;
+  // 这条流自己的中止：外面 stop()，或空闲超时
+  const stream = new AbortController();
+  const onStop = (): void => stream.abort();
+  signal.addEventListener("abort", onStop, { once: true });
+  let idle = false;
+  let idleTimer: NodeJS.Timeout | undefined;
+  const armIdle = (): void => {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      idle = true;
+      stream.abort();
+    }, deps.idleTimeoutMs ?? SSE_IDLE_TIMEOUT_MS);
+  };
   try {
     const since = await cursor.read();
     const position = createCursorPosition(since);
+    let based = since !== null;
     log.info({ since }, "连接网关事件流");
-    for await (const event of deps.gateway.openEventStream({ since, signal })) {
+    armIdle();
+    for await (const event of deps.gateway.openEventStream({
+      since,
+      signal: stream.signal,
+    })) {
+      armIdle();
       frames += 1;
+      if (!based) {
+        // 首次连接：处理第一条之前先把起点落库（见文件头）
+        await cursor.advance(event.eventId - 1);
+        based = true;
+      }
       const result = await ingest(event, {
         clock: deps.clock,
         log,
@@ -124,12 +156,18 @@ export async function consumeOnce(
       });
       const advanced = position.received(result.eventId);
       if (advanced !== null) await cursor.advance(advanced);
-      if (signal.aborted) break;
+      if (signal.aborted || idle) break;
     }
-    return { frames, reason: signal.aborted ? "aborted" : "disconnected" };
+    if (signal.aborted) return { frames, reason: "aborted" };
+    return idle
+      ? { frames, reason: "disconnected", err: new Error("事件流空闲超时") }
+      : { frames, reason: "disconnected" };
   } catch (err) {
     if (signal.aborted) return { frames, reason: "aborted", err };
     return { frames, reason: "disconnected", err };
+  } finally {
+    clearTimeout(idleTimer);
+    signal.removeEventListener("abort", onStop);
   }
 }
 

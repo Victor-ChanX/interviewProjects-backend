@@ -56,6 +56,9 @@ type Json = Record<string, unknown>;
 
 const silentLog = logger.child({}, { level: "silent" });
 
+/** ws message 事件里的 sentAt：值由事件决定，这里只断言有这个字段 */
+const ANY_ISO_TIME = expect.any(String) as string;
+
 /** 可拨动的假时钟（业务「现在」）；SSE 等待不用它，用真定时器 + 短轮询。 */
 function fakeClock(start = new Date()): Clock & { advance(ms: number): void } {
   let now = start.getTime();
@@ -189,7 +192,12 @@ describe("ingest", () => {
       expect(inbound[0]?.groupId).toBe("g-1");
       expect(inbound[0]?.payload).toEqual(ev.data);
       expect((await wsEvents("message")).map((e) => e.payload)).toEqual([
-        { groupId: group.id, msgId: "m1", isOwn: false },
+        {
+          groupId: group.id,
+          msgId: "m1",
+          isOwn: false,
+          sentAt: ANY_ISO_TIME,
+        },
       ]);
     });
 
@@ -225,9 +233,24 @@ describe("ingest", () => {
       expect(ordered.map((m) => m.msgId)).toEqual(["old", "early", "late"]);
       expect(await db().inboundEvent.count()).toBe(4);
       expect((await wsEvents("message")).map((e) => e.payload)).toEqual([
-        { groupId: group.id, msgId: "late", isOwn: false },
-        { groupId: group.id, msgId: "early", isOwn: false },
-        { groupId: group.id, msgId: "old", isOwn: false },
+        {
+          groupId: group.id,
+          msgId: "late",
+          isOwn: false,
+          sentAt: ANY_ISO_TIME,
+        },
+        {
+          groupId: group.id,
+          msgId: "early",
+          isOwn: false,
+          sentAt: ANY_ISO_TIME,
+        },
+        {
+          groupId: group.id,
+          msgId: "old",
+          isOwn: false,
+          sentAt: ANY_ISO_TIME,
+        },
       ]);
     });
 
@@ -307,7 +330,12 @@ describe("ingest", () => {
         deliveryStatus: "sent",
       });
       expect((await wsEvents("message")).map((e) => e.payload)).toEqual([
-        { groupId: group.id, msgId: "m-own", isOwn: true },
+        {
+          groupId: group.id,
+          msgId: "m-own",
+          isOwn: true,
+          sentAt: ANY_ISO_TIME,
+        },
       ]);
       // 补投同一条自己的消息：不再发 ws 事件
       await ingest(frame("message", echo.data), { clock, log: silentLog });
@@ -338,7 +366,12 @@ describe("ingest", () => {
         senderPlatformUserId: account.platformUserId,
       });
       expect((await wsEvents("message")).map((e) => e.payload)).toEqual([
-        { groupId: group.id, msgId: "m-early", isOwn: true },
+        {
+          groupId: group.id,
+          msgId: "m-early",
+          isOwn: true,
+          sentAt: ANY_ISO_TIME,
+        },
       ]);
     });
   });
@@ -910,6 +943,63 @@ describe("ingest", () => {
       expect(p.received(6)).toBe(7);
     });
 
+    it("首次连接（库里还没有游标）：处理第一条之前就把起点落库 —— 崩在第一条处理中途也能从起点补拉", async () => {
+      const advances: number[] = [];
+      let seenAtProcessing: number[] = [];
+      const e50 = frame(
+        "message_sent",
+        { clientMsgId: "c-50", msgId: "m-50", sentAt: at(0).toISOString() },
+        50,
+      );
+      const gateway = {
+        async *openEventStream() {
+          yield e50;
+        },
+      };
+      await consumeOnce(
+        {
+          clock,
+          gateway,
+          log: silentLog,
+          applyGatewayDelivery: async () => {
+            seenAtProcessing = [...advances];
+          },
+          cursorStore: {
+            read: async () => null,
+            advance: async (id) => {
+              advances.push(id);
+            },
+          },
+        },
+        new AbortController().signal,
+      );
+      expect(seenAtProcessing).toEqual([49]);
+      expect(advances).toEqual([49, 50]);
+    });
+
+    it("事件流空闲超时：一帧都没有就主动断开（交给 worker 按游标重连），不会永远卡在半开连接上", async () => {
+      const gateway = {
+        async *openEventStream({ signal }: { signal?: AbortSignal }) {
+          await new Promise<void>((resolve) =>
+            signal?.addEventListener("abort", () => resolve(), { once: true }),
+          );
+          yield* [] as GatewayEvent[];
+        },
+      };
+      const result = await consumeOnce(
+        {
+          clock,
+          gateway,
+          log: silentLog,
+          idleTimeoutMs: 30,
+          cursorStore: { read: async () => 1, advance: async () => undefined },
+        },
+        new AbortController().signal,
+      );
+      expect(result.reason).toBe("disconnected");
+      expect(String(result.err)).toContain("空闲超时");
+    });
+
     it("乱序 + 断流：先到的 101 不推进游标；重连从旧游标补拉，还在路上的 100 不丢", async () => {
       const group = await localGroup();
       await advanceCursor(99, { clock });
@@ -1158,7 +1248,12 @@ describe("openEventStream / inbound worker（真 SSE）", () => {
         msgId: row.msgId,
       });
       expect((await wsEvents("message")).map((e) => e.payload)).toEqual([
-        { groupId: group.id, msgId: row.msgId, isOwn: true },
+        {
+          groupId: group.id,
+          msgId: row.msgId,
+          isOwn: true,
+          sentAt: ANY_ISO_TIME,
+        },
       ]);
     });
 

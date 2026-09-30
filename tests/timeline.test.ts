@@ -8,7 +8,8 @@ import { buildApp } from "../src/app.js";
 import { closeDb } from "../src/db/client.js";
 import type { Message } from "../src/db/generated/client.js";
 import type { MessagePage, MessageRead } from "../src/schemas/message.js";
-import { loginAs, makeGroup, makeMessage } from "./factories.js";
+import { getDb } from "../src/db/client.js";
+import { loginAs, makeAccount, makeGroup, makeMessage } from "./factories.js";
 import { truncateAll } from "./setup.js";
 
 type ErrorBody = { error: { code: string; message: string } };
@@ -224,6 +225,44 @@ describe("GET /api/groups/:id/messages", () => {
     const empty = await list(group.id);
     expect(empty.statusCode).toBe(200);
     expect(empty.json<MessagePage>()).toEqual({ items: [], nextCursor: null });
+  });
+
+  it("一条消息只有一行：自己消息的回流行在出站行落定前不列出（等 message_sent 合并），出站行落定后才照常列出", async () => {
+    const group = await makeGroup();
+    const account = await makeAccount({
+      id: "acc-own",
+      platformUserId: "pu-own",
+    });
+    const outbound = await makeMessage({
+      groupId: group.id,
+      accountId: account.id,
+      senderPlatformUserId: "pu-own",
+      isOwn: true,
+      clientMsgId: "cm-own",
+      deliveryStatus: "accepted",
+      text: "hi",
+    });
+    // 回流的 message 事件先于 message_sent 到：入站插了一行回流行（还没合并）
+    await makeMessage({
+      groupId: group.id,
+      accountId: account.id,
+      senderPlatformUserId: "pu-own",
+      isOwn: true,
+      msgId: "gw-own",
+      text: "hi",
+    });
+    let body = (await list(group.id)).json<MessagePage>();
+    expect(body.items.map((m) => m.clientMsgId)).toEqual(["cm-own"]);
+
+    // 出站行落定（这里是 failed：回流的不是它）→ 不再有待定的出站行，回流行照常列出
+    await getDb().message.update({
+      where: { id: outbound.id },
+      data: { deliveryStatus: "failed", failCode: "SENDER_NOT_IN_GROUP" },
+    });
+    body = (await list(group.id)).json<MessagePage>();
+    expect(body.items.map((m) => m.msgId).sort()).toEqual(
+      ["gw-own", null].sort(),
+    );
   });
 
   it("数据范围：只返回该群的消息，别的群的不混进来", async () => {

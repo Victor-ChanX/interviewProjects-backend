@@ -587,20 +587,20 @@ async function handleMessage(
   // message 事件（补投 / 重复的自己消息不再发）。#12 按 isOwn = false 过滤触发 agent。
   let announce = created;
   if (!created && isOwn) {
-    const seen = await tx.inboundEvent.count({
-      where: {
-        type: "message",
-        processedAt: { not: null },
-        payload: { path: ["msgId"], equals: data.msgId },
-      },
-    });
-    announce = seen === 0;
+    // 走表达式索引 inbound_events_processed_message_msg_id（20260930230000_inbound_msg_id_index），不全表扫 JSON
+    const seen = await tx.$queryRaw<{ one: number }[]>`
+      SELECT 1 AS one FROM inbound_events
+      WHERE type = 'message' AND processed_at IS NOT NULL
+        AND (payload->>'msgId') = ${data.msgId}
+      LIMIT 1`;
+    announce = seen.length === 0;
   }
   if (announce) {
     await emitWsEvent(tx, "message", {
       groupId: group.id,
       msgId: data.msgId,
       isOwn,
+      sentAt: data.sentAt.toISOString(),
     });
   }
   ctx.afterCommit(() =>

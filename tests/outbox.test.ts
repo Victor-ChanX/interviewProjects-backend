@@ -285,6 +285,7 @@ describe("outbox（#7）", () => {
           isOwn: true,
           deliveryStatus: "queued",
           failCode: null,
+          sentAt: m.sentAt.toISOString(),
         },
       ]);
       // 202 只保证落库：网关还没收到

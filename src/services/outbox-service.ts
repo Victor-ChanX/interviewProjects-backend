@@ -160,7 +160,7 @@ export type ResolveUnknownStats = {
 type Tx = Prisma.TransactionClient;
 type MessageEventRow = Pick<
   Message,
-  "groupId" | "msgId" | "clientMsgId" | "deliveryStatus" | "failCode"
+  "groupId" | "msgId" | "clientMsgId" | "deliveryStatus" | "failCode" | "sentAt"
 >;
 
 // ---- 入队 ------------------------------------------------------------------------------
@@ -452,6 +452,8 @@ async function emitMessageEvent(tx: Tx, row: MessageEventRow): Promise<void> {
     isOwn: true,
     deliveryStatus: row.deliveryStatus,
     failCode: row.failCode,
+    // 时间线排序键：受理时是受理时刻，发出后改为网关的 sentAt —— 前端据此把这一行挪到正确位置
+    sentAt: row.sentAt.toISOString(),
   });
 }
 
