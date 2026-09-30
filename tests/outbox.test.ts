@@ -602,6 +602,32 @@ describe("outbox（#7）", () => {
       ]);
     });
 
+    it("429 的「账号限流」与「这条回 queued 排到期」一个事务：后一步出错，账号也不会停在 rate_limited", async () => {
+      const { group, creator } = await stageGroup();
+      await scenario({
+        send: {
+          responses: [
+            {
+              status: 429,
+              retryAfterSeconds: 5,
+              match: { accountId: creator.id },
+            },
+          ],
+        },
+      });
+      const { messageId } = await enqueue(group, creator, "c-1");
+      await withFailingUpdates(
+        "messages",
+        "NEW.last_error = 'RATE_LIMITED'",
+        () => tick(),
+      );
+      expect(await account(creator.id)).toMatchObject({
+        status: "online",
+        rateLimitedUntil: null,
+      });
+      expect((await row(messageId)).deliveryStatus).toBe("queued");
+    });
+
     it("账号先于排在前面的那条到点（两边截止差几毫秒）：后面的也等着，不插队", async () => {
       const { group, creator: a } = await stageGroup();
       await scenario({
@@ -915,6 +941,68 @@ describe("outbox（#7）", () => {
           (c) => c.clientMsgId === clientMsgId,
         ),
       ).toHaveLength(2);
+    });
+
+    it("确认没发出后在确认循环里当场重发，不排到派发循环后面等（504 起 5 秒内定态）", async () => {
+      const { group, creator } = await stageGroup();
+      await scenario({
+        send: { responses: [{ status: 504, landAfterMs: null }] },
+      });
+      const { messageId } = await enqueue(group, creator);
+      await tick();
+      clock.advance(CONFIRM_WINDOW_MS + 1);
+      // 只跑确认循环（生产里它与派发循环互不等待）
+      const r = await runConfirmTick({
+        clock,
+        gateway: gatewayClient,
+        workerId: "w-confirm",
+        log: silent,
+      });
+      expect(r.resends.accepted).toBe(1);
+      expect(await row(messageId)).toMatchObject({
+        deliveryStatus: "accepted",
+        resendCount: 1,
+        claimedBy: null,
+      });
+      expect((await simState()).sendCalls).toHaveLength(2);
+    });
+
+    it("多条 unknown 的确认并发进行：一条慢查询不拖住别的", async () => {
+      const { group, creator } = await stageGroup();
+      const other = await addMember(group);
+      await scenario({
+        send: {
+          responses: [
+            { status: 504, landAfterMs: null },
+            { status: 504, landAfterMs: null },
+          ],
+        },
+      });
+      await enqueue(group, creator, "c-1");
+      await enqueue(group, other, "o-1");
+      await tick();
+      // 第一条查询要等第二条查询也发出了才返回：串行确认会一直等下去
+      let started = 0;
+      let both!: () => void;
+      const barrier = new Promise<void>((resolve) => {
+        both = resolve;
+      });
+      const gated: GatewayClient = {
+        ...gatewayClient,
+        async getMessageByClientId(groupId, id) {
+          started += 1;
+          if (started === 2) both();
+          await barrier;
+          return gatewayClient.getMessageByClientId(groupId, id);
+        },
+      };
+      const r = await runConfirmTick({
+        clock,
+        gateway: gated,
+        workerId: "w1",
+        log: silent,
+      });
+      expect(r.unknownChecked).toBe(2);
     });
 
     it("重发后仍 504 + 404 → failed NETWORK_TIMEOUT，总共只重发一次", async () => {

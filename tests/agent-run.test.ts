@@ -47,6 +47,7 @@ import {
 import {
   createGatewayClient,
   type GatewayClient,
+  GatewayResponseError,
 } from "../src/services/gateway-client.js";
 import { ingest } from "../src/services/inbound-service.js";
 import { applyGatewayDelivery } from "../src/services/outbox-service.js";
@@ -320,12 +321,13 @@ describe("agent run（#12 / #13）", () => {
     auditTimeoutMs?: number;
     workerStartedAt?: Date;
     agent?: AgentClient;
+    gateway?: GatewayClient;
   };
   const tick = (opts: TickOpts = {}) =>
     runAgentTick({
       clock,
       agent: opts.agent ?? agentClient,
-      gateway: gatewayClient,
+      gateway: opts.gateway ?? gatewayClient,
       workerId: opts.workerId ?? "agent-w1",
       log: silent,
       turnTimeoutMs: opts.turnTimeoutMs ?? 5_000,
@@ -1365,6 +1367,35 @@ describe("agent run（#12 / #13）", () => {
   });
 
   describe("kick_user", () => {
+    it("执行账号被网关判停用（kick 返回 ACCOUNT_SUSPENDED）→ 账号进 suspended 级联，这一步 SEND_FAILED，run 继续", async () => {
+      const { group, creator } = await stageGroup({ autoKickEnabled: true });
+      await addExternalMember(group, "u-spam");
+      await agentScenario({
+        turn: { steps: [{ type: "kick_user", platform_user_id: "u-spam" }] },
+      });
+      const runId = await startRun(group);
+      const suspendedKick: GatewayClient = {
+        ...gatewayClient,
+        async kick() {
+          throw new GatewayResponseError("POST", "/kick", 403, {
+            code: "ACCOUNT_SUSPENDED",
+          });
+        },
+      };
+      await runToEnd({ gateway: suspendedKick });
+      const [s0] = await steps(runId);
+      expect(s0).toMatchObject({
+        name: "kick_user",
+        isError: true,
+        errorCode: "SEND_FAILED",
+      });
+      expect(
+        (await getDb().account.findUniqueOrThrow({ where: { id: creator.id } }))
+          .status,
+      ).toBe("suspended");
+      expectEnded(await run(runId), "finished", "final");
+    });
+
     it("autoKickEnabled=false → POLICY_DENIED，不审计、不调网关", async () => {
       const { group } = await stageGroup({ autoKickEnabled: false });
       await addExternalMember(group, "u-spam");

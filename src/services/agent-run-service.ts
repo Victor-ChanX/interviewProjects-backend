@@ -55,6 +55,7 @@ import type {
   Group,
   Prisma,
 } from "../db/generated/client.js";
+import { enterTerminalFromGatewayError } from "./account-service.js";
 import type {
   AgentClient,
   AgentMessage,
@@ -1613,6 +1614,20 @@ async function executeKick(
       targetPlatformUserId: target,
     });
   } catch (err) {
+    // 执行账号被网关判终态：账号进终态（A2 错误表对所有请求适用），这一步 SEND_FAILED（A5 第 5 条：账号在执行中途
+    // 变终态），run 继续
+    const terminal = await enterTerminalFromGatewayError(account.id, err, {
+      clock: deps.clock,
+      log: deps.log,
+    });
+    if (terminal) {
+      return finish(
+        fail(
+          "SEND_FAILED",
+          `执行账号 ${account.id} 已被平台${terminal.account.status === "suspended" ? "停用" : "判定会话失效"}，未移除成员`,
+        ),
+      );
+    }
     if (err instanceof GatewayResponseError) {
       if (err.code === "OWNER_LEFT") {
         return finish(fail("OWNER_LEFT", "群主已退群，网关拒绝移除成员"));

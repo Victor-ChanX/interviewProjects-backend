@@ -25,7 +25,7 @@
 import { randomInt, randomUUID } from "node:crypto";
 
 import { type Clock, systemClock } from "../core/clock.js";
-import { Conflict, DomainError, NotFound } from "../core/errors.js";
+import { Conflict, NotFound } from "../core/errors.js";
 import type { Logger } from "../core/logger.js";
 import { getDb } from "../db/client.js";
 import type {
@@ -36,9 +36,10 @@ import type {
 import {
   cancelQueuedSends,
   DEFAULT_RATE_LIMIT_SECONDS,
-  enterRateLimited,
+  enterRateLimitedInTx,
   enterTerminalInTx,
   isTerminal,
+  logRateLimited,
   logTransition,
   type TerminalStatus,
   terminalFromGatewayError,
@@ -147,10 +148,13 @@ export type ApplyDeliveryResult = {
 export type ResolveUnknownStats = {
   checked: number;
   sent: number;
+  /** 确认没发出、已用同一 clientMsgId 重发（或账号限流中、排到期再发）的条数 */
   requeued: number;
   failed: number;
   /** 仍 unknown：未满 2 秒或查询不可用 */
   pending: number;
+  /** 确认没发出后当场重发的派发结果 */
+  resends: Record<DispatchOutcome, number>;
 };
 
 type Tx = Prisma.TransactionClient;
@@ -579,34 +583,46 @@ export async function recordUnknown(
 export async function requeue(
   messageId: string,
   workerId: string,
-  schedule: {
-    nextAttemptAt: Date;
-    httpStatus: number | null;
-    errorCode: string;
-    detail?: unknown;
-  },
+  schedule: RequeueSchedule,
   deps: OutboxDeps = {},
 ): Promise<boolean> {
   const now = (deps.clock ?? systemClock).now();
-  return getDb().$transaction(async (tx) => {
-    await finishAttempt(tx, messageId, now, schedule);
-    const changed = await tx.message.updateMany({
-      where: { id: messageId, deliveryStatus: "queued", claimedBy: workerId },
-      data: {
-        nextAttemptAt: schedule.nextAttemptAt,
-        lastError: schedule.errorCode,
-        claimedBy: null,
-        lockedAt: null,
-      },
-    });
-    if (changed.count === 0) {
-      await tx.message.updateMany({
-        where: { id: messageId, claimedBy: workerId },
-        data: { claimedBy: null, lockedAt: null },
-      });
-    }
-    return changed.count > 0;
+  return getDb().$transaction((tx) =>
+    requeueInTx(tx, messageId, workerId, schedule, now),
+  );
+}
+
+type RequeueSchedule = {
+  nextAttemptAt: Date;
+  httpStatus: number | null;
+  errorCode: string;
+  detail?: unknown;
+};
+
+async function requeueInTx(
+  tx: Tx,
+  messageId: string,
+  workerId: string,
+  schedule: RequeueSchedule,
+  now: Date,
+): Promise<boolean> {
+  await finishAttempt(tx, messageId, now, schedule);
+  const changed = await tx.message.updateMany({
+    where: { id: messageId, deliveryStatus: "queued", claimedBy: workerId },
+    data: {
+      nextAttemptAt: schedule.nextAttemptAt,
+      lastError: schedule.errorCode,
+      claimedBy: null,
+      lockedAt: null,
+    },
   });
+  if (changed.count === 0) {
+    await tx.message.updateMany({
+      where: { id: messageId, claimedBy: workerId },
+      data: { claimedBy: null, lockedAt: null },
+    });
+  }
+  return changed.count > 0;
 }
 
 /**
@@ -826,34 +842,38 @@ async function handleSendError(
   if (err instanceof GatewayResponseError) {
     const detail = err.body;
 
-    // 429：账号 → rate_limited（已是则刷新截止），该行回 queued 到期再领；限流期内该账号一条都不领（claimBatch）
+    // 429：账号 → rate_limited（已是则刷新截止）与该行回 queued 到期再领**同一个事务**（崩在两者之间，这条会走
+    // 过期领取回收、白白用掉唯一一次重发）；限流期内该账号一条都不领（claimBatch）
     if (err.status === 429 || err.code === "RATE_LIMITED") {
       const retryAfter = retryAfterOf(err);
-      try {
-        await enterRateLimited(msg.accountId, retryAfter, {
-          clock,
-          log,
-          source: "send_error",
-        });
-      } catch (e) {
-        // 账号已被操作员标成别的状态（idle / disconnected / 终态）：转移表不允许，只记日志；行照样回 queued
-        if (!(e instanceof DomainError)) throw e;
-        log?.warn(
-          { ...ctx, err: e },
-          "网关限流但本地账号状态不允许转 rate_limited",
+      const limited = await getDb().$transaction(async (tx) => {
+        const entered = await enterRateLimitedInTx(
+          tx,
+          msg.accountId,
+          retryAfter,
+          "send_error",
+          now,
         );
+        await requeueInTx(
+          tx,
+          msg.id,
+          workerId,
+          {
+            nextAttemptAt: new Date(now.getTime() + retryAfter * 1000),
+            httpStatus: 429,
+            errorCode: err.code,
+            detail,
+          },
+          now,
+        );
+        return entered;
+      });
+      if (limited) {
+        logRateLimited(msg.accountId, "send_error", limited, log);
+      } else {
+        // 账号已被操作员标成别的状态（idle / disconnected / 终态）：转移表不允许，只记日志；行照样回 queued
+        log?.warn(ctx, "网关限流但本地账号状态不允许转 rate_limited");
       }
-      await requeue(
-        msg.id,
-        workerId,
-        {
-          nextAttemptAt: new Date(now.getTime() + retryAfter * 1000),
-          httpStatus: 429,
-          errorCode: err.code,
-          detail,
-        },
-        deps,
-      );
       log?.info({ ...ctx, retryAfter }, "网关限流，消息保持 queued 到期后发出");
       return "requeued";
     }
@@ -991,10 +1011,12 @@ async function backoffOrFail(
 // ---- unknown 的出路：by-client-id 确认 ------------------------------------------------------
 
 /**
- * 每 tick 调。对每条 unknown 行查 by-client-id：
- * 200 → sent；404 且查询发出时距 unknownSince 已超过 2 秒 → 确认没发出：resendCount = 0 就用同一 clientMsgId 回 queued
- * （resendCount = 1，nextAttemptAt 空 → 本 tick 的领取就能发），否则 failed NETWORK_TIMEOUT；
+ * 每 tick 调。对每条 unknown 行查 by-client-id（各行并发：一条慢查询不拖住别的）：
+ * 200 → sent；404 且查询发出时距 unknownSince 已超过 2 秒 → 确认没发出：resendCount = 0 就用同一 clientMsgId
+ * **当场重发**（回 queued 并由本 worker 领取、立刻派发 —— 不排到派发循环后面等，A2：收到 504 起 5 秒内定态），
+ * 账号还在限流期内的只回 queued、到期再发；已经重发过 → failed NETWORK_TIMEOUT；
  * 查询不可用（503 / 连不上）→ 保持 unknown，下个 tick 再看。
+ * 同一账号至多一条 unknown（它挡着该账号后面的消息），所以各行的重发互不影响顺序。
  */
 export async function resolveUnknown(
   deps: DispatchDeps,
@@ -1008,6 +1030,14 @@ export async function resolveUnknown(
     requeued: 0,
     failed: 0,
     pending: 0,
+    resends: {
+      accepted: 0,
+      failed: 0,
+      cancelled: 0,
+      unknown: 0,
+      requeued: 0,
+      lost: 0,
+    },
   };
   const rows = await getDb().message.findMany({
     where: { deliveryStatus: "unknown" },
@@ -1015,7 +1045,8 @@ export async function resolveUnknown(
     orderBy: [{ unknownSince: "asc" }, { id: "asc" }],
     take: limit,
   });
-  for (const row of rows) {
+
+  const confirmOne = async (row: (typeof rows)[number]): Promise<void> => {
     stats.checked += 1;
     const ctx = { messageId: row.id, clientMsgId: row.clientMsgId };
     if (row.clientMsgId === null || row.group.gatewayGroupId === null) {
@@ -1028,7 +1059,7 @@ export async function resolveUnknown(
         deps,
       );
       stats.failed += 1;
-      continue;
+      return;
     }
     // 404 反映的是查询**发出**时的状态：窗口按发出时刻算。按响应到达时刻算的话，窗口末尾发出的查询
     // 慢慢回来一个 404，而消息恰在两者之间落地 —— 那就是「确认没发出」之前的重发（A2）。
@@ -1043,7 +1074,7 @@ export async function resolveUnknown(
       // 查询不可用 ≠ 没发出：保持 unknown
       log?.warn({ ...ctx, err }, "by-client-id 查询不可用，保持 unknown");
       stats.pending += 1;
-      continue;
+      return;
     }
     if (landing) {
       await recordSent(
@@ -1052,57 +1083,104 @@ export async function resolveUnknown(
         deps,
       );
       stats.sent += 1;
-      continue;
+      return;
     }
     const since = row.unknownSince ?? row.updatedAt;
     if (queriedAt.getTime() - since.getTime() <= UNKNOWN_CONFIRM_MS) {
       stats.pending += 1;
-      continue;
+      return;
     }
-    if (row.resendCount === 0) {
-      const changed = await getDb().$transaction(async (tx) => {
-        // 条件带上读到的 resendCount / unknownSince：多副本下别的副本可能已经确认、重发过一次、这条又进了 unknown，
-        // 拿着旧快照的这一次不能再把它放回 queued（那是第三次发送）
-        const n = await tx.message.updateMany({
-          where: {
-            id: row.id,
-            deliveryStatus: "unknown",
-            resendCount: 0,
-            unknownSince: row.unknownSince,
-          },
-          data: {
-            deliveryStatus: "queued",
-            resendCount: 1,
-            unknownSince: null,
-            nextAttemptAt: null,
-            lastError: `${NETWORK_TIMEOUT_CODE}: 确认未发出，重发一次`,
-          },
-        });
-        if (n.count > 0) {
-          const fresh = await tx.message.findUniqueOrThrow({
-            where: { id: row.id },
-          });
-          await emitMessageEvent(tx, fresh);
-        }
-        return n.count;
-      });
-      if (changed > 0) {
-        log?.info(ctx, "确认未发出，用同一 clientMsgId 重发一次");
-        stats.requeued += 1;
-      }
-      continue;
+    if (row.resendCount > 0) {
+      await recordFailed(
+        row.id,
+        null,
+        NETWORK_TIMEOUT_CODE,
+        { from: ["unknown"] },
+        deps,
+      );
+      log?.warn(ctx, "重发后仍未发出，failed NETWORK_TIMEOUT");
+      stats.failed += 1;
+      return;
     }
-    await recordFailed(
-      row.id,
-      null,
-      NETWORK_TIMEOUT_CODE,
-      { from: ["unknown"] },
-      deps,
-    );
-    log?.warn(ctx, "重发后仍未发出，failed NETWORK_TIMEOUT");
-    stats.failed += 1;
-  }
+    const claimed = await requeueForResend(row, deps);
+    if (claimed === "stale") return;
+    log?.info(ctx, "确认未发出，用同一 clientMsgId 重发一次");
+    stats.requeued += 1;
+    if (claimed === "deferred") return;
+    const outcome = await dispatchOne(claimed, deps);
+    stats.resends[outcome] += 1;
+  };
+
+  await Promise.all(rows.map(confirmOne));
   return stats;
+}
+
+/**
+ * 确认没发出的 unknown 行 → queued（resendCount = 1）。条件带上读到的 resendCount / unknownSince：多副本下别的副本
+ * 可能已经确认、重发过一次、这条又进了 unknown，拿着旧快照的这一次不能再把它放回 queued（那是第三次发送）→ "stale"。
+ * 同一事务里由本 worker 直接领取（与 claimBatch 同样的标记 + 投递记录），返回可派发的 ClaimedMessage；
+ * 账号还在限流期内的不领取（派发循环到期再领）→ "deferred"。
+ */
+async function requeueForResend(
+  row: Message & { group: { gatewayGroupId: string | null } },
+  deps: DispatchDeps,
+): Promise<ClaimedMessage | "deferred" | "stale"> {
+  const now = (deps.clock ?? systemClock).now();
+  return getDb().$transaction(async (tx) => {
+    const account = await tx.$queryRaw<
+      { status: string; rate_limited_until: Date | null }[]
+    >`SELECT status, rate_limited_until FROM accounts WHERE id = ${row.accountId} FOR SHARE`;
+    const rateLimited =
+      account[0]?.status === "rate_limited" &&
+      (account[0].rate_limited_until?.getTime() ?? 0) > now.getTime();
+    const n = await tx.message.updateMany({
+      where: {
+        id: row.id,
+        deliveryStatus: "unknown",
+        resendCount: 0,
+        unknownSince: row.unknownSince,
+      },
+      data: {
+        deliveryStatus: "queued",
+        resendCount: 1,
+        unknownSince: null,
+        nextAttemptAt: null,
+        lastError: `${NETWORK_TIMEOUT_CODE}: 确认未发出，重发一次`,
+        ...(rateLimited
+          ? {}
+          : {
+              claimedBy: deps.workerId,
+              lockedAt: now,
+              attempts: { increment: 1 },
+            }),
+      },
+    });
+    if (n.count === 0) return "stale" as const;
+    const fresh = await tx.message.findUniqueOrThrow({ where: { id: row.id } });
+    await emitMessageEvent(tx, fresh);
+    if (rateLimited) return "deferred" as const;
+    await tx.outboundAttempt.create({
+      data: {
+        messageId: fresh.id,
+        attemptNo: fresh.attempts,
+        isResend: true,
+        startedAt: now,
+      },
+    });
+    if (fresh.clientMsgId === null || fresh.accountId === null) {
+      throw new Error(`出站行 ${fresh.id} 缺少 clientMsgId / accountId`);
+    }
+    return {
+      id: fresh.id,
+      clientMsgId: fresh.clientMsgId,
+      groupId: fresh.groupId,
+      gatewayGroupId: row.group.gatewayGroupId,
+      accountId: fresh.accountId,
+      text: fresh.text,
+      attempts: fresh.attempts,
+      resendCount: fresh.resendCount,
+    };
+  });
 }
 
 // ---- 回收：领取者死了 ----------------------------------------------------------------------
@@ -1127,25 +1205,39 @@ export async function recoverStaleClaims(
       select: { id: true },
     });
     if (stale.length === 0) return [];
-    await tx.outboundAttempt.updateMany({
-      where: { messageId: { in: stale.map((s) => s.id) }, finishedAt: null },
-      data: { finishedAt: now, httpStatus: null, errorCode: CLAIM_LOST_CODE },
-    });
-    await tx.message.updateMany({
-      where: { id: { in: stale.map((s) => s.id) } },
-      data: {
-        deliveryStatus: "unknown",
-        unknownSince: now,
-        claimedBy: null,
-        lockedAt: null,
-        lastError: "领取后未记账（领取者可能死在发出与记账之间）",
-      },
-    });
+    // 逐条条件更新：读出来之后，慢但还活着的领取者可能刚记下结果（accepted / failed / 回 queued）或续了约 ——
+    // 只改仍然 queued、仍被领着、lockedAt 仍早于阈值的行，不覆盖别人的结果
+    const recovered: string[] = [];
     for (const s of stale) {
+      const { count } = await tx.message.updateMany({
+        where: {
+          id: s.id,
+          deliveryStatus: "queued",
+          claimedBy: { not: null },
+          lockedAt: { lt: cutoff },
+        },
+        data: {
+          deliveryStatus: "unknown",
+          unknownSince: now,
+          claimedBy: null,
+          lockedAt: null,
+          lastError: "领取后未记账（领取者可能死在发出与记账之间）",
+        },
+      });
+      if (count === 0) continue;
+      recovered.push(s.id);
+      await tx.outboundAttempt.updateMany({
+        where: { messageId: s.id, finishedAt: null },
+        data: {
+          finishedAt: now,
+          httpStatus: null,
+          errorCode: CLAIM_LOST_CODE,
+        },
+      });
       const fresh = await tx.message.findUniqueOrThrow({ where: { id: s.id } });
       await emitMessageEvent(tx, fresh);
     }
-    return stale.map((s) => s.id);
+    return recovered;
   });
   if (ids.length > 0) {
     deps.log?.warn({ messageIds: ids }, "回收过期领取：转 unknown 待确认");

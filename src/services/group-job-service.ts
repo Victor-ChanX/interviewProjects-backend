@@ -62,6 +62,7 @@ import type { Clock } from "../core/clock.js";
 import type { Logger } from "../core/logger.js";
 import { getDb } from "../db/client.js";
 import type { Job, JobStepKind, Prisma } from "../db/generated/client.js";
+import { enterTerminalFromGatewayError } from "./account-service.js";
 import {
   type GatewayClient,
   GatewayResponseError,
@@ -453,6 +454,21 @@ type BaseCtx = {
   deps: JobServiceDeps;
 };
 
+/**
+ * 网关以账号终态码（ACCOUNT_SUSPENDED / SESSION_EXPIRED）拒绝了某个账号的请求：账号进终态（A2 错误表对所有请求
+ * 适用，不只 send；级联把它移出所有群、取消排队的发送）。之后照常按这一步的拒绝处理。
+ */
+async function noteAccountTerminal(
+  ctx: BaseCtx,
+  accountId: string,
+  err: unknown,
+): Promise<void> {
+  await enterTerminalFromGatewayError(accountId, err, {
+    clock: ctx.deps.clock,
+    log: ctx.deps.log,
+  });
+}
+
 type StepCtx = BaseCtx & {
   input: CreateGroupJobInput;
   state: CreateGroupState;
@@ -538,6 +554,7 @@ async function stepCreate(ctx: StepCtx): Promise<StepOutcome> {
       creatorAccountId: input.creatorAccountId,
     });
   } catch (err) {
+    await noteAccountTerminal(ctx, input.creatorAccountId, err);
     return onGatewayError(ctx, err, { step: "create", accountId: null });
   }
 
@@ -669,6 +686,7 @@ async function joinRequest(
       inviteLink: state.invite.link,
     });
   } catch (err) {
+    await noteAccountTerminal(ctx, accountId, err);
     if (err instanceof GatewayResponseError) {
       switch (err.code) {
         case "ALREADY_MEMBER":
@@ -934,6 +952,7 @@ async function stepPromote(ctx: StepCtx): Promise<StepOutcome> {
       accountId: target,
     });
   } catch (err) {
+    await noteAccountTerminal(ctx, input.creatorAccountId, err);
     if (err instanceof GatewayResponseError) {
       if (
         err.code === "NOT_MEMBER_YET" &&
@@ -1264,6 +1283,7 @@ async function leaveOne(
   try {
     await deps.gateway.leave(gatewayGroupId, { accountId });
   } catch (err) {
+    await noteAccountTerminal(ctx, accountId, err);
     if (err instanceof GatewayResponseError && !isTransientGatewayError(err)) {
       // 500（没退成）/ 409 ACCOUNT_OFFLINE / 其他 4xx：明确失败，记 errors，继续下一位
       return leaveFailed(ctx, accountId, err.code, err.message);

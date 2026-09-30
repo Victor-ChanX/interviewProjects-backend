@@ -80,6 +80,8 @@ export type TransitionSource =
   | "gateway_event"
   | "send_error"
   | "connect_error"
+  /** 建群 / 入群 / 提升 / 退群 / 踢人等请求被网关以 ACCOUNT_SUSPENDED / SESSION_EXPIRED 拒绝 */
+  | "request_error"
   | "rate_limit_worker";
 
 export type TransitionInput = {
@@ -368,27 +370,6 @@ export async function cancelQueuedSends(
   return { messagesCancelled: messages.count, stepsSkipped: steps.count };
 }
 
-/** 读 → 按当前状态转移；撞 CAS_CONFLICT（别人刚改过）就重读再试，最多 attempts 次。 */
-async function withCasRetry<T>(
-  attempts: number,
-  fn: () => Promise<T>,
-): Promise<T> {
-  for (let i = 1; ; i++) {
-    try {
-      return await fn();
-    } catch (err) {
-      if (
-        i < attempts &&
-        err instanceof DomainError &&
-        err.code === "CAS_CONFLICT"
-      ) {
-        continue;
-      }
-      throw err;
-    }
-  }
-}
-
 /**
  * 进终态的统一入口：网关事件（account_status / message_failed）、发送错误（ACCOUNT_SUSPENDED / SESSION_EXPIRED）、
  * connect 被拒都从这里进 —— 它们没有「操作员看到的旧状态」，expectedFrom 取当前状态；
@@ -423,6 +404,17 @@ export async function enterTerminalInTx(
 ): Promise<TransitionResult> {
   await tx.$queryRaw`SELECT id FROM accounts WHERE id = ${accountId} FOR UPDATE`;
   const row = await findAccountOrThrow(tx, accountId);
+  // 已经是（任一个）终态：目的已达成，静默忽略。终态之间没有边，但网关事件 / 发送错误晚于另一个终态到达
+  // （例如操作员先标了 session_expired，网关再报 ACCOUNT_SUSPENDED）不能抛错 —— 抛了会把调用方同一事务里的
+  // 记账一起回滚、让这条事件反复失败（A1：重复进入终态不影响后续事件处理）。操作员手动转移仍走 transition() 的转移表。
+  if (isTerminal(row.status)) {
+    return {
+      account: row,
+      from: row.status,
+      changed: false,
+      cascade: NO_CASCADE,
+    };
+  }
   return transitionInTx(
     tx,
     accountId,
@@ -445,43 +437,81 @@ export async function enterRateLimited(
   deps: TransitionDeps & { source?: TransitionSource } = {},
 ): Promise<TransitionResult> {
   const clock = deps.clock ?? systemClock;
-  const db = getDb();
-  return withCasRetry(3, async () => {
-    const until = new Date(clock.now().getTime() + retryAfterSeconds * 1000);
-    const row = await findAccountOrThrow(db, accountId);
-    if (row.status === "rate_limited") {
-      const refreshed = await db.account.updateMany({
-        where: { id: accountId, version: row.version },
-        data: { rateLimitedUntil: until, version: { increment: 1 } },
-      });
-      if (refreshed.count === 0) {
-        throw casConflict(accountId, row.status, row.status);
-      }
-      const account = await db.account.findUniqueOrThrow({
-        where: { id: accountId },
-      });
-      deps.log?.info(
-        { accountId, rateLimitedUntil: until.toISOString() },
-        "限流截止已刷新",
-      );
-      return {
-        account,
-        from: row.status,
-        changed: false,
-        cascade: NO_CASCADE,
-      };
-    }
-    return transition(
-      accountId,
-      {
-        to: "rate_limited",
-        expectedFrom: row.status,
-        source: deps.source ?? "send_error",
-        rateLimitSeconds: retryAfterSeconds,
-      },
-      deps,
+  const source = deps.source ?? "send_error";
+  const result = await getDb().$transaction((tx) =>
+    enterRateLimitedInTx(tx, accountId, retryAfterSeconds, source, clock.now()),
+  );
+  if (result === null) {
+    const row = await findAccountOrThrow(getDb(), accountId);
+    throw new Conflict(
+      "ILLEGAL_TRANSITION",
+      `账号不能从 ${row.status} 转到 rate_limited`,
+      { accountId, from: row.status, to: "rate_limited" },
     );
-  });
+  }
+  logRateLimited(accountId, source, result, deps.log);
+  return result;
+}
+
+/**
+ * enterRateLimited 的事务体（出站派发把「账号限流」与「这条回 queued 排到期」放进同一个事务）。先锁账号行；
+ * 当前状态不允许转 rate_limited（idle / disconnected / 终态）返回 null，不抛 —— 抛了会回滚调用方的记账。
+ * commit 之后调用方调 logRateLimited。
+ */
+export async function enterRateLimitedInTx(
+  tx: Prisma.TransactionClient,
+  accountId: string,
+  retryAfterSeconds: number,
+  source: TransitionSource,
+  now: Date,
+): Promise<TransitionResult | null> {
+  await tx.$queryRaw`SELECT id FROM accounts WHERE id = ${accountId} FOR UPDATE`;
+  const row = await findAccountOrThrow(tx, accountId);
+  if (row.status === "rate_limited") {
+    await tx.account.update({
+      where: { id: accountId },
+      data: {
+        rateLimitedUntil: new Date(now.getTime() + retryAfterSeconds * 1000),
+        version: { increment: 1 },
+      },
+    });
+    const account = await tx.account.findUniqueOrThrow({
+      where: { id: accountId },
+    });
+    return { account, from: row.status, changed: false, cascade: NO_CASCADE };
+  }
+  if (!canTransition(row.status, "rate_limited")) return null;
+  return transitionInTx(
+    tx,
+    accountId,
+    {
+      to: "rate_limited",
+      expectedFrom: row.status,
+      source,
+      rateLimitSeconds: retryAfterSeconds,
+    },
+    now,
+  );
+}
+
+/** enterRateLimitedInTx 的业务日志：调用方在 commit 之后调。 */
+export function logRateLimited(
+  accountId: string,
+  source: TransitionSource,
+  result: TransitionResult,
+  log: TransitionDeps["log"],
+): void {
+  if (result.changed) {
+    logTransition(accountId, "rate_limited", source, result, log);
+  } else {
+    log?.info(
+      {
+        accountId,
+        rateLimitedUntil: result.account.rateLimitedUntil?.toISOString(),
+      },
+      "限流截止已刷新",
+    );
+  }
 }
 
 /**
@@ -598,6 +628,20 @@ export async function connect(
 }
 
 /** 网关对账号请求回的两种「永久不可用」码 → 对应终态；其余返回 undefined。 */
+/**
+ * 任何账号维度的网关请求（建群 / 入群 / 提升 / 退群 / 踢人）被以 ACCOUNT_SUSPENDED / SESSION_EXPIRED 拒绝：
+ * 账号进终态（A2 错误表对所有请求适用，不只 send）。不是这两个码返回 null。
+ */
+export async function enterTerminalFromGatewayError(
+  accountId: string,
+  err: unknown,
+  deps: TransitionDeps = {},
+): Promise<TransitionResult | null> {
+  const terminal = terminalFromGatewayError(err);
+  if (!terminal) return null;
+  return enterTerminal(accountId, terminal, "request_error", deps);
+}
+
 export function terminalFromGatewayError(
   err: unknown,
 ): TerminalStatus | undefined {

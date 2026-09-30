@@ -584,10 +584,32 @@ describe("accounts", () => {
       expect(
         await getDb().groupMember.count({ where: { accountId: account.id } }),
       ).toBe(1);
-      // 终态之间也没有边：suspended 的账号来一条 session_expired 事件是冲突，不是覆盖
-      await expect(
-        enterTerminal(account.id, "session_expired", "gateway_event"),
-      ).rejects.toMatchObject({ code: "ILLEGAL_TRANSITION" });
+      // 终态之间没有边，但来自网关 / 发送错误的「另一个终态」不能抛错（会把调用方的记账一起回滚、事件反复失败）：
+      // 静默忽略，状态保持 suspended、不再发事件
+      const other = await enterTerminal(
+        account.id,
+        "session_expired",
+        "gateway_event",
+      );
+      expect(other).toMatchObject({ changed: false, from: "suspended" });
+      expect(
+        (await getDb().account.findUniqueOrThrow({ where: { id: account.id } }))
+          .status,
+      ).toBe("suspended");
+      expect(await wsEvents()).toHaveLength(eventsBefore.length);
+      // 操作员手动转移仍按转移表：终态没有出边
+      const manual = await post(
+        `/api/accounts/${account.id}/transition`,
+        admin,
+        {
+          to: "session_expired",
+          expectedFrom: "suspended",
+        },
+      );
+      expect(manual.statusCode).toBe(409);
+      expect(manual.json()).toMatchObject({
+        error: { code: "ILLEGAL_TRANSITION" },
+      });
     });
   });
 

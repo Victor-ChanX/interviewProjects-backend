@@ -20,6 +20,7 @@ import {
   createGatewayClient,
   type GatewayClient,
   type GatewayEvent,
+  GatewayResponseError,
 } from "../src/services/gateway-client.js";
 import {
   JOB_ERROR_CODES,
@@ -178,10 +179,16 @@ describe("建群 job（#11）", () => {
     return { creator, members, jobId, groupId: job.groupId! };
   }
 
-  const tick = (opts: { workerId?: string; maxStepsPerJob?: number } = {}) =>
+  const tick = (
+    opts: {
+      workerId?: string;
+      maxStepsPerJob?: number;
+      gateway?: GatewayClient;
+    } = {},
+  ) =>
     runJobTick({
       clock,
-      gateway: gatewayClient,
+      gateway: opts.gateway ?? gatewayClient,
       workerId: opts.workerId ?? "w1",
       log: silent,
       maxStepsPerJob: opts.maxStepsPerJob,
@@ -496,6 +503,31 @@ describe("建群 job（#11）", () => {
     const s = await stateOf(jobId);
     expect(members.map((m) => s.joins[m]!.inviteRetries)).toEqual([1, 1]);
     expect((await simState()).invites).toHaveLength(3);
+  });
+
+  it("入群时网关以 ACCOUNT_SUSPENDED 拒绝：该账号进 suspended（A2 错误表对所有请求适用），这一步记 errors", async () => {
+    const { members, jobId } = await createJob(1);
+    const suspendedJoin: GatewayClient = {
+      ...gatewayClient,
+      async joinGroup() {
+        throw new GatewayResponseError("POST", "/join", 403, {
+          code: "ACCOUNT_SUSPENDED",
+        });
+      },
+    };
+    for (let i = 0; i < 5; i++) await tick({ gateway: suspendedJoin });
+    expect(
+      (await getDb().account.findUniqueOrThrow({ where: { id: members[0]! } }))
+        .status,
+    ).toBe("suspended");
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/jobs/${jobId}`,
+      headers: admin,
+    });
+    expect(briefErrors(res.json<JobBody>())).toEqual([
+      { step: `join:${members[0]}`, code: "ACCOUNT_SUSPENDED" },
+    ]);
   });
 
   // ---- join 等待 ------------------------------------------------------------------------

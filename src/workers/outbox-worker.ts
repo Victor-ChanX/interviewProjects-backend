@@ -62,7 +62,21 @@ export async function runOutboxTick(
 ): Promise<OutboxTickStats> {
   const confirmed = await runConfirmTick(deps);
   const stats = await runDispatchTick(deps);
-  return { ...stats, ...confirmed };
+  // 确认循环里当场重发的也算进这一个 tick 的派发（「确认未发出 → 重发」落在同一个 tick 里）
+  const resent = Object.values(confirmed.resends).reduce((a, b) => a + b, 0);
+  const outcomes = { ...stats.outcomes };
+  for (const [k, v] of Object.entries(confirmed.resends) as [
+    DispatchOutcome,
+    number,
+  ][]) {
+    outcomes[k] += v;
+  }
+  return {
+    recovered: confirmed.recovered,
+    unknownChecked: confirmed.unknownChecked,
+    claimed: stats.claimed + resent,
+    outcomes,
+  };
 }
 
 function serviceDepsOf(deps: OutboxTickDeps) {
@@ -76,12 +90,25 @@ function serviceDepsOf(deps: OutboxTickDeps) {
   };
 }
 
-/** 回收过期领取 → unknown 按 by-client-id 确认；返回回收了几条、查了几条。 */
-export async function runConfirmTick(
-  deps: OutboxTickDeps,
-): Promise<{ recovered: number; unknownChecked: number }> {
+/** 回收过期领取 → unknown 按 by-client-id 确认（确认没发出的当场重发）；返回回收 / 查了几条与重发结果。 */
+export async function runConfirmTick(deps: OutboxTickDeps): Promise<{
+  recovered: number;
+  unknownChecked: number;
+  resends: Record<DispatchOutcome, number>;
+}> {
   const serviceDeps = serviceDepsOf(deps);
-  const result = { recovered: 0, unknownChecked: 0 };
+  const result = {
+    recovered: 0,
+    unknownChecked: 0,
+    resends: {
+      accepted: 0,
+      failed: 0,
+      cancelled: 0,
+      unknown: 0,
+      requeued: 0,
+      lost: 0,
+    } as Record<DispatchOutcome, number>,
+  };
   try {
     result.recovered = await recoverStaleClaims(deps.clock.now(), serviceDeps);
   } catch (err) {
@@ -93,6 +120,7 @@ export async function runConfirmTick(
       deps.batchSize ?? DEFAULT_BATCH_SIZE,
     );
     result.unknownChecked = r.checked;
+    result.resends = r.resends;
   } catch (err) {
     serviceDeps.log.error({ err }, "确认 unknown 失败");
   }
