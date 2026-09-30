@@ -880,7 +880,7 @@ describe("accounts", () => {
       });
     });
 
-    it("网关整体 503 → 502 GATEWAY_ERROR，本地状态不变", async () => {
+    it("网关整体 503 → 503 GATEWAY_ERROR，本地状态不变", async () => {
       const account = await accountIn("idle");
       await gateway.inject({
         method: "POST",
@@ -888,7 +888,7 @@ describe("accounts", () => {
         payload: { outage: { all: true } },
       });
       const res = await post(`/api/accounts/${account.id}/connect`, admin);
-      expect(res.statusCode).toBe(502);
+      expect(res.statusCode).toBe(503);
       expect(res.json()).toMatchObject({
         error: { code: "GATEWAY_ERROR", gatewayStatus: 503 },
       });

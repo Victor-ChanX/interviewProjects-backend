@@ -10,7 +10,7 @@
 // 用全局 fetch（tests/setup.ts 的 MockAgent 只接管它）；测试经 buildApp({ llmAdmin }) 注入指向本地实例的客户端。
 import { config } from "../core/config.js";
 import {
-  BadGateway,
+  ServiceUnavailable,
   Conflict,
   Invalid,
   type ErrorCode,
@@ -180,7 +180,7 @@ function toDomainError(res: Exclude<AdminResponse, { kind: "ok" }>): Error {
     return new Invalid(res.code as ErrorCode, res.message);
   }
   if (res.status === 401) {
-    return new BadGateway(
+    return new ServiceUnavailable(
       "LLM_UPSTREAM_ERROR",
       "llm-agent 拒绝了管理令牌：后端与 llm-agent 的 LLM_AGENT_ADMIN_TOKEN 要一致",
     );
@@ -188,13 +188,13 @@ function toDomainError(res: Exclude<AdminResponse, { kind: "ok" }>): Error {
   if (res.status === 400) {
     return new Invalid("VALIDATION_ERROR", res.message);
   }
-  return new BadGateway("LLM_UPSTREAM_ERROR", res.message);
+  return new ServiceUnavailable("LLM_UPSTREAM_ERROR", res.message);
 }
 
 const isProvider = (v: unknown): v is LlmProvider =>
   v === "anthropic" || v === "gemini";
 
-/** llm-agent 的 /admin/config 响应 → LlmConfigView（形状不对按 502：对方版本不匹配） */
+/** llm-agent 的 /admin/config 响应 → LlmConfigView（形状不对按 503：对方版本不匹配） */
 function toView(body: unknown): LlmConfigView {
   const nullableString = (v: unknown): string | null =>
     typeof v === "string" ? v : null;
@@ -203,7 +203,7 @@ function toView(body: unknown): LlmConfigView {
     (body.source !== "file" && body.source !== "none") ||
     (body.provider !== null && !isProvider(body.provider))
   ) {
-    throw new BadGateway(
+    throw new ServiceUnavailable(
       "LLM_UPSTREAM_ERROR",
       "llm-agent 返回的配置形状不对，确认两边是同一版本",
     );
@@ -262,7 +262,7 @@ export async function listLlmModels(
   const models =
     isRecord(res.body) && Array.isArray(res.body.items) ? res.body.items : null;
   if (!models) {
-    throw new BadGateway(
+    throw new ServiceUnavailable(
       "LLM_UPSTREAM_ERROR",
       "llm-agent 返回的模型列表形状不对",
     );
@@ -292,7 +292,7 @@ export async function testLlmConnection(
     typeof b.ok !== "boolean" ||
     typeof b.message !== "string"
   ) {
-    throw new BadGateway(
+    throw new ServiceUnavailable(
       "LLM_UPSTREAM_ERROR",
       "llm-agent 返回的测试结果形状不对",
     );

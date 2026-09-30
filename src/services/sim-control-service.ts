@@ -9,7 +9,12 @@
 // 开关 SIM_CONTROLS_ENABLED（默认关）：关着时 simControlClientFromConfig() 返回 null，端点一律 409，
 // 后端不碰 /_sim/*。真网关没有这个接口，所以只该在 GATEWAY_URL 指向模拟器时打开。
 import { config } from "../core/config.js";
-import { BadGateway, Conflict, Invalid, NotFound } from "../core/errors.js";
+import {
+  ServiceUnavailable,
+  Conflict,
+  Invalid,
+  NotFound,
+} from "../core/errors.js";
 import type { Logger } from "../core/logger.js";
 import { getDb } from "../db/client.js";
 import type {
@@ -50,13 +55,13 @@ export function createSimControlClient(opts: {
           signal: AbortSignal.timeout(SIM_TIMEOUT_MS),
         });
       } catch {
-        throw new BadGateway(
+        throw new ServiceUnavailable(
           "GATEWAY_ERROR",
           "连不上网关模拟器（GATEWAY_URL），确认它已启动",
         );
       }
       if (!res.ok) {
-        throw new BadGateway(
+        throw new ServiceUnavailable(
           "GATEWAY_ERROR",
           res.status === 404
             ? "网关模拟器不认识这个群，或 GATEWAY_URL 指向的不是模拟器"
@@ -83,7 +88,7 @@ export function getSimControls(
 /**
  * 以外部成员身份往群里推一条消息（经模拟器，异步进入时间线）。
  * 拒绝：开关关着 409 SIM_CONTROLS_DISABLED · 群不存在 404 · 群还没在网关建好 / 已退出 409 GROUP_UNREACHABLE ·
- * 发送者是本平台托管账号 422 SIM_SENDER_IS_MANAGED · 模拟器不可达 / 拒绝 502 GATEWAY_ERROR。
+ * 发送者是本平台托管账号 422 SIM_SENDER_IS_MANAGED · 模拟器不可达 / 拒绝 503 GATEWAY_ERROR。
  */
 export async function simulateInbound(
   groupId: string,

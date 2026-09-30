@@ -16,7 +16,7 @@ export type ErrorCode =
   | "ILLEGAL_TRANSITION"
   | "CAS_CONFLICT"
   | "ACCOUNT_UNAVAILABLE"
-  // 网关整体不可用 / 网络错（502）：不是业务拒绝，前端按它提示「稍后再试」
+  // 网关整体不可用 / 网络错（503）：不是业务拒绝，前端按它提示「稍后再试」
   | "GATEWAY_ERROR"
   // ---- 群消息时间线（#9，题目 2.3 GET /api/groups/:id/messages）----
   | "GROUP_NOT_FOUND"
@@ -51,7 +51,7 @@ export type ErrorCode =
   | "LLM_API_KEY_REQUIRED"
   // 服务商对这个 key 回 401 / 403（422：换个 key 就能过）
   | "LLM_UPSTREAM_UNAUTHORIZED"
-  // 服务商或 llm-agent 不可用、超时、回了不可理解的东西（502）
+  // 服务商或 llm-agent 不可用、超时、回了不可理解的东西（503）
   | "LLM_UPSTREAM_ERROR"
   // AGENT_URL 指向的服务没有管理端点（例如 Agent 模拟器），或没配 LLM_AGENT_ADMIN_TOKEN（409：切到 llm-agent 后就能用）
   | "LLM_AGENT_UNSUPPORTED"
@@ -134,15 +134,17 @@ export class Invalid extends DomainError {
 }
 
 /**
- * 502：请求本身没问题，是依赖的外部服务（消息网关 / Agent 服务）不可用或回了不可理解的东西。
+ * 503：请求本身没问题，是依赖的外部服务（消息网关 / 网关模拟器 / Agent 服务 / 模型服务商）不可用或回了不可理解的东西。
  * 不是业务拒绝，前端按它提示「稍后再试」；结果未知的外部调用不在这里翻译，走 outbox 的 unknown。
+ * 为什么不用 502：线上站点走 Cloudflare，源站的 502 响应体会被 Cloudflare 整个换成它自己的错误页，
+ * message 里写给人看的原因到不了控制台（后端 #50）；503 原样转发。
  */
-export class BadGateway extends DomainError {
+export class ServiceUnavailable extends DomainError {
   constructor(
     code: ErrorCode = "GATEWAY_ERROR",
     message = "外部服务暂时不可用，请稍后再试",
     extra?: ErrorExtra,
   ) {
-    super(502, code, message, extra);
+    super(503, code, message, extra);
   }
 }

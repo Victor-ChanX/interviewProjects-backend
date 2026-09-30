@@ -282,7 +282,7 @@ describe("LLM 设置 /api/llm/*（#19）", () => {
     ).toMatchObject({ provider: "anthropic", model: "m2" });
   });
 
-  it("上游错误码：401 → 422 LLM_UPSTREAM_UNAUTHORIZED；5xx → 502 LLM_UPSTREAM_ERROR；形状错 → 400", async () => {
+  it("上游错误码：401 → 422 LLM_UPSTREAM_UNAUTHORIZED；5xx → 503 LLM_UPSTREAM_ERROR；形状错 → 400", async () => {
     fake.modelsScript.push({
       status: 401,
       body: A.apiError("authentication_error", `invalid key ${API_KEY}`),
@@ -306,7 +306,7 @@ describe("LLM 设置 /api/llm/*（#19）", () => {
       provider: "anthropic",
       apiKey: API_KEY,
     });
-    expect(down.statusCode).toBe(502);
+    expect(down.statusCode).toBe(503);
     expect(down.json()).toMatchObject({
       error: { code: "LLM_UPSTREAM_ERROR" },
     });
@@ -380,7 +380,7 @@ describe("LLM 设置 /api/llm/*（#19）", () => {
       await bare.close();
     });
 
-    it("两边令牌不一致 → 502 LLM_UPSTREAM_ERROR，提示检查令牌", async () => {
+    it("两边令牌不一致 → 503 LLM_UPSTREAM_ERROR，提示检查令牌", async () => {
       const wrong = await buildApp({
         logger: false,
         llmAdmin: createLlmAdminClient({
@@ -390,7 +390,7 @@ describe("LLM 设置 /api/llm/*（#19）", () => {
       });
       const wrongAdmin = await loginAs(wrong, "admin");
       const res = await call(wrong, "GET", "/api/llm/settings", wrongAdmin);
-      expect(res.statusCode).toBe(502);
+      expect(res.statusCode).toBe(503);
       expect(res.json()).toMatchObject({
         error: { code: "LLM_UPSTREAM_ERROR" },
       });

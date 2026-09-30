@@ -16,7 +16,12 @@
 // 外部副作用不在事务里：标 idle / disconnected 时的网关 disconnect 在 commit 之后调，失败只记日志
 // （本地状态是真相：账号已被本地标离线，出站 worker 不会再用它发消息；网关侧多挂一会儿没有后果）。
 import { type Clock, systemClock } from "../core/clock.js";
-import { BadGateway, Conflict, DomainError, NotFound } from "../core/errors.js";
+import {
+  ServiceUnavailable,
+  Conflict,
+  DomainError,
+  NotFound,
+} from "../core/errors.js";
 import type { Logger } from "../core/logger.js";
 import { getDb } from "../db/client.js";
 import type { Account, AccountStatus, Prisma } from "../db/generated/client.js";
@@ -562,7 +567,7 @@ export async function recoverRateLimited(
  * - 终态账号：409 ACCOUNT_UNAVAILABLE（重连也不能恢复），不打网关；
  * - online / rate_limited：已经连着，409 ILLEGAL_TRANSITION；
  * - 网关回 403 ACCOUNT_SUSPENDED / 401 SESSION_EXPIRED：账号进相应终态（级联），再对外 409 ACCOUNT_UNAVAILABLE；
- * - 网关不可用（503 / 连不上 / 超时）：502 GATEWAY_ERROR，本地状态不变；
+ * - 网关不可用（503 / 连不上 / 超时）：503 GATEWAY_ERROR，本地状态不变；
  * - 网关 connect 成功后本地 CAS 失败（期间被标了别的状态）：CAS_CONFLICT 原样抛出 —— 网关侧多了个在线标记，
  *   但本地是真相，账号不会被用来发消息。
  */
@@ -607,12 +612,16 @@ export async function connect(
       throw err;
     }
     deps.log?.warn({ err, accountId }, "网关 connect 失败");
-    throw new BadGateway("GATEWAY_ERROR", "消息网关暂时不可用，请稍后再试", {
-      accountId,
-      ...(err instanceof GatewayResponseError
-        ? { gatewayStatus: err.status, gatewayCode: err.code }
-        : {}),
-    });
+    throw new ServiceUnavailable(
+      "GATEWAY_ERROR",
+      "消息网关暂时不可用，请稍后再试",
+      {
+        accountId,
+        ...(err instanceof GatewayResponseError
+          ? { gatewayStatus: err.status, gatewayCode: err.code }
+          : {}),
+      },
+    );
   }
 
   return transition(

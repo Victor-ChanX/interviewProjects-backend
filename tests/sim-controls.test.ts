@@ -184,13 +184,13 @@ describe("模拟外部成员发言（#46）", () => {
     expect((await simState()).messages).toEqual([]);
   });
 
-  it("模拟器不认识这个群（换过网关 / 模拟器重启清空）→ 502 GATEWAY_ERROR", async () => {
+  it("模拟器不认识这个群（换过网关 / 模拟器重启清空）→ 503 GATEWAY_ERROR", async () => {
     const group = await makeGroup({ gatewayGroupId: "g_not_on_simulator" });
     const res = await push(app, group.id, {
       senderPlatformUserId: "ext-alice",
       text: "hi",
     });
-    expect(res.statusCode).toBe(502);
+    expect(res.statusCode).toBe(503);
     expect(res.json<ErrorBody>().error.code).toBe("GATEWAY_ERROR");
   });
 });
