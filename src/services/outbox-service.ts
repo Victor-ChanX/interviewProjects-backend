@@ -9,7 +9,7 @@
 // - 记账（record*）：都是条件更新 `where { id, deliveryStatus, claimedBy }`——级联（账号进终态 / 群不可写）
 //   可能已在途中把行置 cancelled，这时 count = 0：不覆盖，只释放领取标记。状态变化都在同一事务里写 ws_events。
 // - 结果不明（504 / 客户端超时 / 连接被重置 / 领取者死在发出与记账之间）→ unknown，**确认对方没收到之前不重发**：
-//   resolveUnknown 每 tick 按 by-client-id 查，200 → sent；404 且超过 2 秒 → 确认没发出：用同一个 clientMsgId
+//   resolveUnknown 每 tick 按 by-client-id 查，200 → sent；查询发出时已过 2 秒仍 404 → 确认没发出：用同一个 clientMsgId
 //   重发一次（resendCount 0 → 1），已经重发过 → failed NETWORK_TIMEOUT；查询不可用（503 / 连不上）→ 保持 unknown。
 //   tick ≤ 500ms 时「收到 504 起 5 秒内定态」：2s 确认 + 同一 tick 里重发。
 // - 网关同步错误表（A2）在 dispatchOne：429 → 账号 rate_limited + 该行回 queued（nextAttemptAt = 到期）；
@@ -860,7 +860,7 @@ async function backoffOrFail(
 
 /**
  * 每 tick 调。对每条 unknown 行查 by-client-id：
- * 200 → sent；404 且距 unknownSince 超过 2 秒 → 确认没发出：resendCount = 0 就用同一 clientMsgId 回 queued
+ * 200 → sent；404 且查询发出时距 unknownSince 已超过 2 秒 → 确认没发出：resendCount = 0 就用同一 clientMsgId 回 queued
  * （resendCount = 1，nextAttemptAt 空 → 本 tick 的领取就能发），否则 failed NETWORK_TIMEOUT；
  * 查询不可用（503 / 连不上）→ 保持 unknown，下个 tick 再看。
  */
@@ -898,6 +898,9 @@ export async function resolveUnknown(
       stats.failed += 1;
       continue;
     }
+    // 404 反映的是查询**发出**时的状态：窗口按发出时刻算。按响应到达时刻算的话，窗口末尾发出的查询
+    // 慢慢回来一个 404，而消息恰在两者之间落地 —— 那就是「确认没发出」之前的重发（A2）。
+    const queriedAt = clock.now();
     let landing: { msgId: string; sentAt: string } | null;
     try {
       landing = await gateway.getMessageByClientId(
@@ -919,9 +922,8 @@ export async function resolveUnknown(
       stats.sent += 1;
       continue;
     }
-    const now = clock.now();
     const since = row.unknownSince ?? row.updatedAt;
-    if (now.getTime() - since.getTime() <= UNKNOWN_CONFIRM_MS) {
+    if (queriedAt.getTime() - since.getTime() <= UNKNOWN_CONFIRM_MS) {
       stats.pending += 1;
       continue;
     }

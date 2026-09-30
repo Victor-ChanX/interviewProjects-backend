@@ -729,6 +729,47 @@ describe("outbox（#7）", () => {
       ]);
     });
 
+    it("by-client-id 在 2 秒内发出、2 秒后才回 404：这个 404 不算确认，不重发", async () => {
+      const { group, creator } = await stageGroup();
+      await scenario({
+        send: { responses: [{ status: 504, landAfterMs: null }] },
+      });
+      const { messageId } = await enqueue(group, creator);
+      await tick();
+
+      // 查询在第 1.8 秒发出、响应在第 2.2 秒回来：404 反映的是 1.8 秒时的状态，消息可能在那之后才落地
+      const slowLookup: GatewayClient = {
+        ...gatewayClient,
+        async getMessageByClientId(groupId, clientMsgId) {
+          const landing = await gatewayClient.getMessageByClientId(
+            groupId,
+            clientMsgId,
+          );
+          clock.advance(400);
+          return landing;
+        },
+      };
+      clock.advance(CONFIRM_WINDOW_MS - 200);
+      const s = await runOutboxTick({
+        clock,
+        gateway: slowLookup,
+        workerId: "w1",
+        log: silent,
+      });
+      expect(s.unknownChecked).toBe(1);
+      expect(s.claimed).toBe(0);
+      expect(await row(messageId)).toMatchObject({
+        deliveryStatus: "unknown",
+        resendCount: 0,
+      });
+      expect((await simState()).sendCalls).toHaveLength(1);
+
+      // 下一次查询在窗口之后发出：这次的 404 才是确认
+      const late = await tick();
+      expect(late.claimed).toBe(1);
+      expect((await row(messageId)).resendCount).toBe(1);
+    });
+
     it("重发后仍 504 + 404 → failed NETWORK_TIMEOUT，总共只重发一次", async () => {
       const { group, creator } = await stageGroup();
       await scenario({
