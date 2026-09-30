@@ -23,8 +23,11 @@ import {
   GatewayResponseError,
 } from "../src/services/gateway-client.js";
 import {
+  advanceJob,
+  claimJobs,
   JOB_ERROR_CODES,
   JOIN_POLL_MS,
+  recoverStaleJobClaims,
   STALE_CLAIM_MS,
 } from "../src/services/group-job-service.js";
 import { ingest } from "../src/services/inbound-service.js";
@@ -991,6 +994,60 @@ describe("建群 job（#11）", () => {
         },
       });
     }
+
+    it("写入防护：步骤进行中领取被回收、别的副本接手 —— 旧领取者的进度写不进去（lost），不覆盖接手者", async () => {
+      const { jobId } = await createJob(1);
+      const [claimed] = await claimJobs("w-old", clock.now());
+      expect(claimed?.id).toBe(jobId);
+      const hijacking: GatewayClient = {
+        ...gatewayClient,
+        async createGroup(input) {
+          const r = await gatewayClient.createGroup(input);
+          // 网关调用期间：领取被回收、w-new 接手（旧领取者还不知道）
+          await getDb().job.update({
+            where: { id: jobId },
+            data: { claimedBy: "w-new", lockedAt: clock.now() },
+          });
+          return r;
+        },
+      };
+      const result = await advanceJob(jobId, {
+        clock,
+        gateway: hijacking,
+        workerId: "w-old",
+        log: silent,
+      });
+      expect(result.outcome).toBe("lost");
+      const job = await getDb().job.findUniqueOrThrow({ where: { id: jobId } });
+      expect(job).toMatchObject({ claimedBy: "w-new", step: "create" });
+      expect(await getDb().jobError.count({ where: { jobId } })).toBe(0);
+    });
+
+    it("续租：连推多步时每步都刷新 lockedAt —— 前面的步骤用掉了整整一个回收期，后面的步骤进行中也不会被回收", async () => {
+      const { jobId } = await createJob(2);
+      await claimJobs("w1", clock.now());
+      let recoveredDuringJoin: number | null = null;
+      const slow: GatewayClient = {
+        ...gatewayClient,
+        async createInvite(groupId) {
+          clock.advance(STALE_CLAIM_MS + 1_000); // 这一步慢到超过回收期
+          return gatewayClient.createInvite(groupId);
+        },
+        async joinGroup(groupId, input) {
+          // 下一步进行中，另一个副本来回收：租约在这一步开始前续过，不该被回收
+          recoveredDuringJoin ??= await recoverStaleJobClaims(clock.now(), {
+            log: silent,
+          });
+          return gatewayClient.joinGroup(groupId, input);
+        },
+      };
+      await advanceJob(
+        jobId,
+        { clock, gateway: slow, workerId: "w1", log: silent },
+        { maxSteps: 3 },
+      );
+      expect(recoveredDuringJoin).toBe(0);
+    });
 
     it("invite 之后死掉：新实例回收领取、从 join 继续；网关只建了一个群、一条链接", async () => {
       const { jobId, groupId } = await createJob(2);

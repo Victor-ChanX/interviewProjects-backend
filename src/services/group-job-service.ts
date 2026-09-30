@@ -283,7 +283,10 @@ export async function claimJobs(
   });
 }
 
-/** lockedAt 早于 now − STALE_CLAIM_MS 仍被占着的 running job：放回队列（step / state 原样，接手者继续）。 */
+/**
+ * lockedAt 早于 now − STALE_CLAIM_MS 仍被占着的 running job：放回队列（step / state 原样，接手者继续）。
+ * 逐行按读到的 claimedBy + 仍过期为条件回收：查询之后领取者刚续过租约（advanceJob 每步都续）的不回收（后端 #55）。
+ */
 export async function recoverStaleJobClaims(
   now: Date,
   deps: Pick<JobServiceDeps, "log">,
@@ -297,18 +300,51 @@ export async function recoverStaleJobClaims(
     },
     select: { id: true, claimedBy: true, step: true },
   });
-  if (stale.length === 0) return 0;
-  await getDb().job.updateMany({
-    where: { id: { in: stale.map((s) => s.id) } },
-    data: {
-      claimedBy: null,
-      lockedAt: null,
-      nextRunAt: now,
-      lastError: "领取者未释放（可能死在步骤中途），已回收",
-    },
+  let recovered = 0;
+  for (const s of stale) {
+    const { count } = await getDb().job.updateMany({
+      where: {
+        id: s.id,
+        status: "running",
+        claimedBy: s.claimedBy,
+        lockedAt: { lt: cutoff },
+      },
+      data: {
+        claimedBy: null,
+        lockedAt: null,
+        nextRunAt: now,
+        lastError: "领取者未释放（可能死在步骤中途），已回收",
+      },
+    });
+    recovered += count;
+  }
+  if (recovered > 0) deps.log?.warn({ jobs: stale }, "回收过期领取的 job");
+  return recovered;
+}
+
+/** 写 job 行时发现领取已不属于本 worker（被回收、别的副本接手了）：整个事务回滚，本 worker 停手 */
+export class JobClaimLostError extends Error {
+  constructor(jobId: string) {
+    super(`job ${jobId} 的领取已不属于本 worker`);
+    this.name = "JobClaimLostError";
+  }
+}
+
+/**
+ * 带写入防护（fencing）的 job 行更新：条件里带 claimedBy = 本 worker 且仍 running，一行都没改到就抛
+ * JobClaimLostError 让所在事务整体回滚 —— 被回收后仍在跑的旧领取者写不进任何进度（后端 #55）。
+ */
+async function fencedJobUpdate(
+  tx: Prisma.TransactionClient,
+  jobId: string,
+  workerId: string,
+  data: Prisma.JobUpdateManyMutationInput,
+): Promise<void> {
+  const { count } = await tx.job.updateMany({
+    where: { id: jobId, claimedBy: workerId, status: "running" },
+    data,
   });
-  deps.log?.warn({ jobs: stale }, "回收过期领取的 job");
-  return stale.length;
+  if (count === 0) throw new JobClaimLostError(jobId);
 }
 
 /** 释放领取并排期（步骤结果已各自落库） */
@@ -339,7 +375,16 @@ export async function advanceJob(
   const maxSteps = opts.maxSteps ?? DEFAULT_MAX_STEPS_PER_CLAIM;
   let steps = 0;
   for (;;) {
-    const job = await getDb().job.findUnique({ where: { id: jobId } });
+    // 每步之前续租约（lockedAt = now）：一次领取最多连推 maxSteps 步、每步可能等网关十秒，不续的话推进超过
+    // STALE_CLAIM_MS 就会被别的副本回收接手，两边同时推进同一个 job（后端 #55）。续不上 = 已被回收，停手。
+    const renewed = await getDb().job.updateMany({
+      where: { id: jobId, claimedBy: deps.workerId, status: "running" },
+      data: { lockedAt: deps.clock.now() },
+    });
+    const job =
+      renewed.count === 1
+        ? await getDb().job.findUnique({ where: { id: jobId } })
+        : null;
     if (!job || job.status !== "running" || job.claimedBy !== deps.workerId) {
       return { jobId, steps, outcome: "lost" };
     }
@@ -351,7 +396,18 @@ export async function advanceJob(
     try {
       outcome = await runStep(job, deps);
     } catch (err) {
-      outcome = await onCrash(job, err, deps);
+      if (err instanceof JobClaimLostError) {
+        deps.log?.warn({ jobId, step: job.step }, "job 领取已被回收，停手");
+        return { jobId, steps, outcome: "lost" };
+      }
+      try {
+        outcome = await onCrash(job, err, deps);
+      } catch (crashErr) {
+        if (crashErr instanceof JobClaimLostError) {
+          return { jobId, steps, outcome: "lost" };
+        }
+        throw crashErr;
+      }
     }
     steps += 1;
     if (outcome.kind === "continue") continue;
@@ -388,10 +444,12 @@ async function onCrash(
       message,
     });
   }
-  await getDb().job.update({
-    where: { id: job.id },
-    data: { state: toJson({ ...state, crashes }), lastError: message },
-  });
+  await getDb().$transaction((tx) =>
+    fencedJobUpdate(tx, job.id, deps.workerId, {
+      state: toJson({ ...state, crashes }),
+      lastError: message,
+    }),
+  );
   return {
     kind: "wait",
     until: new Date(deps.clock.now().getTime() + CRASH_RETRY_MS),
@@ -495,15 +553,10 @@ async function persist(
   also?: (tx: Prisma.TransactionClient) => Promise<void>,
 ): Promise<void> {
   await getDb().$transaction(async (tx) => {
-    await tx.job.update({
-      where: { id: ctx.job.id },
-      data: {
-        ...(patch.step !== undefined ? { step: patch.step } : {}),
-        state: toJson(patch.state),
-        ...(patch.lastError !== undefined
-          ? { lastError: patch.lastError }
-          : {}),
-      },
+    await fencedJobUpdate(tx, ctx.job.id, ctx.deps.workerId, {
+      ...(patch.step !== undefined ? { step: patch.step } : {}),
+      state: toJson(patch.state),
+      ...(patch.lastError !== undefined ? { lastError: patch.lastError } : {}),
     });
     const step = patch.step ?? ctx.job.step;
     if (
@@ -1077,23 +1130,30 @@ async function recordPromoteError(
 /** 终态：有 errors → failed，否则 finished；释放领取、写 finishedAt、推 ws 事件 */
 async function finish(
   ctx: BaseCtx & { state: JobState },
+  error?: {
+    step: JobStepKind;
+    accountId: string | null;
+    code: string;
+    message: string;
+  },
 ): Promise<StepOutcome> {
   const { deps } = ctx;
   const now = deps.clock.now();
   const status = await getDb().$transaction(async (tx) => {
+    // 先按领取加锁写（防护），再记可能附带的那条 errors —— 失去领取时两者一起回滚
+    await fencedJobUpdate(tx, ctx.job.id, deps.workerId, {
+      state: toJson({ ...ctx.state, currentAccountId: null }),
+      finishedAt: now,
+      claimedBy: null,
+      lockedAt: null,
+      nextRunAt: null,
+    });
+    if (error) {
+      await tx.jobError.create({ data: { jobId: ctx.job.id, ...error } });
+    }
     const errors = await tx.jobError.count({ where: { jobId: ctx.job.id } });
     const status = errors > 0 ? "failed" : "finished";
-    await tx.job.update({
-      where: { id: ctx.job.id },
-      data: {
-        status,
-        state: toJson({ ...ctx.state, currentAccountId: null }),
-        finishedAt: now,
-        claimedBy: null,
-        lockedAt: null,
-        nextRunAt: null,
-      },
-    });
+    await tx.job.update({ where: { id: ctx.job.id }, data: { status } });
     await emitWsEvent(tx, "job", {
       jobId: ctx.job.id,
       groupId: ctx.groupId,
@@ -1121,13 +1181,15 @@ async function failWithError(
     message: string;
   },
 ): Promise<StepOutcome> {
-  await getDb().jobError.create({ data: { jobId: job.id, ...error } });
-  return finish({
-    job,
-    groupId: job.groupId ?? "",
-    state: safeState(job),
-    deps,
-  });
+  return finish(
+    {
+      job,
+      groupId: job.groupId ?? "",
+      state: safeState(job),
+      deps,
+    },
+    error,
+  );
 }
 
 /** 按 kind 解析 state；解析不了（存量坏数据）退回空的初始 state，让收尾还能写下去 */
