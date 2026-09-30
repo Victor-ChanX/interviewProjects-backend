@@ -3,8 +3,15 @@
 // - 位置在库里（event_cursor.lastEventId），不在内存：重启 / 断线都从游标之后补拉（题目 A2：停机或断流期间
 //   的事件恢复后都要处理到）。游标从未写过（首次启动）时不带 since —— 题目里不带 since = 从当前时刻开始；
 //   要从头回放就把 event_cursor 手动置 0。
-// - 一条一条处理：ingest 自己吞掉「处理失败」（入册 + 不一致记录），只在库不可用时抛；那时断开这条流、
-//   退避后从游标重连，事件不会丢（游标没推进）。
+// - **游标只推到「比它小的事件都已处理」的位置**：相邻事件可能乱序（窗口 ≤ 1s），先到的可能是更大的 id。收到 101
+//   就把游标推到 101，而 100 还在路上时断流 / 崩溃，重连带 since=101，100 就永远收不到了。游标只凭两种证据前进：
+//   1. 连号：游标是 c 时收到 c + 1 —— 两个整数之间没有别的 id，直接前进（接着看已收到的 c + 2 …）；
+//   2. 沉淀：一条事件在**同一条流上**收到之后又过了 CURSOR_SETTLE_MS（乱序窗口的两倍）、且这条流还活着（期间又收到了
+//      后续事件）—— 比它小的事件在这段时间里必然已经到过、处理过，游标可以前进到它。
+//   网关 id 连续时靠第 1 条逐帧前进（每条流只活一帧也能前进）；有空洞时靠第 2 条。代价只是重连时可能重放最后一小段，
+//   由事件级去重吃掉。
+// - 一条一条处理：ingest 自己吞掉「处理失败」（入册 + 不一致记录 + 排重试，重试见 inbound-retry-worker），
+//   只在库不可用时抛；那时断开这条流、退避后从游标重连，事件不会丢（游标没推进）。
 // - 退避有界：min(base × 2^n, cap) + 抖动；一条流只要收到过帧就把 n 清零。
 // - stop()：abort 掐断 fetch → 流安静结束 → 等在途的 ingest 完成 → 返回。SIGTERM 路径见 src/main.ts。
 // - setTimeout 只用于退避等待（「多久再试」），排期本身没有 —— 事件流是推送，不是轮询。
@@ -24,6 +31,9 @@ import {
 export const RECONNECT_BASE_MS = 1_000;
 export const RECONNECT_CAP_MS = 30_000;
 const RECONNECT_JITTER_MS = 500;
+
+/** 一条事件收到之后要再过这么久（同一条流上）才进游标：题目 2.1 的乱序窗口 ≤ 1s，取两倍 */
+export const CURSOR_SETTLE_MS = 2_000;
 
 export type InboundWorkerDeps = {
   clock: Clock;
@@ -70,8 +80,48 @@ export function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
 }
 
 /**
- * 连一次流并消费到断开为止（可单独 await，测试用）：读游标 → openEventStream({ since }) → 每帧 ingest +
- * advanceCursor。返回为什么结束。不做重连、不做退避。
+ * 一条流上的游标位置（见文件头的两条证据）。只属于这一次连接：沉淀要求「同一条流还活着」，换一条流从头观察。
+ * received() 在每条事件 ingest 之后调，返回游标新推进到的位置（没推进返回 null）。
+ */
+export function createCursorPosition(since: number | null): {
+  received(eventId: number, now: number): number | null;
+} {
+  let cursor = since;
+  /** 比游标大、已处理、还没被游标越过的 id */
+  const ahead = new Set<number>();
+  /** 这条流上收到、还没沉淀的事件（按收到顺序） */
+  const unsettled: { eventId: number; receivedAt: number }[] = [];
+
+  return {
+    received(eventId, now) {
+      const before = cursor;
+      if (cursor === null || eventId > cursor) {
+        ahead.add(eventId);
+        unsettled.push({ eventId, receivedAt: now });
+      }
+      // 沉淀：收到得够早、且此刻这条流还在送事件
+      while (
+        unsettled[0] !== undefined &&
+        now - unsettled[0].receivedAt >= CURSOR_SETTLE_MS
+      ) {
+        const head = unsettled.shift();
+        if (head && (cursor === null || head.eventId > cursor)) {
+          cursor = head.eventId;
+        }
+      }
+      // 连号：c → c + 1 → …
+      if (cursor !== null) {
+        for (const id of ahead) if (id <= cursor) ahead.delete(id);
+        while (ahead.delete(cursor + 1)) cursor += 1;
+      }
+      return cursor !== null && cursor !== before ? cursor : null;
+    },
+  };
+}
+
+/**
+ * 连一次流并消费到断开为止（可单独 await，测试用）：读游标 → openEventStream({ since }) → 每帧 ingest →
+ * 按连号 / 沉淀推进游标（见文件头）。返回为什么结束。不做重连、不做退避。
  */
 export async function consumeOnce(
   deps: InboundWorkerDeps,
@@ -85,6 +135,7 @@ export async function consumeOnce(
   let frames = 0;
   try {
     const since = await cursor.read();
+    const position = createCursorPosition(since);
     log.info({ since }, "连接网关事件流");
     for await (const event of deps.gateway.openEventStream({ since, signal })) {
       frames += 1;
@@ -93,7 +144,11 @@ export async function consumeOnce(
         log,
         applyGatewayDelivery: deps.applyGatewayDelivery,
       });
-      await cursor.advance(result.eventId);
+      const advanced = position.received(
+        result.eventId,
+        deps.clock.now().getTime(),
+      );
+      if (advanced !== null) await cursor.advance(advanced);
       if (signal.aborted) break;
     }
     return { frames, reason: signal.aborted ? "aborted" : "disconnected" };

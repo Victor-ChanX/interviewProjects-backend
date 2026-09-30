@@ -45,6 +45,7 @@ import {
   makeAccount,
   makeGroup,
   makeMessage,
+  stopAfterFrames,
 } from "./factories.js";
 import { truncateAll } from "./setup.js";
 
@@ -258,31 +259,24 @@ describe("重启恢复与并发（#10）", () => {
       .map((p) => p.deliveryStatus);
 
   /**
-   * 入站 worker 的一次连接（真 SSE）：从库里的游标起消费，每帧 ingest + 推进游标之后判 stop，为真就停
-   * （相当于 stop()）。message_sent / message_failed 的记账注入 outbox-service.applyGatewayDelivery，
-   * 与 src/main.ts 的接法相同。返回这条连接收到的帧数。
+   * 入站 worker 的一次连接（真 SSE）：从库里的游标起消费，每处理完一帧判 stop，为真就停（相当于 stop()，
+   * factories.stopAfterFrames）。message_sent / message_failed 的记账注入 outbox-service.applyGatewayDelivery，
+   * 与 src/main.ts 的接法相同；opts.advance 替换游标写入（模拟死在推进游标之前）。返回这条连接收到的帧数。
    */
   async function consume(
     stop: (processed: number, eventId: number) => boolean,
     opts: { advance?: (eventId: number) => Promise<void> } = {},
   ): Promise<number> {
     const ac = new AbortController();
-    let processed = 0;
     const result = await consumeOnce(
       {
         clock,
-        gateway: gatewayClient,
+        gateway: stopAfterFrames(gatewayClient, stop, ac),
         log: silent,
         applyGatewayDelivery,
         cursorStore: {
           read: readCursor,
-          advance: async (eventId) => {
-            await (opts.advance ?? ((id) => advanceCursor(id, { clock })))(
-              eventId,
-            );
-            processed += 1;
-            if (stop(processed, eventId)) ac.abort();
-          },
+          advance: opts.advance ?? ((id) => advanceCursor(id, { clock })),
         },
       },
       ac.signal,

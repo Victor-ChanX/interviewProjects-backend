@@ -251,7 +251,7 @@ model InboundEvent {
 }
 
 /// SSE 游标，单行（id 固定 1，约束见 20260930101643_domain_model）。
-/// 处理完一批并 commit 之后才推进；重启从这里的 lastEventId 带 since 补拉。
+/// 只推到「比它小的事件都已处理」的位置（连号或沉淀，见 src/workers/inbound-worker.ts）；重启从这里的 lastEventId 带 since 补拉。
 model EventCursor {
   id          Int      @id @default(1)
   lastEventId String?  @map("last_event_id")

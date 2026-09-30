@@ -126,5 +126,6 @@ tests/          vitest（真库）
 ```
 
 三条贯穿全局的设计：外部副作用一律走 outbox（先落库再发，504 后按 clientMsgId 确认没发出才重发一次）；
-入站按 at-least-once 处理（eventId / (groupId, msgId) 去重，游标落库）；互斥与预算靠数据库
+入站按 at-least-once 处理（eventId / (groupId, msgId) 去重，游标只越过已确认没有更小 id 在途的事件，
+处理失败按退避自动重试）；互斥与预算靠数据库
 （部分唯一索引保证同群单 run / 单序列，预算按落库时间戳累计，停机不计）。

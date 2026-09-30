@@ -41,6 +41,8 @@ import { buildGatewayApp } from "../src/sim/gateway/app.js";
 import {
   abortableSleep,
   consumeOnce,
+  createCursorPosition,
+  CURSOR_SETTLE_MS,
   startInboundWorker,
 } from "../src/workers/inbound-worker.js";
 import {
@@ -884,6 +886,66 @@ describe("ingest", () => {
       await advanceCursor(9, { clock });
       expect(await readCursor()).toBe(9);
       expect(await db().eventCursor.count()).toBe(1);
+    });
+
+    it("位置：连号逐帧前进；跳号的先到者不推进游标，缺的那条到了再一起前进", () => {
+      const p = createCursorPosition(99);
+      expect(p.received(101, 0)).toBeNull();
+      expect(p.received(100, 10)).toBe(101);
+      expect(p.received(102, 20)).toBe(102);
+      expect(p.received(101, 30)).toBeNull(); // 重复
+    });
+
+    it("位置：id 有空洞时靠沉淀 —— 同一条流上收到后又过了 CURSOR_SETTLE_MS 且流还在送事件，才越过它", () => {
+      const p = createCursorPosition(10);
+      expect(p.received(20, 0)).toBeNull();
+      expect(p.received(30, CURSOR_SETTLE_MS - 1)).toBeNull();
+      expect(p.received(40, CURSOR_SETTLE_MS)).toBe(20);
+      expect(p.received(50, CURSOR_SETTLE_MS * 2)).toBe(40);
+    });
+
+    it("位置：首次连接没有游标（since = null）：先沉淀出一个起点，再按连号接上", () => {
+      const p = createCursorPosition(null);
+      expect(p.received(5, 0)).toBeNull();
+      expect(p.received(6, 100)).toBeNull();
+      expect(p.received(7, CURSOR_SETTLE_MS)).toBe(7);
+    });
+
+    it("乱序 + 断流：先到的 101 不推进游标；重连从旧游标补拉，还在路上的 100 不丢", async () => {
+      const group = await localGroup();
+      await advanceCursor(99, { clock });
+      const e100 = frame("message", msgData("g-1", "m-100"), 100);
+      const e101 = frame("message", msgData("g-1", "m-101"), 101);
+      const sinces: (number | null)[] = [];
+      const gateway = {
+        async *openEventStream({ since }: { since: number | null }) {
+          sinces.push(since);
+          if (sinces.length === 1) {
+            // 101 先到（乱序），100 还没到连接就断了
+            yield e101;
+            throw new Error("连接被掐断");
+          }
+          for (const e of [e100, e101]) {
+            if (since === null || e.eventId > since) yield e;
+          }
+        },
+      };
+      const deps = { clock, gateway, log: silentLog };
+      const first = await consumeOnce(deps, new AbortController().signal);
+      expect(first).toMatchObject({ frames: 1, reason: "disconnected" });
+      expect(await readCursor()).toBe(99);
+
+      await consumeOnce(deps, new AbortController().signal);
+      expect(sinces).toEqual([99, 99]);
+      expect(await readCursor()).toBe(101);
+      expect(
+        (
+          await db().message.findMany({
+            where: { groupId: group.id },
+            orderBy: { msgId: "asc" },
+          })
+        ).map((m) => m.msgId),
+      ).toEqual(["m-100", "m-101"]);
     });
   });
 });

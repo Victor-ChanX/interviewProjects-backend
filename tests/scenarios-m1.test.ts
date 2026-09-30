@@ -33,7 +33,12 @@ import { buildGatewayApp } from "../src/sim/gateway/app.js";
 import { consumeOnce } from "../src/workers/inbound-worker.js";
 import { runOutboxTick } from "../src/workers/outbox-worker.js";
 import { startRateLimitWorker } from "../src/workers/rate-limit-worker.js";
-import { loginAs, makeAccount, makeGroup } from "./factories.js";
+import {
+  loginAs,
+  makeAccount,
+  makeGroup,
+  stopAfterFrames,
+} from "./factories.js";
 import { truncateAll } from "./setup.js";
 
 type Json = Record<string, unknown>;
@@ -247,7 +252,7 @@ describe("典型场景 S1–S4（#10，出站 tick + 入站 consumeOnce 串联�
     ).map((e) => e.payload as Json);
 
   /**
-   * 入站 worker 的一次连接（真 SSE）：从库里的游标起消费，每帧 ingest + 推进游标之后判 stop，为真就停。
+   * 入站 worker 的一次连接（真 SSE）：从库里的游标起消费，每处理完一帧判 stop，为真就停（factories.stopAfterFrames）。
    * 记账注入 outbox-service.applyGatewayDelivery（与 src/main.ts 相同）。返回收到的帧数。
    */
   async function consume(
@@ -255,21 +260,12 @@ describe("典型场景 S1–S4（#10，出站 tick + 入站 consumeOnce 串联�
   ): Promise<number> {
     const ac = new AbortController();
     stoppers.push(async () => ac.abort());
-    let processed = 0;
     const result = await consumeOnce(
       {
         clock,
-        gateway: gatewayClient,
+        gateway: stopAfterFrames(gatewayClient, stop, ac),
         log: silent,
         applyGatewayDelivery,
-        cursorStore: {
-          read: readCursor,
-          advance: async (eventId) => {
-            await advanceCursor(eventId, { clock });
-            processed += 1;
-            if (stop(processed, eventId)) ac.abort();
-          },
-        },
       },
       ac.signal,
     );

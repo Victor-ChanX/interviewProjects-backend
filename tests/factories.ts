@@ -25,6 +25,7 @@ import type {
 } from "../src/db/generated/client.js";
 import { SEED_USERS } from "../src/db/seed.js";
 import { REFRESH_COOKIE_NAME } from "../src/services/auth-service.js";
+import type { GatewayClient } from "../src/services/gateway-client.js";
 import {
   type ApplyDeliveryResult,
   applyGatewayDelivery,
@@ -296,6 +297,30 @@ export async function makeInconsistency(
   });
 }
 
+// ---- 网关回执（message_sent / message_failed）------------------------------------------
+
+/**
+ * 模拟入站 worker 收到一条 message_sent / message_failed：在一个事务里调 outbox-service.applyGatewayDelivery
+ * （生产里它跑在处理这条事件的事务中），commit 之后执行它登记的日志。
+ */
+export async function deliverGatewayReceipt(
+  input: GatewayDeliveryInput,
+  deps: {
+    clock?: Clock;
+    log?: Parameters<typeof applyGatewayDelivery>[2]["log"];
+  } = {},
+): Promise<ApplyDeliveryResult> {
+  const committed: (() => void)[] = [];
+  const result = await getDb().$transaction((tx) =>
+    applyGatewayDelivery(tx, input, {
+      ...deps,
+      afterCommit: (fn) => committed.push(fn),
+    }),
+  );
+  for (const fn of committed) fn();
+  return result;
+}
+
 // ---- ws_events ------------------------------------------------------------------------
 
 /**
@@ -341,26 +366,28 @@ export async function withFailingUpdates<T>(
   }
 }
 
-// ---- 网关回执（message_sent / message_failed）------------------------------------------
+// ---- 网关事件流 ------------------------------------------------------------------------
 
 /**
- * 模拟入站 worker 收到一条 message_sent / message_failed：在一个事务里调 outbox-service.applyGatewayDelivery
- * （生产里它跑在处理这条事件的事务中），commit 之后执行它登记的日志。
+ * 包一层网关客户端的事件流：消费方每处理完一帧（来要下一帧时）计数一次，stop(已处理帧数, eventId) 为真就 abort
+ * 并结束这条流 —— 让入站 worker 的一次连接停在确定的帧上（相当于 stop()），不往生产代码里加测试钩子。
  */
-export async function deliverGatewayReceipt(
-  input: GatewayDeliveryInput,
-  deps: {
-    clock?: Clock;
-    log?: Parameters<typeof applyGatewayDelivery>[2]["log"];
-  } = {},
-): Promise<ApplyDeliveryResult> {
-  const committed: (() => void)[] = [];
-  const result = await getDb().$transaction((tx) =>
-    applyGatewayDelivery(tx, input, {
-      ...deps,
-      afterCommit: (fn) => committed.push(fn),
-    }),
-  );
-  for (const fn of committed) fn();
-  return result;
+export function stopAfterFrames(
+  gateway: Pick<GatewayClient, "openEventStream">,
+  stop: (frames: number, eventId: number) => boolean,
+  controller: AbortController,
+): Pick<GatewayClient, "openEventStream"> {
+  return {
+    async *openEventStream(opts) {
+      let frames = 0;
+      for await (const event of gateway.openEventStream(opts)) {
+        yield event;
+        frames += 1;
+        if (stop(frames, event.eventId)) {
+          controller.abort();
+          return;
+        }
+      }
+    },
+  };
 }

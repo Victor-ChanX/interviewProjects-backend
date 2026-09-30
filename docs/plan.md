@@ -28,7 +28,7 @@ backend/ (Fastify + Prisma + PostgreSQL)
 
 1. **一切外部副作用走 outbox**：出站消息与业务写同一事务落库（`queued`），worker 领取（`FOR UPDATE SKIP LOCKED`）→ 调网关 → 记结果。
    崩溃只会留下「意图已记录、结果未记录」的行，重启后按状态机继续；永远不会出现「网关发了、库里没有」。
-2. **一切入站按 at-least-once 处理**：事件流游标（`lastEventId`）落库，`(groupId, msgId)` / `eventId` 唯一约束去重；写库失败不中断消费，原始事件进 `inconsistencies` 并推给操作员。
+2. **一切入站按 at-least-once 处理**：事件流游标（`lastEventId`）落库、只推到「比它小的都已处理」的位置（乱序窗口内先到的大 id 不越过在途的小 id），`(groupId, msgId)` / `eventId` 唯一约束去重；写库失败不中断消费，原始事件进 `inconsistencies` 并推给操作员，事件按 `nextAttemptAt` 退避自动重试。
 3. **一切互斥与预算靠数据库，不靠进程内存**：「同群同时至多一个 running 的 run / 序列」用部分唯一索引；60 秒预算按落库的 `accumulatedMs + (now − activeSince)` 算，停机不计；定时器只是「多久看一次」，排期本身是库里的 `nextRunAt`。
 
 ## 3. 数据模型（Prisma）
