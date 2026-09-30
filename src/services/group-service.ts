@@ -358,11 +358,16 @@ function toGroupRead(
     creatorAccountId: row.creatorAccountId,
     agentEnabled: row.agentEnabled,
     autoKickEnabled: row.autoKickEnabled,
-    members: row.members.map((m) => ({
-      accountId: m.accountId,
-      platformUserId: m.platformUserId,
-      role: m.role,
-    })),
+    // left（leave-all 完成）：我们的账号都已不在群里，题目 2.3 要求 members = []；库里仍留着外部用户的行，
+    // 与网关的成员列表一致（B2）
+    members:
+      row.status === "left"
+        ? []
+        : row.members.map((m) => ({
+            accountId: m.accountId,
+            platformUserId: m.platformUserId,
+            role: m.role,
+          })),
     activeSequenceRunId: running.sequenceRunId,
     activeAgentRunId: running.agentRunId,
   };
@@ -497,7 +502,8 @@ export async function getJob(jobId: string): Promise<JobRead> {
   return {
     id: row.id,
     kind: row.kind,
-    status: row.status,
+    // 题目 2.3：errors 非空即 failed —— 一个成员失败后 job 还会接着处理其余成员（仍在跑），但对外已是 failed
+    status: row.errors.length > 0 ? "failed" : row.status,
     groupId: row.groupId,
     step:
       row.step === null

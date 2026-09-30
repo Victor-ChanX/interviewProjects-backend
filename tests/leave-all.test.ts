@@ -569,7 +569,7 @@ describe("leave-all job（#16）", () => {
 
   // ---- 完成后对账：网关里还有人（外部用户）→ 不一致记录可见、不阻断 ------------------------
 
-  it("网关里还有外部用户：job 仍 finished，写一行 inconsistencies leave_all_members_mismatch + ws inconsistency", async () => {
+  it("网关里还有外部用户：job finished；外部用户的成员行保留（与网关一致、不记不一致），API 的 members = []", async () => {
     const { groupId, gatewayGroupId } = await readyGroup(1);
     const external = `ext-${randomUUID().slice(0, 6)}`;
     await gateway.inject({
@@ -589,30 +589,21 @@ describe("leave-all job（#16）", () => {
     const jobId = await startLeaveAll(groupId);
     const job = await runToEnd(jobId);
     expect(job).toMatchObject({ status: "finished", errors: [] });
-    // 本地：题目要求 members = []；网关：外部用户还在 → 差集非空 → 不一致记录
-    expect(await localMembers(groupId)).toEqual([]);
+    // 本地成员表与网关一致：只剩外部用户（B2）
+    expect((await localMembers(groupId)).map((m) => m.platformUserId)).toEqual([
+      external,
+    ]);
     expect(
       (await simGroup(gatewayGroupId)).members.map((m) => m.platformUserId),
     ).toEqual([external]);
-    const rows = await getDb().inconsistency.findMany();
-    expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({
-      kind: "leave_all_members_mismatch",
-      ref: jobId,
+    expect(await getDb().inconsistency.count()).toBe(0);
+    // API：left 的群 members = []（题目 2.3）
+    const detail = await app.inject({
+      method: "GET",
+      url: `/api/groups/${groupId}`,
+      headers: admin,
     });
-    expect(rows[0]!.payload).toMatchObject({
-      groupId,
-      gatewayOnly: [external],
-      localOnly: [],
-    });
-    const ws = await getDb().wsEvent.findMany({
-      where: { type: "inconsistency" },
-    });
-    expect(ws).toHaveLength(1);
-    expect(ws[0]!.payload).toMatchObject({
-      inconsistencyId: rows[0]!.id,
-      kind: "leave_all_members_mismatch",
-    });
+    expect(detail.json()).toMatchObject({ status: "left", members: [] });
   });
 
   // ---- 业务边界 / 闸门 -----------------------------------------------------------------

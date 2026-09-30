@@ -12,9 +12,12 @@
 //   join     每个成员一步（step = join，state.currentAccountId 记账号；API 拼成 join:<accountId>）：
 //            pending → POST join：202 → accepted（acceptedAt）；ALREADY_MEMBER → 视为已入群（成员表自己写一行，
 //            网关不会再推 member_joined）；INVITE_NOT_READY → nextRunAt = max(readyAt, now + 250ms) 再试（不 sleep）；
-//            INVITE_EXPIRED → 重新申请链接一次（转回 invite，expiredRetries + 1），再过期记 errors；其他 4xx 记 errors。
-//            accepted → **不轮询网关**：每 tick 查 group_members（入站 worker #8 收到 member_joined 会写行）；
-//            出现 → joined；acceptedAt 起超过 10s 没出现 → job_errors { join, accountId, JOIN_TIMEOUT }。
+//            INVITE_EXPIRED → 重新申请链接后重试一次（每个成员各一次：转回 invite，该成员 inviteRetries + 1），
+//            同一成员再过期记 errors；其他 4xx 记 errors。
+//            accepted → 每 tick 查 group_members（入站 worker #8 收到 member_joined 会写行）；出现 → joined。
+//            acceptedAt 起超过 10s 没出现：先问一次网关成员列表（GET members）再下结论 —— 本地没有行可能只是入站事件
+//            还没处理到（停机刚恢复、积压），网关里已有这个账号就是入过群了（视同 ALREADY_MEMBER，成员行自己写）；
+//            网关里也没有才记 job_errors { join, accountId, JOIN_TIMEOUT }；成员列表不可用按网关不可用退避。
 //   promote  memberAccountIds[0] 已 joined 才调（成员表先确认，避免明知会 NOT_MEMBER_YET 的调用）；
 //            调用前先把 promote.calls + 1 落库（崩在调用与记账之间也不会多调），总数 ≤ 2：
 //            NOT_MEMBER_YET 且 calls < 2 → 300ms 后再试；仍不行 / NO_PERMISSION / 其他 → 记 errors。
@@ -46,8 +49,8 @@
 //     视为已退（不重发，「确认对方没收到之前不重发」）；还在 → 再发；退避超限记 GATEWAY_UNAVAILABLE、继续下一位。
 //     进程死在「发出」与「记账」之间也是同一条路（calling 就是那个痕迹）。
 //   非群主全部处理完：有任一 failed → **群主不退**、直接收尾（job failed；失败账号在库与网关里都仍是成员）；
-//   全部 left → 群主同样一步 leave；200 后同一事务里 groups.status = left + 成员表清空（题目：完成后 left、
-//   members = []）+ ws group_status_changed；群主 leave 失败也记 errors、job failed（群状态不变）。
+//   全部 left → 群主同样一步 leave；200 后同一事务里 groups.status = left + 清掉服务账号的成员行（外部用户仍在
+//   网关的群里，行保留，与网关一致；GET /api/groups 对 left 的群返回 members = []，题目 2.3）+ ws group_status_changed；群主 leave 失败也记 errors、job failed（群状态不变）。
 //   收尾前对账：GET /groups/:id/members（网关视角）与本地 group_members 比对，不一致 → inconsistencies
 //   { kind: leave_all_members_mismatch } + ws inconsistency，**不阻断**收尾（题目：完成后成员表与网关一致 ——
 //   一致靠上面的清理，不一致要看得见）。
@@ -123,6 +126,8 @@ const joinProgressSchema = z.object({
   status: z.enum(["pending", "accepted", "joined", "failed"]),
   /** 网关 202 的时刻（ISO）；JOIN_TIMEOUT 从这里算 */
   acceptedAt: z.string().nullable(),
+  /** 这个成员 join 时因 INVITE_EXPIRED 重新申请过几次链接（题目 B2：每次重试一次） */
+  inviteRetries: z.number().int().default(0),
 });
 export type JoinProgress = z.infer<typeof joinProgressSchema>;
 
@@ -135,8 +140,6 @@ const createGroupStateSchema = z.object({
     link: z.string().nullable(),
     /** 链接可用时刻（ISO） */
     readyAt: z.string().nullable(),
-    /** 因 INVITE_EXPIRED 重新申请过几次 */
-    expiredRetries: z.number().int(),
   }),
   joins: z.record(z.string(), joinProgressSchema),
   promote: z.object({
@@ -156,11 +159,15 @@ export function initialCreateGroupState(
   return {
     memberAccountIds: [...input.memberAccountIds],
     currentAccountId: null,
-    invite: { link: null, readyAt: null, expiredRetries: 0 },
+    invite: { link: null, readyAt: null },
     joins: Object.fromEntries(
       input.memberAccountIds.map((id) => [
         id,
-        { status: "pending", acceptedAt: null } satisfies JoinProgress,
+        {
+          status: "pending",
+          acceptedAt: null,
+          inviteRetries: 0,
+        } satisfies JoinProgress,
       ]),
     ),
     promote: { calls: 0, lastOutcome: null },
@@ -684,7 +691,8 @@ async function joinRequest(
           return { kind: "wait", until };
         }
         case "INVITE_EXPIRED": {
-          if (state.invite.expiredRetries < INVITE_EXPIRED_MAX_RETRIES) {
+          const progress = state.joins[accountId];
+          if (progress && progress.inviteRetries < INVITE_EXPIRED_MAX_RETRIES) {
             deps.log?.warn(
               { jobId: ctx.job.id, accountId },
               "邀请链接已过期，重新申请一次",
@@ -693,10 +701,13 @@ async function joinRequest(
               step: "invite",
               state: {
                 ...state,
-                invite: {
-                  link: null,
-                  readyAt: null,
-                  expiredRetries: state.invite.expiredRetries + 1,
+                invite: { link: null, readyAt: null },
+                joins: {
+                  ...state.joins,
+                  [accountId]: {
+                    ...progress,
+                    inviteRetries: progress.inviteRetries + 1,
+                  },
                 },
               },
             });
@@ -718,7 +729,11 @@ async function joinRequest(
       ...state,
       joins: {
         ...state.joins,
-        [accountId]: { status: "accepted", acceptedAt: now.toISOString() },
+        [accountId]: {
+          ...state.joins[accountId]!,
+          status: "accepted",
+          acceptedAt: now.toISOString(),
+        },
       },
       transientFailures: 0,
     },
@@ -726,7 +741,7 @@ async function joinRequest(
   return { kind: "wait", until: new Date(now.getTime() + JOIN_POLL_MS) };
 }
 
-/** accepted → 查成员表；超过 10s → JOIN_TIMEOUT */
+/** accepted → 查成员表；超过 10s → 先向网关确认，确实不在才 JOIN_TIMEOUT（见文件头） */
 async function joinWait(
   ctx: StepCtx,
   accountId: string,
@@ -741,6 +756,26 @@ async function joinWait(
   const now = deps.clock.now();
   const acceptedAt = progress.acceptedAt ? new Date(progress.acceptedAt) : now;
   if (now.getTime() - acceptedAt.getTime() > JOIN_TIMEOUT_MS) {
+    const gatewayGroupId = await requireGatewayGroupId(ctx);
+    let remote: string[];
+    try {
+      remote = (await deps.gateway.listMembers(gatewayGroupId)).map(
+        (m) => m.platformUserId,
+      );
+    } catch (err) {
+      return onGatewayError(ctx, err, { step: "join", accountId });
+    }
+    const account = await getDb().account.findUnique({
+      where: { id: accountId },
+      select: { platformUserId: true },
+    });
+    if (account?.platformUserId && remote.includes(account.platformUserId)) {
+      deps.log?.info(
+        { jobId: ctx.job.id, accountId },
+        "member_joined 还没处理到，但网关成员列表里已有该账号：视为已入群",
+      );
+      return markJoined(ctx, accountId, { viaAlreadyMember: true });
+    }
     return memberFailed(
       ctx,
       accountId,
@@ -1345,8 +1380,9 @@ async function markLeft(
         reason: "leave_all",
       });
     }
-    // 成员表由 member_left 事件清；这里也清一次（事件可能晚到），与网关最终一致 —— 见文件头
-    await deleteMemberRows(tx, ctx.groupId, {});
+    // 服务账号的成员行由 member_left 事件清；这里也清一次（事件可能晚到），与网关最终一致 —— 见文件头。
+    // 外部用户还在网关的群里，他们的行保留（B2：完成后成员表与网关一致）；API 对 left 的群返回 members = []
+    await deleteMemberRows(tx, ctx.groupId, { accountId: { not: null } });
   });
   ctx.state = left;
   deps.log?.info(

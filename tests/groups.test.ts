@@ -211,8 +211,8 @@ describe("建群 job（#11）", () => {
   const stateOf = async (jobId: string) =>
     (await readJob(jobId)).state as {
       currentAccountId: string | null;
-      invite: { link: string | null; expiredRetries: number };
-      joins: Record<string, { status: string }>;
+      invite: { link: string | null };
+      joins: Record<string, { status: string; inviteRetries: number }>;
       promote: { calls: number };
     };
 
@@ -449,7 +449,8 @@ describe("建群 job（#11）", () => {
       await tick({ maxStepsPerJob: 1 });
       const s = await stateOf(jobId);
       expect((await readJob(jobId)).step).toBe("invite");
-      expect(s.invite).toMatchObject({ link: null, expiredRetries: 1 });
+      expect(s.invite).toMatchObject({ link: null });
+      expect(s.joins[members[0]!]!.inviteRetries).toBe(1);
       expect(await getDb().jobError.count()).toBe(0);
 
       const job = await runToEnd(jobId);
@@ -472,6 +473,29 @@ describe("建群 job（#11）", () => {
       expect((await simState()).promoteCalls).toHaveLength(1); // 第一个 job 的
       expect(members).toHaveLength(1);
     });
+  });
+
+  it("INVITE_EXPIRED 的重试是每个成员各一次：m1、m2 各遇到一次过期，都重新申请后入群", async () => {
+    const { members, jobId } = await createJob(2);
+    await tick({ maxStepsPerJob: 1 }); // create
+    await tick({ maxStepsPerJob: 1 }); // invite → join
+    await gateway.inject({ method: "POST", url: "/_sim/invites/expire" });
+    await tick({ maxStepsPerJob: 1 }); // m1 INVITE_EXPIRED → 回 invite
+    await tick({ maxStepsPerJob: 1 }); // 重新申请 → join
+    // m1 用新链接入群，走到 m2 时链接又过期：m2 自己还有一次重试机会
+    for (let i = 0; i < 20; i++) {
+      await sleepMs(5);
+      await pumpEvents();
+      clock.advance(JOIN_POLL_MS);
+      await tick({ maxStepsPerJob: 1 });
+      if ((await stateOf(jobId)).currentAccountId === members[1]) break;
+    }
+    await gateway.inject({ method: "POST", url: "/_sim/invites/expire" });
+    const job = await runToEnd(jobId);
+    expect(job).toMatchObject({ status: "finished", errors: [] });
+    const s = await stateOf(jobId);
+    expect(members.map((m) => s.joins[m]!.inviteRetries)).toEqual([1, 1]);
+    expect((await simState()).invites).toHaveLength(3);
   });
 
   // ---- join 等待 ------------------------------------------------------------------------
@@ -547,6 +571,42 @@ describe("建群 job（#11）", () => {
       ]);
       // 群本身还在、状态不变（B2：群和账号状态都不变）
       expect((await getGroup(groupId)).json<GroupBody>().status).toBe("active");
+    });
+
+    it("入站积压（停机刚恢复）：member_joined 已推但还没处理，超过 10 秒时先问网关 —— 已在群里就不记 JOIN_TIMEOUT", async () => {
+      await scenario({ join: { delayMs: { min: 0, max: 0 } } });
+      const { members, jobId, groupId } = await createJob(1);
+      await tick(); // create + invite + join 受理 → 等
+      await sleepMs(20); // 模拟器把账号加进群、推 member_joined —— 但这里不喂给入站（积压）
+      expect(await localMembers(groupId)).toHaveLength(1);
+      clock.advance(JOIN_TIMEOUT_MS + 1);
+      await tick();
+      const s = await stateOf(jobId);
+      expect(s.joins[members[0]!]!.status).toBe("joined");
+      expect(await getDb().jobError.count()).toBe(0);
+      const job = await runToEnd(jobId);
+      expect(job).toMatchObject({ status: "finished", errors: [] });
+      // 晚到的 member_joined 补处理：不多一行，角色仍是 promote 后的 admin
+      await pumpEvents();
+      const rows = await localMembers(groupId);
+      expect(rows).toHaveLength(2);
+      expect(rows.find((r) => r.accountId === members[0])?.role).toBe("admin");
+    });
+
+    it("job 还在处理其余成员时，errors 一旦非空 GET /api/jobs 就报 failed（题目：errors 非空即 failed）", async () => {
+      await scenario({ join: { neverJoin: true } });
+      const { jobId } = await createJob(2);
+      await tick();
+      clock.advance(JOIN_TIMEOUT_MS + 1);
+      await tick(); // m1 超时记 errors，转 m2 继续
+      expect((await readJob(jobId)).status).toBe("running");
+      const res = await app.inject({
+        method: "GET",
+        url: `/api/jobs/${jobId}`,
+        headers: viewer,
+      });
+      expect(res.json<JobBody>().status).toBe("failed");
+      expect(res.json<JobBody>().errors).toHaveLength(1);
     });
 
     it("一个成员超时不影响其余成员：m1 入群并被 promote，m2 超时 → failed 但 m1 是 admin", async () => {
