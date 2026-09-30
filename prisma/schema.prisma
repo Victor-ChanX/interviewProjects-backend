@@ -14,22 +14,6 @@ datasource db {
   provider = "postgresql"
 }
 
-enum ExampleStatus {
-  active
-  archived
-
-  @@map("example_status")
-}
-
-model Example {
-  id        Int           @id @default(autoincrement())
-  name      String        @unique
-  status    ExampleStatus @default(active)
-  createdAt DateTime      @default(now()) @map("created_at") @db.Timestamptz
-
-  @@map("examples")
-}
-
 // ============================================================================
 // 领域模型（docs/plan.md 第 3 节；列名与枚举值直接对应题目 2.3 的 API 字段）
 //

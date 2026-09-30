@@ -2,7 +2,6 @@
 // 排期 / 进度落库，重启后从库里继续。Clock 可注入，测试用假时钟。
 import type { Clock } from "../core/clock.js";
 import { logger } from "../core/logger.js";
-import { countActiveExamples } from "../services/example-service.js";
 
 export type ExampleWorkerDeps = {
   clock: Clock;
@@ -18,11 +17,8 @@ export function startExampleWorker(deps: ExampleWorkerDeps): WorkerHandle {
   const tick = async (): Promise<void> => {
     const startedAt = deps.clock.now();
     try {
-      const active = await countActiveExamples();
-      logger.info(
-        { active, at: startedAt.toISOString() },
-        "example-worker tick",
-      );
+      // #6 删掉了 Example 示例资源，tick 只剩心跳日志；本文件由 #7 换成真正的出站 worker。
+      logger.info({ at: startedAt.toISOString() }, "example-worker tick");
     } catch (err) {
       logger.error({ err }, "example-worker tick 失败");
     }

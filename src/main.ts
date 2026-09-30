@@ -12,6 +12,7 @@ import {
 } from "./db/client.js";
 import { seedDatabase } from "./db/seed.js";
 import { startExampleWorker } from "./workers/example-worker.js";
+import { startRateLimitWorker } from "./workers/rate-limit-worker.js";
 
 async function main(): Promise<void> {
   runMigrations();
@@ -24,10 +25,15 @@ async function main(): Promise<void> {
     clock: systemClock,
     intervalMs: 30_000,
   });
+  // 限流到期恢复（#6）：排期在 accounts.rateLimitedUntil，这里只是每秒看一眼
+  const rateLimitWorker = startRateLimitWorker({
+    clock: systemClock,
+    intervalMs: 1_000,
+  });
 
   const shutdown = async (signal: string): Promise<void> => {
     logger.info({ signal }, "收到停机信号，开始优雅停机");
-    await worker.stop();
+    await Promise.all([worker.stop(), rateLimitWorker.stop()]);
     await app.close();
     await closeDb();
     process.exit(0);
