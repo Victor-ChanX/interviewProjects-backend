@@ -93,6 +93,8 @@ services:
       # 媒体文件（题目 C1）下载到 media-data 卷里：重新部署 / 换容器都还在
       MEDIA_DIR: /data/media
       MEDIA_RETENTION_DAYS: ${MEDIA_RETENTION_DAYS:-30}
+      # 演示用：控制台群详情的「模拟外部发言」（经 gateway-sim 的 /_sim/push 推外部成员消息，可触发 Agent）
+      SIM_CONTROLS_ENABLED: ${SIM_CONTROLS_ENABLED:-0}
     volumes:
       - media-data:/data
     expose:

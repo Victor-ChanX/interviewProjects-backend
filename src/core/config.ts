@@ -64,6 +64,11 @@ export type Config = {
   mediaDir: string;
   /** C1：媒体文件保留天数（MEDIA_RETENTION_DAYS，正整数），默认 30；超过的由 media-worker 删除 */
   mediaRetentionDays: number;
+  /**
+   * 演示用模拟控制（SIM_CONTROLS_ENABLED=1 开，默认关）：控制台可代推「外部成员发言」到网关模拟器的 /_sim/push。
+   * 只在 GATEWAY_URL 指向模拟器时打开 —— 真网关没有 /_sim/*。
+   */
+  simControlsEnabled: boolean;
 };
 
 function readMs(
@@ -150,4 +155,5 @@ export const config: Readonly<Config> = Object.freeze({
     "MEDIA_RETENTION_DAYS",
     30,
   ),
+  simControlsEnabled: process.env.SIM_CONTROLS_ENABLED === "1",
 });

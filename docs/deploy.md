@@ -73,6 +73,13 @@ refresh token 放在带 `Secure` 的 cookie 里，浏览器只在 https 下保�
    Key 存在 `llm-data` 卷里（文件权限 600），不进镜像，也不进 Environment。
 3. 切回模拟器：`AGENT_URL` 改回 `http://agent-sim:8200` 再部署。
 
+## 演示：在控制台模拟外部成员发言
+
+`SIM_CONTROLS_ENABLED=1`（`.env.deploy.example` 默认开着）时，admin 在群详情右上角能看到「模拟外部发言」：
+填一个外部用户 ID（如 `ext-alice`）和内容，后端代为调用 `gateway-sim` 的 `/_sim/push`，消息随后照常经事件流进入时间线；
+群开着「Agent 自动回复」时会触发一次 agent run。不用开服务器终端，也不用把模拟器暴露到公网。
+只在网关是模拟器时打开：真网关没有 `/_sim/*`。
+
 ## 在部署环境里按人工测试手册操作
 
 [人工测试手册](manual-testing.md) 里调后端接口的命令，把 `localhost:8000` 换成后端域名即可。

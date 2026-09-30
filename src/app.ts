@@ -32,12 +32,14 @@ import jobRoutes from "./api/routes/jobs.js";
 import llmSettingsRoutes from "./api/routes/llm-settings.js";
 import sequenceRunRoutes from "./api/routes/sequence-runs.js";
 import sequenceRoutes from "./api/routes/sequences.js";
+import simControlRoutes from "./api/routes/sim-controls.js";
 import wsRoutes from "./api/routes/ws.js";
 import { config } from "./core/config.js";
 import { DomainError, type ErrorCode, NotFound } from "./core/errors.js";
 import { assertJwtSecretConfigured } from "./core/jwt.js";
 import type { GatewayClient } from "./services/gateway-client.js";
 import type { LlmAdminClient } from "./services/llm-settings-service.js";
+import type { SimControlClient } from "./services/sim-control-service.js";
 import { createWsHub, type WsHub } from "./services/ws-hub.js";
 // 副作用 import：让 .meta({ id }) 的 schema 在 app.swagger() 之前已进 z.globalRegistry
 import "./schemas/account.js";
@@ -52,6 +54,7 @@ import "./schemas/job.js";
 import "./schemas/llm-settings.js";
 import "./schemas/message.js";
 import "./schemas/sequence.js";
+import "./schemas/sim-control.js";
 
 export type ErrorEnvelope = {
   error: {
@@ -88,6 +91,11 @@ export type BuildAppOptions = {
    * 测试把 llm-agent 起在 listen(0) 上后经这里注入，传 null 表示「不支持」。
    */
   llmAdmin?: LlmAdminClient | null;
+  /**
+   * 演示用模拟控制（#46，/api/sim-controls、/api/groups/:id/simulate-inbound）的客户端。不给则按
+   * SIM_CONTROLS_ENABLED + GATEWAY_URL 建（开关关着 = null）；测试注入指向 listen(0) 模拟器的客户端，或传 null。
+   */
+  simControl?: SimControlClient | null;
 };
 
 export async function buildApp(
@@ -213,6 +221,11 @@ export async function buildApp(
   void app.register(dashboardRoutes);
   void app.register(inconsistencyRoutes);
   void app.register(activityRoutes);
+  // 演示用模拟控制（#46）：代推外部成员发言，路由文件写全路径
+  void app.register(
+    simControlRoutes,
+    opts.simControl !== undefined ? { simControl: opts.simControl } : {},
+  );
 
   return app;
 }

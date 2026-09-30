@@ -57,6 +57,11 @@ export type ErrorCode =
   | "LLM_AGENT_UNSUPPORTED"
   // ---- 异常中心（#22，题目 A2「让操作员看到」：GET /api/inconsistencies/:id、POST …/resolve）----
   | "INCONSISTENCY_NOT_FOUND"
+  // ---- 演示用模拟控制（后端 #46：控制台代推外部成员发言）----
+  // SIM_CONTROLS_ENABLED 没开（409：开关打开并重新部署后就能用）
+  | "SIM_CONTROLS_DISABLED"
+  // 指定的发送者是本平台托管的账号（422：外部成员发言不能冒用自己的账号，自己发走 /send）
+  | "SIM_SENDER_IS_MANAGED"
   /** 没有这个接口（未匹配的路由） */
   | "ROUTE_NOT_FOUND";
 
