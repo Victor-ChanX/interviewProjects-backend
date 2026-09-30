@@ -77,10 +77,12 @@ export type GatewayClient = {
    * 目标在 200 返回前已从成员列表移除。同步错误按 GatewayResponseError 抛：409 OWNER_LEFT（群主已退群）/
    * 403 NO_PERMISSION（by 不是群主也没被 promote）/ 409 ACCOUNT_OFFLINE / 504 NETWORK_TIMEOUT（结果未知：
    * 调用方用 listMembers 在 2 秒内收敛判断）。响应本身可能要 1–5 秒（timeoutMs 默认 10s 够）。
+   * opts.timeoutMs：本次调用的超时上限（agent 用 run 的剩余预算封顶，后端 #52）。
    */
   kick(
     groupId: string,
     input: { byAccountId: string; targetPlatformUserId: string },
+    opts?: { timeoutMs?: number },
   ): Promise<{ kicked: true }>;
   /**
    * POST /groups/:groupId/leave { accountId } → 200 {}，随后推 member_left（leave-all job，#16）。
@@ -189,6 +191,7 @@ export function createGatewayClient(
     method: "GET" | "POST",
     path: string,
     payload?: unknown,
+    callTimeoutMs: number = timeoutMs,
   ): Promise<{ status: number; body: unknown }> {
     let res: Response;
     try {
@@ -196,7 +199,7 @@ export function createGatewayClient(
         method,
         headers: { "content-type": "application/json" },
         ...(method === "POST" ? { body: JSON.stringify(payload ?? {}) } : {}),
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: AbortSignal.timeout(callTimeoutMs),
       });
     } catch (err) {
       throw new GatewayUnreachableError(method, path, err);
@@ -378,11 +381,12 @@ export function createGatewayClient(
         });
       }
     },
-    async kick(groupId, input) {
+    async kick(groupId, input, opts) {
       await request(
         "POST",
         `/groups/${encodeURIComponent(groupId)}/kick`,
         input,
+        Math.min(opts?.timeoutMs ?? timeoutMs, timeoutMs),
       );
       return { kicked: true };
     },
@@ -545,7 +549,7 @@ export function gatewayClientFromConfig(): GatewayClient {
     promote: (groupId, input) => resolve().promote(groupId, input),
     listMembers: (groupId) => resolve().listMembers(groupId),
     downloadMedia: (mediaUrl) => resolve().downloadMedia(mediaUrl),
-    kick: (groupId, input) => resolve().kick(groupId, input),
+    kick: (groupId, input, opts) => resolve().kick(groupId, input, opts),
     leave: (groupId, input) => resolve().leave(groupId, input),
   };
 }

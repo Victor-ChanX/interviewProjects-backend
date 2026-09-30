@@ -49,6 +49,7 @@ import {
   createGatewayClient,
   type GatewayClient,
   GatewayResponseError,
+  GatewayUnreachableError,
 } from "../src/services/gateway-client.js";
 import { ingest } from "../src/services/inbound-service.js";
 import { applyGatewayDelivery } from "../src/services/outbox-service.js";
@@ -56,7 +57,13 @@ import { buildAgentApp } from "../src/sim/agent/app.js";
 import { buildGatewayApp } from "../src/sim/gateway/app.js";
 import { runAgentTick, startAgentWorker } from "../src/workers/agent-worker.js";
 import { runOutboxTick } from "../src/workers/outbox-worker.js";
-import { loginAs, makeAccount, makeGroup, makeMessage } from "./factories.js";
+import {
+  loginAs,
+  makeAccount,
+  makeGroup,
+  makeMessage,
+  withFailingUpdates,
+} from "./factories.js";
 import { truncateAll } from "./setup.js";
 
 type Json = Record<string, unknown>;
@@ -1451,6 +1458,59 @@ describe("agent run（#12 / #13）", () => {
       expectEnded(await run(runId), "finished", "final");
     });
 
+    it("kick 请求超时 / 断连（结果未知）但其实已生效：按成员列表确认，记成已移除而不是 GROUP_UNREACHABLE", async () => {
+      const { group } = await stageGroup({ autoKickEnabled: true });
+      await addExternalMember(group, "u-spam");
+      await agentScenario({
+        turn: { steps: [{ type: "kick_user", platform_user_id: "u-spam" }] },
+      });
+      const runId = await startRun(group);
+      const lostResponse: GatewayClient = {
+        ...gatewayClient,
+        async kick(groupId, input) {
+          await gatewayClient.kick(groupId, input); // 网关其实移除了
+          throw new GatewayUnreachableError(
+            "POST",
+            `/groups/${groupId}/kick`,
+            new Error("timeout"),
+          );
+        },
+      };
+      await runToEnd({ gateway: lostResponse });
+      const s = await steps(runId);
+      expect(s[0]).toMatchObject({ isError: false, errorCode: null });
+      expect(parseContent(s[0]?.resultContent ?? null)).toEqual({
+        kicked: true,
+      });
+    });
+
+    it("kick 的超时按 run 的剩余预算封顶（60 秒是硬上限）", async () => {
+      const { group } = await stageGroup({ autoKickEnabled: true });
+      await addExternalMember(group, "u-spam");
+      await agentScenario({
+        turn: { steps: [{ type: "kick_user", platform_user_id: "u-spam" }] },
+      });
+      const runId = await startRun(group);
+      const timeouts: (number | undefined)[] = [];
+      const recording: GatewayClient = {
+        ...gatewayClient,
+        async kick(groupId, input, opts) {
+          timeouts.push(opts?.timeoutMs);
+          return gatewayClient.kick(groupId, input);
+        },
+      };
+      await runToEnd({ gateway: recording });
+      expect(timeouts).toHaveLength(1);
+      const t = (await run(runId)).budgetMs;
+      expect(timeouts[0]).toBeGreaterThan(0);
+      expect(timeouts[0]).toBeLessThanOrEqual(t);
+      expect(
+        parseContent((await steps(runId))[0]?.resultContent ?? null),
+      ).toEqual({
+        kicked: true,
+      });
+    });
+
     it("没有 online 的群主 / 管理员 → NO_AVAILABLE_ACCOUNT；普通成员在线也不行", async () => {
       const { group, creator } = await stageGroup({ autoKickEnabled: true });
       await getDb().account.update({
@@ -1882,6 +1942,69 @@ describe("agent run（#12 / #13）", () => {
       });
       expect(s[0]?.isError).toBe(false);
       expectEnded(await run(runId), "finished", "final");
+    });
+
+    it("kick 发出后死掉、停机期间 autoKick 被关掉：恢复时仍按成员列表记成已移除，不记 POLICY_DENIED", async () => {
+      const { group } = await stageGroup({ autoKickEnabled: true });
+      await addExternalMember(group, "u-spam");
+      await agentScenario({
+        turn: { steps: [{ type: "kick_user", platform_user_id: "u-spam" }] },
+      });
+      const runId = await startRun(group);
+      await tick({
+        workerId: "w-dead",
+        checkpoint: async (p) => {
+          if (p === "before_kick") {
+            await gatewayClient.kick(group.gatewayGroupId!, {
+              byAccountId: group.creatorAccountId,
+              targetPlatformUserId: "u-spam",
+            });
+            throw new Error("simulated crash before kick response");
+          }
+        },
+      });
+      // 停机期间运营把自动踢人关了
+      await getDb().group.update({
+        where: { id: group.id },
+        data: { autoKickEnabled: false },
+      });
+      await runToEnd({ workerId: "w-new" });
+      const s = await steps(runId);
+      expect(s[0]).toMatchObject({ isError: false, errorCode: null });
+      expect(parseContent(s[0]?.resultContent ?? null)).toEqual({
+        kicked: true,
+      });
+    });
+
+    it("审计已判 fail、记 AUDIT_REJECTED 之前死掉：重启不再审计（第二次可能 pass），直接按 fail 收口，消息不发", async () => {
+      const { group } = await stageGroup();
+      await agentScenario({
+        turn: { steps: [{ type: "send_message", text: "不当内容" }] },
+        audit: {
+          steps: [{ mode: "fail", reason: "不礼貌" }],
+          fallback: { mode: "pass" },
+        },
+      });
+      const runId = await startRun(group);
+      // 记「AUDIT_REJECTED」那次写失败 = 进程死在审计结论落库之后、结果落库之前
+      await withFailingUpdates(
+        "agent_steps",
+        "NEW.error_code = 'AUDIT_REJECTED'",
+        () => tick({ workerId: "w-dead" }),
+      );
+      expect((await steps(runId))[0]).toMatchObject({
+        auditVerdict: "fail",
+        completedAt: null,
+      });
+      await runToEnd({ workerId: "w-new" });
+      const s = await steps(runId);
+      expect(s[0]).toMatchObject({
+        isError: true,
+        errorCode: "AUDIT_REJECTED",
+        auditVerdict: "fail",
+      });
+      expect((await agentState()).audits).toHaveLength(1);
+      expect((await gatewayState()).sendCalls).toHaveLength(0);
     });
 
     it("心跳过期的 run 被别的副本接手，只折算心跳还活着的那段", async () => {

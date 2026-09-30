@@ -1261,6 +1261,9 @@ async function runAudit(
   deps: AgentRunDeps,
 ): Promise<"pass" | "fail" | "blocked" | "wall_clock"> {
   const db = getDb();
+  // 上次已拿到 fail、死在记「AUDIT_REJECTED」之前：结论就是 fail，不再审一次 —— 再审若得到 pass 就会执行一个
+  // 已被否决的工具调用（A5 第 4、8 条，后端 #52）
+  if (step.auditVerdict === "fail") return "fail";
   let attempts = step.auditAttempts;
   while (attempts < AUDIT_MAX_ATTEMPTS) {
     // 等审计的时间计入 60 秒（A5 第 4 条）：预算用完就不再审、工具不执行
@@ -1576,6 +1579,18 @@ async function executeKick(
   const group = await db.group.findUniqueOrThrow({
     where: { id: run.groupId },
   });
+  // 上次死在「发 kick」与「记结果」之间（toolStartedAt 已写）：先看网关成员列表，目标已不在就是做过了 ——
+  // 不能再做一次，也不能因为停机期间 autoKick 被关 / 群变不可达 / 账号离线，把已生效的 kick 记成失败
+  // （A5 第 8 条，后端 #52）。所以这个核对排在下面所有前置检查之前。
+  if (step.toolStartedAt !== null && group.gatewayGroupId !== null) {
+    deps.log?.warn(
+      { runId: run.id, stepIndex: step.index, target },
+      "kick 结果未知，先核对成员列表",
+    );
+    if (await waitUntilRemoved(group.gatewayGroupId, target, deps)) {
+      return finish(ok({ kicked: true }, `已移除 ${target}（按成员列表确认）`));
+    }
+  }
   if (!group.autoKickEnabled) {
     return finish(
       fail("POLICY_DENIED", "该群未开启 autoKickEnabled，不允许自动移除成员"),
@@ -1584,15 +1599,15 @@ async function executeKick(
   if (group.gatewayGroupId === null || group.status !== "active") {
     return finish(fail("GROUP_UNREACHABLE", "群不可用，无法移除成员"));
   }
-  const account = await pickAccount(run.groupId, true);
-  if (!account) {
-    return finish(
+  const noAccount = (): Promise<boolean> =>
+    finish(
       fail(
         "NO_AVAILABLE_ACCOUNT",
         "群里没有在线的群主 / 管理员账号可以执行移除",
       ),
     );
-  }
+  // 先看一眼有没有能执行的账号（没有就不必去审计），审计完再重新挑：审计可能要十几秒，期间账号可能已离线
+  if (!(await pickAccount(run.groupId, true))) return noAccount();
   if (step.auditVerdict !== "pass") {
     const verdict = await runAudit(
       run,
@@ -1610,17 +1625,20 @@ async function executeKick(
     }
   }
   await deps.checkpoint?.("after_audit");
+  const account = await pickAccount(run.groupId, true);
+  if (!account) return noAccount();
 
-  if (step.toolStartedAt !== null) {
-    // 上次死在「发 kick」与「记结果」之间：先看网关，目标已不在就是做过了，不能再做一次（A5 第 8 条）
-    deps.log?.warn(
-      { runId: run.id, stepIndex: step.index, target },
-      "kick 结果未知，先核对成员列表",
-    );
-    if (await waitUntilRemoved(group.gatewayGroupId, target, deps)) {
-      return finish(ok({ kicked: true }, `已移除 ${target}（按成员列表确认）`));
-    }
-  } else {
+  // 60 秒是硬上限（A5 第 2 条）：kick 的超时也按剩余预算封顶；预算已用完就不再发
+  const remaining = remainingBudgetMs(run, deps.clock.now());
+  if (remaining <= 0) {
+    await endOnWallClock(run, deps, {
+      id: step.id,
+      summary: "run 的 60 秒预算在移除成员前用完，未移除",
+    });
+    return true;
+  }
+
+  if (step.toolStartedAt === null) {
     await db.$transaction(async (tx) => {
       await touchRun(tx, run.id, deps.workerId, deps.clock.now());
       await tx.agentStep.update({
@@ -1632,10 +1650,11 @@ async function executeKick(
   await deps.checkpoint?.("before_kick");
 
   try {
-    await deps.gateway.kick(group.gatewayGroupId, {
-      byAccountId: account.id,
-      targetPlatformUserId: target,
-    });
+    await deps.gateway.kick(
+      group.gatewayGroupId,
+      { byAccountId: account.id, targetPlatformUserId: target },
+      { timeoutMs: remaining },
+    );
   } catch (err) {
     // 执行账号被网关判终态：账号进终态（A2 错误表对所有请求适用），这一步 SEND_FAILED（A5 第 5 条：账号在执行中途
     // 变终态），run 继续
@@ -1688,6 +1707,15 @@ async function executeKick(
       return finish(fail("GROUP_UNREACHABLE", `网关拒绝移除：${err.code}`));
     }
     if (err instanceof GatewayUnreachableError) {
+      // 连不上 / 超时（含按剩余预算封顶的超时）：请求可能已经送达，和 504 一样先按成员列表收敛判断
+      if (await waitUntilRemoved(group.gatewayGroupId, target, deps)) {
+        return finish(
+          ok(
+            { kicked: true },
+            `已移除 ${target}（网关无响应，按成员列表确认）`,
+          ),
+        );
+      }
       return finish(
         fail("GROUP_UNREACHABLE", "网关不可用，无法移除成员", "稍后再试"),
       );
