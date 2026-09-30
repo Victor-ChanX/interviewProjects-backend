@@ -928,7 +928,7 @@ describe("ingest", () => {
       expect(p.received(101)).toBeNull(); // 重复
     });
 
-    it("位置：有空洞就不越过，无论过了多久 —— 慢处理期间晚到的小 id 可能还在缓冲里没读", () => {
+    it("位置：有空洞时，等得还不够（帧数或时间任一不够）就不越过 —— 慢处理期间晚到的小 id 可能还在缓冲里没读", () => {
       // 105 处理了 2 秒；这期间 106 先于 104 进了 socket 缓冲。读到 106 时 104 还没读 —— 游标不能到 106
       const p = createCursorPosition(103);
       expect(p.received(105)).toBeNull();
@@ -936,24 +936,33 @@ describe("ingest", () => {
       expect(p.received(104)).toBe(106);
     });
 
-    it("位置：首次连接没有游标（since = null）：以收到的第一条为起点，之后按连号前进", () => {
-      const p = createCursorPosition(null);
-      expect(p.received(5)).toBe(5);
-      expect(p.received(7)).toBeNull();
-      expect(p.received(6)).toBe(7);
+    it("位置：网关的 id 本身有空洞（不保证连续）—— 又等了足够的帧数且过了足够久就越过，报告越过了哪段", () => {
+      let t = 0;
+      const skipped: [number, number][] = [];
+      const p = createCursorPosition(10, {
+        now: () => t,
+        gapFrames: 3,
+        gapMs: 1_000,
+        onSkip: (from, to) => skipped.push([from, to]),
+      });
+      expect(p.received(11)).toBe(11);
+      // 12、13 永远不来
+      expect(p.received(14)).toBeNull();
+      expect(p.received(15)).toBeNull();
+      expect(p.received(16)).toBeNull();
+      expect(p.received(17)).toBeNull(); // 帧数够了，时间不够
+      t = 1_000;
+      expect(p.received(18)).toBe(18); // 都够了：越过 12–13，一路接到 18
+      expect(skipped).toEqual([[12, 13]]);
+      expect(p.received(19)).toBe(19);
     });
 
-    it("首次连接（库里还没有游标）：处理第一条之前就把起点落库 —— 崩在第一条处理中途也能从起点补拉", async () => {
-      const advances: number[] = [];
-      let seenAtProcessing: number[] = [];
-      const e50 = frame(
-        "message_sent",
-        { clientMsgId: "c-50", msgId: "m-50", sentAt: at(0).toISOString() },
-        50,
-      );
+    it("首次连接（库里还没有游标）带 since=0 从头回放：网关保留全部历史，首次启动前的事件也处理到", async () => {
+      const sinces: (number | null)[] = [];
       const gateway = {
-        async *openEventStream() {
-          yield e50;
+        async *openEventStream({ since }: { since: number | null }) {
+          sinces.push(since);
+          yield* [] as GatewayEvent[];
         },
       };
       await consumeOnce(
@@ -961,20 +970,50 @@ describe("ingest", () => {
           clock,
           gateway,
           log: silentLog,
-          applyGatewayDelivery: async () => {
-            seenAtProcessing = [...advances];
-          },
           cursorStore: {
             read: async () => null,
-            advance: async (id) => {
-              advances.push(id);
-            },
+            advance: async () => undefined,
           },
         },
         new AbortController().signal,
       );
-      expect(seenAtProcessing).toEqual([49]);
-      expect(advances).toEqual([49, 50]);
+      expect(sinces).toEqual([0]);
+    });
+
+    it("毒事件（内容存不进库，如文本含 \\u0000）：隔离 + 不一致记录，游标越过它，后面的事件照常处理", async () => {
+      const group = await localGroup();
+      const poison = frame(
+        "message",
+        { ...msgData("g-1", "m-bad"), text: "坏\u0000内容" },
+        1,
+      );
+      const good = frame("message", msgData("g-1", "m-good"), 2);
+      const gateway = {
+        async *openEventStream() {
+          yield poison;
+          yield good;
+        },
+      };
+      await consumeOnce(
+        { clock, gateway, log: silentLog },
+        new AbortController().signal,
+      );
+      expect(await readCursor()).toBe(2);
+      expect(
+        (await db().message.findMany({ where: { groupId: group.id } })).map(
+          (m) => m.msgId,
+        ),
+      ).toEqual(["m-good"]);
+      const quarantined = await db().inboundEvent.findUniqueOrThrow({
+        where: { eventId: "1" },
+      });
+      expect(quarantined.processedAt).not.toBeNull();
+      expect(quarantined.nextAttemptAt).toBeNull();
+      expect((quarantined.payload as { text: string }).text).toBe("坏内容");
+      const inc = await db().inconsistency.findMany();
+      expect(inc).toEqual([
+        expect.objectContaining({ kind: "inbound_event_unstorable", ref: "1" }),
+      ]);
     });
 
     it("事件流空闲超时：一帧都没有就主动断开（交给 worker 按游标重连），不会永远卡在半开连接上", async () => {

@@ -117,6 +117,8 @@ export const INCONSISTENCY_KINDS = Object.freeze({
   eventFailed: "inbound_event_failed",
   /** 事件指向本地没有的群（外部群 / 建群 job 还没落 gatewayGroupId）：事件已入册，不写时间线 */
   unknownGroup: "inbound_unknown_group",
+  /** 事件原文存不进库（内容不合数据库的数据规则，如文本含 \u0000）：清洗后隔离入册、不处理，事件流越过它继续 */
+  unstorable: "inbound_event_unstorable",
 });
 
 // ---- 事件 payload（题目 2.1）-------------------------------------------------------------
@@ -197,6 +199,9 @@ export async function ingest(
       },
     });
   } catch (err) {
+    // 内容本身存不进库（数据异常，重试多少次都一样）：隔离，不让一条毒事件卡住后面所有事件（后端 #54）。
+    // 其余错误（库不可用等）照旧抛，worker 断流重连、从游标重拉。
+    if (isDataException(err)) return quarantine(event, err, now, deps);
     if (!isUniqueViolation(err)) throw err;
     const existing = await db.inboundEvent.findUniqueOrThrow({
       where: { eventId },
@@ -782,6 +787,64 @@ async function handleAccountStatus(
       ctx.log,
     ),
   );
+}
+
+/**
+ * 毒事件：原文存不进库。清洗后的原文（去掉 \u0000）入册、直接标为已处理（不进重试），同一事务写一条
+ * inbound_event_unstorable 不一致记录给操作员看。这一步也写不进去就是库不可用 → 抛原错误，worker 断流重连。
+ */
+async function quarantine(
+  event: GatewayEvent,
+  cause: unknown,
+  now: Date,
+  deps: IngestDeps,
+): Promise<IngestResult> {
+  const reason = cause instanceof Error ? cause.message : String(cause);
+  const data = JSON.parse(
+    JSON.stringify(event.data).replace(/\\u0000/g, ""),
+  ) as Record<string, unknown>;
+  const cleaned: GatewayEvent = { ...event, data };
+  try {
+    await getDb().$transaction(async (tx) => {
+      await tx.inboundEvent.upsert({
+        where: { eventId: String(event.eventId) },
+        create: {
+          eventId: String(event.eventId),
+          type: event.type,
+          groupId: typeof data.groupId === "string" ? data.groupId : null,
+          payload: data as Prisma.InputJsonObject,
+          receivedAt: now,
+          processedAt: now,
+          lastError: reason.slice(-500),
+          nextAttemptAt: null,
+        },
+        update: {},
+      });
+      await recordInconsistency(
+        tx,
+        INCONSISTENCY_KINDS.unstorable,
+        cleaned,
+        `${event.type} 事件（eventId ${event.eventId}）的内容存不进库，已隔离、未处理（事件流继续）：原文见附带的清洗后内容`,
+      );
+    });
+  } catch {
+    throw cause;
+  }
+  deps.log?.error(
+    { eventId: event.eventId, type: event.type, err: cause },
+    "事件内容存不进库，已隔离",
+  );
+  return { eventId: event.eventId, outcome: "failed" };
+}
+
+/** Postgres 的数据异常（SQLSTATE 22xxx）：内容本身不合规，重试不会好 */
+function isDataException(err: unknown): boolean {
+  if (!(err instanceof Prisma.PrismaClientKnownRequestError)) return false;
+  const code = (
+    err.meta as
+      { driverAdapterError?: { cause?: { code?: unknown } } } | undefined
+  )?.driverAdapterError?.cause?.code;
+  return typeof code === "string" && code.startsWith("22");
 }
 
 function isUniqueViolation(err: unknown): boolean {
