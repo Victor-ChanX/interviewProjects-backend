@@ -15,7 +15,7 @@ export default async function dashboardRoutes(
   r.get(
     "/api/dashboard/summary",
     {
-      preHandler: [requireUser],
+      onRequest: [requireUser],
       schema: {
         summary:
           "工作台概览：账号 / 群 / 今日消息 / Agent 运行 / 序列 / job / 待处理异常的计数（今日按业务时区自然日）",

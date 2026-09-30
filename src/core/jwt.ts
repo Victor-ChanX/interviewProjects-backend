@@ -46,12 +46,25 @@ const HEADER = Buffer.from(
   JSON.stringify({ alg: "HS256", typ: "JWT" }),
 ).toString("base64url");
 
-/** 缺 JWT_SECRET 时只在这里抛：buildApp 启动时先查一次，运行期不会走到。 */
+/** HS256 密钥的最短长度：短于 32 个字符可被离线穷举（openssl rand -hex 32 生成的是 64 个字符） */
+export const JWT_SECRET_MIN_LENGTH = 32;
+
+/** 缺 JWT_SECRET 或太短时只在这里抛：buildApp 启动时先查一次，运行期不会走到。 */
 function secret(): string {
-  if (!config.jwtSecret) {
+  return checkJwtSecret(config.jwtSecret);
+}
+
+/** 校验签名密钥：缺失或短于 JWT_SECRET_MIN_LENGTH 就抛，合格原样返回。 */
+export function checkJwtSecret(value: string | undefined): string {
+  if (!value) {
     throw new Error("缺少 JWT_SECRET（src/core/config.ts）");
   }
-  return config.jwtSecret;
+  if (value.length < JWT_SECRET_MIN_LENGTH) {
+    throw new Error(
+      `JWT_SECRET 太短：至少 ${JWT_SECRET_MIN_LENGTH} 个字符（openssl rand -hex 32）`,
+    );
+  }
+  return value;
 }
 
 export function assertJwtSecretConfigured(): void {

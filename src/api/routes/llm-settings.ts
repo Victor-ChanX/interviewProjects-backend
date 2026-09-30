@@ -40,7 +40,7 @@ export default async function llmSettingsRoutes(
   r.get(
     "/api/llm/settings",
     {
-      preHandler: [requireUser],
+      onRequest: [requireUser],
       schema: {
         summary:
           "当前的 LLM 设置（服务商 Claude / Gemini、模型、key 提示）；Agent 服务不是 llm-agent 时 supported=false",
@@ -54,7 +54,7 @@ export default async function llmSettingsRoutes(
   r.put(
     "/api/llm/settings",
     {
-      preHandler: [requireUser, requireRole("admin")],
+      onRequest: [requireUser, requireRole("admin")],
       schema: {
         summary:
           "保存 LLM 设置（apiKey 省略时仅在服务商不变时沿用已保存的 key），llm-agent 立即生效",
@@ -69,7 +69,7 @@ export default async function llmSettingsRoutes(
   r.post(
     "/api/llm/models",
     {
-      preHandler: [requireUser, requireRole("admin")],
+      onRequest: [requireUser, requireRole("admin")],
       schema: {
         summary:
           "用给定的服务商与 key 获取可用的模型列表（Claude：Models API；Gemini：支持 generateContent 的模型）",
@@ -84,7 +84,7 @@ export default async function llmSettingsRoutes(
   r.post(
     "/api/llm/test",
     {
-      preHandler: [requireUser, requireRole("admin")],
+      onRequest: [requireUser, requireRole("admin")],
       schema: {
         summary:
           "用已保存的 LLM 设置测试连接（一轮带工具历史的对话 + 一次审计），失败也返回 200 与原因",

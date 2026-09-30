@@ -27,7 +27,7 @@ import type { Clock } from "../core/clock.js";
 import { config } from "../core/config.js";
 import { Unauthorized } from "../core/errors.js";
 import { type Principal, signAccessToken } from "../core/jwt.js";
-import { verifyPassword } from "../core/password.js";
+import { UNUSABLE_PASSWORD_HASH, verifyPassword } from "../core/password.js";
 import { getDb } from "../db/client.js";
 
 /** refresh token 的 cookie 名。 */
@@ -88,8 +88,12 @@ export async function login(
     where: { username },
     select: { id: true, username: true, passwordHash: true, role: true },
   });
-  // 两条失败路径同一个码、同一句话；verifyPassword 对坏格式的哈希返回 false 而不抛
-  if (!user || !(await verifyPassword(password, user.passwordHash))) {
+  // 两条失败路径同一个码、同一句话、同样的耗时（用户不存在也跑一遍 scrypt）；verifyPassword 对坏格式的哈希返回 false 而不抛
+  const valid = await verifyPassword(
+    password,
+    user?.passwordHash ?? UNUSABLE_PASSWORD_HASH,
+  );
+  if (!user || !valid) {
     throw new Unauthorized("UNAUTHORIZED", "用户名或密码错误");
   }
   const at = now(deps);
@@ -240,6 +244,23 @@ export async function logout(
 ): Promise<{ revokedCount: number }> {
   const row = await getDb().session.findUnique({
     where: { id: sessionId },
+    select: { tokenFamily: true },
+  });
+  if (!row) return { revokedCount: 0 };
+  const { count } = await revokeFamily(row.tokenFamily, now(deps));
+  return { revokedCount: count };
+}
+
+/**
+ * 按 refresh token 登出（access token 已过期、只剩 cookie 时）：找到它所在的族，整族作废。
+ * 不认识的 token 当作已登出，不报错 —— 登出是幂等的收尾动作，不给调用方探测 token 是否有效的机会。
+ */
+export async function logoutByRefreshToken(
+  rawToken: string,
+  deps: Deps = {},
+): Promise<{ revokedCount: number }> {
+  const row = await getDb().session.findUnique({
+    where: { tokenHash: hashToken(rawToken) },
     select: { tokenFamily: true },
   });
   if (!row) return { revokedCount: 0 };

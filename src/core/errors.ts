@@ -56,7 +56,9 @@ export type ErrorCode =
   // AGENT_URL 指向的服务没有管理端点（例如 Agent 模拟器），或没配 LLM_AGENT_ADMIN_TOKEN（409：切到 llm-agent 后就能用）
   | "LLM_AGENT_UNSUPPORTED"
   // ---- 异常中心（#22，题目 A2「让操作员看到」：GET /api/inconsistencies/:id、POST …/resolve）----
-  | "INCONSISTENCY_NOT_FOUND";
+  | "INCONSISTENCY_NOT_FOUND"
+  /** 没有这个接口（未匹配的路由） */
+  | "ROUTE_NOT_FOUND";
 
 export type ErrorExtra = Record<string, unknown>;
 

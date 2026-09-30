@@ -29,7 +29,7 @@ export default async function agentRunRoutes(
   r.get(
     "/api/agent-runs",
     {
-      preHandler: [requireUser],
+      onRequest: [requireUser],
       schema: {
         summary:
           "全部群的 agent run 列表：可按状态、群筛选，按创建时间倒序游标分页（不含 steps）",
@@ -50,7 +50,7 @@ export default async function agentRunRoutes(
   r.get(
     "/api/agent-runs/:id",
     {
-      preHandler: [requireUser],
+      onRequest: [requireUser],
       schema: {
         summary:
           "某次 agent run 的详情：状态、结束原因、summary 与全部步骤（含协议错误步）",
@@ -65,7 +65,7 @@ export default async function agentRunRoutes(
   r.get(
     "/api/groups/:id/agent-runs",
     {
-      preHandler: [requireUser],
+      onRequest: [requireUser],
       schema: {
         summary: "某群最近的 agent run 列表（最新在前，不含 steps）",
         tags: ["agent-runs"],

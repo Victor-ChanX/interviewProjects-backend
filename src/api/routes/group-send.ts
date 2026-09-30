@@ -24,7 +24,7 @@ export default async function groupSendRoutes(
   r.post(
     "/:id/send",
     {
-      preHandler: [requireUser, requireRole("admin")],
+      onRequest: [requireUser, requireRole("admin")],
       schema: {
         summary: "以某服务账号身份往群里发一条消息（入队，202）",
         tags: ["groups"],

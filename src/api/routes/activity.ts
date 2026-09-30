@@ -15,7 +15,7 @@ export default async function activityRoutes(
   r.get(
     "/api/activity",
     {
-      preHandler: [requireUser],
+      onRequest: [requireUser],
       schema: {
         summary:
           "最近动态：WS 事件（白名单类型）按 seq 倒序，游标分页；首屏用它，之后靠 WS 追加",

@@ -27,7 +27,7 @@ export default async function inconsistencyRoutes(
   r.get(
     "/api/inconsistencies",
     {
-      preHandler: [requireUser],
+      onRequest: [requireUser],
       schema: {
         summary:
           "异常中心列表：不一致记录按创建时间倒序，可按是否已处理筛选，游标分页（不含 payload）",
@@ -50,7 +50,7 @@ export default async function inconsistencyRoutes(
   r.get(
     "/api/inconsistencies/:id",
     {
-      preHandler: [requireUser],
+      onRequest: [requireUser],
       schema: {
         summary: "某条不一致记录的详情（含 payload 原文）",
         tags: ["inconsistencies"],
@@ -64,7 +64,7 @@ export default async function inconsistencyRoutes(
   r.post(
     "/api/inconsistencies/:id/resolve",
     {
-      preHandler: [requireUser, requireRole("admin")],
+      onRequest: [requireUser, requireRole("admin")],
       schema: {
         summary:
           "把一条不一致记录标记为已处理（记录处理人；幂等，重复标记返回原记录）",

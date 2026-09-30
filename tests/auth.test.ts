@@ -10,7 +10,16 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { requireRole, requireUser } from "../src/api/guards.js";
 import { buildApp } from "../src/app.js";
 import type { ErrorEnvelope } from "../src/app.js";
-import { ACCESS_TOKEN_TTL_SECONDS, type Principal } from "../src/core/jwt.js";
+import {
+  ACCESS_TOKEN_TTL_SECONDS,
+  checkJwtSecret,
+  JWT_SECRET_MIN_LENGTH,
+  type Principal,
+} from "../src/core/jwt.js";
+import {
+  UNUSABLE_PASSWORD_HASH,
+  verifyPassword,
+} from "../src/core/password.js";
 import { closeDb } from "../src/db/client.js";
 import { authHeaders, login, loginAs } from "./factories.js";
 import { truncateAll } from "./setup.js";
@@ -20,12 +29,12 @@ const PROBE_WRITE = "/__test/probe/write";
 
 /** 探针路由：只在测试进程里注册，不进地图与 openapi。 */
 async function probeRoutes(app: FastifyInstance): Promise<void> {
-  app.get(PROBE_READ, { preHandler: [requireUser] }, async (req) => ({
+  app.get(PROBE_READ, { onRequest: [requireUser] }, async (req) => ({
     principal: req.principal,
   }));
   app.post(
     PROBE_WRITE,
-    { preHandler: [requireUser, requireRole("admin")] },
+    { onRequest: [requireUser, requireRole("admin")] },
     async (req) => ({ by: req.principal?.username }),
   );
 }
@@ -76,6 +85,21 @@ describe("auth", () => {
       expect(res.json()).toMatchObject({
         error: { code: "UNAUTHORIZED", message: "用户名或密码错误" },
       });
+    });
+
+    it("用户名不存在也跑一遍 scrypt：占位哈希格式合法、任何口令都验不过", async () => {
+      expect(UNUSABLE_PASSWORD_HASH.split("$")).toHaveLength(6);
+      expect(await verifyPassword("admin", UNUSABLE_PASSWORD_HASH)).toBe(false);
+      expect(await verifyPassword("", UNUSABLE_PASSWORD_HASH)).toBe(false);
+    });
+
+    it("JWT_SECRET 缺失或短于 32 个字符：拒绝签发（启动即失败）", () => {
+      expect(() => checkJwtSecret(undefined)).toThrow(/缺少/);
+      expect(() =>
+        checkJwtSecret("x".repeat(JWT_SECRET_MIN_LENGTH - 1)),
+      ).toThrow(/太短/);
+      const ok = "x".repeat(JWT_SECRET_MIN_LENGTH);
+      expect(checkJwtSecret(ok)).toBe(ok);
     });
 
     it("边界：请求体形状错 → 400 VALIDATION_ERROR，带 issues", async () => {
@@ -190,6 +214,24 @@ describe("auth", () => {
       expect(res.json()).toEqual({ by: "admin" });
     });
 
+    it("闸门先于请求体校验：viewer 带非法请求体调真实写端点 → 403（不是 400）；未登录 → 401", async () => {
+      const viewer = await loginAs(app, "viewer");
+      const asViewer = await app.inject({
+        method: "POST",
+        url: "/api/groups",
+        headers: viewer,
+        payload: { memberAccountIds: "not-an-array" },
+      });
+      expect(asViewer.statusCode).toBe(403);
+      expect(asViewer.json()).toMatchObject({ error: { code: "FORBIDDEN" } });
+      const anon = await app.inject({
+        method: "POST",
+        url: "/api/groups",
+        payload: {},
+      });
+      expect(anon.statusCode).toBe(401);
+    });
+
     it("没登录直接调写端点 → 401（不是 403：先分清是谁）", async () => {
       const res = await app.inject({ method: "POST", url: PROBE_WRITE });
       expect(res.statusCode).toBe(401);
@@ -229,6 +271,22 @@ describe("auth", () => {
         expect(error.code).toBe("VALIDATION_ERROR");
         expect(error.reason).toMatch(/^FST_ERR_/);
       }
+    });
+
+    it("没有这个接口 → 404 ROUTE_NOT_FOUND，同样是错误信封", async () => {
+      const res = await app.inject({
+        method: "GET",
+        url: "/api/no-such-thing?x=1",
+        headers: { "x-request-id": "gw-404" },
+      });
+      expect(res.statusCode).toBe(404);
+      expect(res.json()).toEqual({
+        error: {
+          code: "ROUTE_NOT_FOUND",
+          message: "没有这个接口：GET /api/no-such-thing",
+          requestId: "gw-404",
+        },
+      });
     });
 
     it("没传 x-request-id 时自生成，信封与响应头是同一个", async () => {

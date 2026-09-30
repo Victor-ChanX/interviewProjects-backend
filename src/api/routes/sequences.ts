@@ -26,7 +26,7 @@ export default async function sequenceRoutes(
     "/",
     {
       prefixTrailingSlash: "no-slash",
-      preHandler: [requireUser, requireRole("admin")],
+      onRequest: [requireUser, requireRole("admin")],
       schema: {
         summary: "创建序列定义（题目 B1 的 JSON）",
         tags: ["sequences"],
@@ -44,7 +44,7 @@ export default async function sequenceRoutes(
     "/",
     {
       prefixTrailingSlash: "no-slash",
-      preHandler: [requireUser],
+      onRequest: [requireUser],
       schema: {
         summary: "列出全部序列定义（按创建顺序）",
         tags: ["sequences"],

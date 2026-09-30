@@ -1,5 +1,7 @@
-// 闸门（preHandler）。地图只认这个文件导出的函数为闸门：
-// 路由的 preHandler 里没有任何一个来自这里 → endpoint-without-auth 告警。
+// 闸门（挂在路由的 onRequest 上）。地图只认这个文件导出的函数为闸门：
+// 路由的 onRequest / preHandler 里没有任何一个来自这里 → endpoint-without-auth 告警。
+// 挂 onRequest 而不是 preHandler：onRequest 在请求体解析与 schema 校验**之前**跑，未登录 / 无权限的写请求
+// 先拿到 401 / 403，不会因为请求体不合法先拿到 400（题目 A0：viewer 对所有写操作得到 403）。
 //
 // requireUser：Authorization: Bearer <access token> → 验签（src/core/jwt.ts）→ 按 sid 查会话未作废
 // （src/services/auth-service.ts 的 assertSessionActive，issue #17）→ request.principal。
@@ -15,12 +17,17 @@ import {
   type VerifyFailure,
   verifyAccessToken,
 } from "../core/jwt.js";
-import { assertSessionActive } from "../services/auth-service.js";
+import {
+  assertSessionActive,
+  REFRESH_COOKIE_NAME,
+} from "../services/auth-service.js";
 
 declare module "fastify" {
   interface FastifyRequest {
     /** requireUser 通过后一定有；路由把它当普通参数传给 service */
     principal?: Principal;
+    /** requireUserOrRefreshCookie 在没有有效 Bearer 时放进来的 refresh token（只给登出用） */
+    refreshCredential?: string;
   }
 }
 
@@ -57,6 +64,25 @@ export async function requireUser(
     role: result.claims.role,
     sessionId: result.claims.sessionId,
   };
+}
+
+/**
+ * 登出专用：有效的 Bearer 与 refresh cookie 二者有其一即可。access token 过期（15 分钟）之后用户仍要能登出，
+ * 否则 refresh 会话继续有效、拿 cookie 还能换出新 token。有有效 Bearer → 同 requireUser；否则有 refresh cookie →
+ * req.refreshCredential（由 service 按它找族作废）；两者都没有 → 401。
+ */
+export async function requireUserOrRefreshCookie(
+  req: FastifyRequest,
+  reply: FastifyReply,
+): Promise<void> {
+  const cookie = req.cookies[REFRESH_COOKIE_NAME];
+  try {
+    await requireUser(req, reply);
+    return;
+  } catch (err) {
+    if (!(err instanceof Unauthorized) || !cookie) throw err;
+  }
+  req.refreshCredential = cookie;
 }
 
 /**

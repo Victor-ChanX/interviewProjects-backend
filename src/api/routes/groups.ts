@@ -37,7 +37,7 @@ export default async function groupRoutes(app: FastifyInstance): Promise<void> {
     "/",
     {
       prefixTrailingSlash: "no-slash",
-      preHandler: [requireUser, requireRole("admin")],
+      onRequest: [requireUser, requireRole("admin")],
       schema: {
         summary:
           "建群 + 拉人 + 提升 memberAccountIds[0] 为管理员（异步 job，202）",
@@ -57,7 +57,7 @@ export default async function groupRoutes(app: FastifyInstance): Promise<void> {
     {
       // 只注册 /api/groups（不带斜杠），让 onRoute 与 openapi 的路径一一对应
       prefixTrailingSlash: "no-slash",
-      preHandler: [requireUser],
+      onRequest: [requireUser],
       schema: {
         summary: "列出全部群（含成员与进行中的运行）",
         tags: ["groups"],
@@ -70,7 +70,7 @@ export default async function groupRoutes(app: FastifyInstance): Promise<void> {
   r.get(
     "/:id",
     {
-      preHandler: [requireUser],
+      onRequest: [requireUser],
       schema: {
         summary: "群详情：成员、开关、进行中的运行",
         tags: ["groups"],
@@ -84,7 +84,7 @@ export default async function groupRoutes(app: FastifyInstance): Promise<void> {
   r.patch(
     "/:id",
     {
-      preHandler: [requireUser, requireRole("admin")],
+      onRequest: [requireUser, requireRole("admin")],
       schema: {
         summary: "改群开关 agentEnabled / autoKickEnabled",
         tags: ["groups"],
@@ -99,7 +99,7 @@ export default async function groupRoutes(app: FastifyInstance): Promise<void> {
   r.post(
     "/:id/leave-all",
     {
-      preHandler: [requireUser, requireRole("admin")],
+      onRequest: [requireUser, requireRole("admin")],
       schema: {
         summary: "群里所有服务账号退群：非群主先、群主最后（异步 job，202）",
         tags: ["groups"],

@@ -13,7 +13,7 @@ export default async function jobRoutes(app: FastifyInstance): Promise<void> {
   r.get(
     "/:jobId",
     {
-      preHandler: [requireUser],
+      onRequest: [requireUser],
       schema: {
         summary: "查异步任务（建群 / leave-all）的状态与失败步骤",
         tags: ["jobs"],

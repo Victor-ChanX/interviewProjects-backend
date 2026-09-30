@@ -307,6 +307,29 @@ describe("sessions（#17）", () => {
       expect((await refresh(app, b.refreshToken)).statusCode).toBe(200);
     });
 
+    it("access token 过期后只凭 refresh cookie 也能登出：整族作废，cookie 再刷新 401", async () => {
+      const s = await loginSession(app, "viewer");
+      const expired = await authHeaders("u-any", [], {
+        sessionId: "no-such-session",
+        ttlSeconds: -1,
+      });
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/auth/logout",
+        headers: expired,
+        cookies: { [REFRESH_COOKIE_NAME]: s.refreshToken },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({ ok: true });
+      expect(refreshCookieFrom(res)?.value).toBe("");
+      const r = await refresh(app, s.refreshToken);
+      expect(r.statusCode).toBe(401);
+      expect(r.json()).toMatchObject({
+        error: { code: "UNAUTHORIZED", reason: "revoked" },
+      });
+      expect((await probe(s.headers)).statusCode).toBe(401);
+    });
+
     it("边界：没登录直接 logout → 401", async () => {
       const res = await logout(app, {});
       expect(res.statusCode).toBe(401);

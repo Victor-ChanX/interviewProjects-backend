@@ -54,7 +54,7 @@ export default async function accountRoutes(
     {
       // 只注册 /api/accounts（不带斜杠），让 onRoute 与 openapi 的路径一一对应
       prefixTrailingSlash: "no-slash",
-      preHandler: [requireUser],
+      onRequest: [requireUser],
       schema: {
         summary: "列出全部服务账号及其状态",
         tags: ["accounts"],
@@ -67,7 +67,7 @@ export default async function accountRoutes(
   r.post(
     "/:id/connect",
     {
-      preHandler: [requireUser, requireRole("admin")],
+      onRequest: [requireUser, requireRole("admin")],
       schema: {
         summary: "调网关 connect，账号 idle / disconnected → online",
         tags: ["accounts"],
@@ -87,7 +87,7 @@ export default async function accountRoutes(
   r.post(
     "/:id/transition",
     {
-      preHandler: [requireUser, requireRole("admin")],
+      onRequest: [requireUser, requireRole("admin")],
       schema: {
         summary: "操作员手动标记账号状态（expectedFrom 做 CAS）",
         tags: ["accounts"],

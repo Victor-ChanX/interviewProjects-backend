@@ -48,6 +48,13 @@ export async function hashPassword(password: string): Promise<string> {
   ].join("$");
 }
 
+/**
+ * 用户名不存在时拿它跑一遍 verifyPassword：两条失败路径耗时一样，不能从响应快慢判断用户名是否存在。
+ * 随机口令的哈希，口令本身已丢弃，任何输入都验不过。
+ */
+export const UNUSABLE_PASSWORD_HASH =
+  "scrypt$16384$8$1$BkklPxSlsK3f3hHe8GWLGA==$rBq7omwaIFXiWcAJAqdqfHQ6+viP1PNAMzO7+oWsOwjgjuiHXQTlOP0EVYddxtzh26pHRf2WXtWV5pF6lc4cSQ==";
+
 /** 格式不认识 / 被截断的串一律 false，不抛错（登录路径上把坏数据当成密码错误处理）。 */
 export async function verifyPassword(
   password: string,

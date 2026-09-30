@@ -34,7 +34,7 @@ import sequenceRunRoutes from "./api/routes/sequence-runs.js";
 import sequenceRoutes from "./api/routes/sequences.js";
 import wsRoutes from "./api/routes/ws.js";
 import { config } from "./core/config.js";
-import { DomainError, type ErrorCode } from "./core/errors.js";
+import { DomainError, type ErrorCode, NotFound } from "./core/errors.js";
 import { assertJwtSecretConfigured } from "./core/jwt.js";
 import type { GatewayClient } from "./services/gateway-client.js";
 import type { LlmAdminClient } from "./services/llm-settings-service.js";
@@ -175,6 +175,14 @@ export async function buildApp(
     }
     req.log.error({ err, requestId }, "未处理的异常");
     envelope(500, "INTERNAL", "服务内部错误");
+  });
+
+  // 未匹配的路由同样走错误信封（题目 2.3：错误响应统一为 { error: { code, message, requestId } }）
+  app.setNotFoundHandler(async (req) => {
+    throw new NotFound(
+      "ROUTE_NOT_FOUND",
+      `没有这个接口：${req.method} ${req.url.split("?")[0]}`,
+    );
   });
 
   // 不 await：路由插件排队到 app.ready() 再装载（onRoute 已在上面挂好）。

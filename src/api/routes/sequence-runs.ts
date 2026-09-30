@@ -26,7 +26,7 @@ export default async function sequenceRunRoutes(
   r.post(
     "/api/groups/:id/sequence-runs",
     {
-      preHandler: [requireUser, requireRole("admin")],
+      onRequest: [requireUser, requireRole("admin")],
       schema: {
         summary:
           "在某群启动一次序列运行（预检取值链；同群至多一个 running；201 后由 worker 按排期发送）",
@@ -47,7 +47,7 @@ export default async function sequenceRunRoutes(
   r.get(
     "/api/sequence-runs/:id",
     {
-      preHandler: [requireUser],
+      onRequest: [requireUser],
       schema: {
         summary: "某次序列运行的状态与每步的取值 / 排期 / 发送结果",
         tags: ["sequences"],

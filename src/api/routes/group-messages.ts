@@ -20,7 +20,7 @@ export default async function groupMessageRoutes(
   r.get(
     "/:id/messages",
     {
-      preHandler: [requireUser],
+      onRequest: [requireUser],
       schema: {
         summary:
           "群消息时间线：按 sentAt 倒序，游标分页（before = 上一页的 nextCursor）",
