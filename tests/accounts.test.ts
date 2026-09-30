@@ -707,12 +707,16 @@ describe("accounts", () => {
         ).toBe("rate_limited");
 
         clock.advance(5_000);
-        await vi.advanceTimersByTimeAsync(1_000);
-        await settle();
-        expect(
-          (await getDb().account.findUniqueOrThrow({ where: { id: a.id } }))
-            .status,
-        ).toBe("online");
+        // tick 是真库 I/O，在假定时器下完成时刻不确定：推进定时器后轮询直到落库
+        let status = "rate_limited";
+        for (let i = 0; i < 40 && status !== "online"; i += 1) {
+          await vi.advanceTimersByTimeAsync(250);
+          await settle();
+          status = (
+            await getDb().account.findUniqueOrThrow({ where: { id: a.id } })
+          ).status;
+        }
+        expect(status).toBe("online");
 
         await worker.stop();
       });

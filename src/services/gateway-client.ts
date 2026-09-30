@@ -14,6 +14,52 @@ export type GatewayClient = {
   connect(accountId: string): Promise<{ platformUserId: string }>;
   /** POST /accounts/:accountId/disconnect → 账号离线 */
   disconnect(accountId: string): Promise<void>;
+  /**
+   * GET /events?since=<eventId>（SSE，#8）：逐帧产出解析后的事件。since 为 null = 不带（只收连接之后的）。
+   * 连接被掐断 / 网关回非 2xx 时**抛错**（GatewayUnreachableError / GatewayResponseError），
+   * 由入站 worker 带最新游标重连；signal 被 abort 则安静结束（停机）。
+   */
+  openEventStream(opts: OpenEventStreamOptions): AsyncIterable<GatewayEvent>;
+  /**
+   * POST /groups/:groupId/send → 202 { accepted: true }（#7）。同步错误全套按 GatewayResponseError 抛：
+   * 429 RATE_LIMITED（body.retryAfterSeconds）/ 403 ACCOUNT_SUSPENDED / 401 SESSION_EXPIRED /
+   * 403 GROUP_WRITE_FORBIDDEN / 403 SENDER_NOT_IN_GROUP / 409 ACCOUNT_OFFLINE / 504 NETWORK_TIMEOUT / 503。
+   */
+  send(input: GatewaySendInput): Promise<{ accepted: true }>;
+  /**
+   * GET /groups/:groupId/messages/by-client-id/:clientMsgId → 200 { msgId, sentAt } / 404 → null（#7）。
+   * 503 / 连不上照常抛（GatewayResponseError / GatewayUnreachableError）：查询不可用 ≠ 没发出。
+   */
+  getMessageByClientId(
+    groupId: string,
+    clientMsgId: string,
+  ): Promise<GatewayMessageLanding | null>;
+};
+
+export type GatewaySendInput = {
+  /** 网关侧的 groupId（groups.gatewayGroupId） */
+  groupId: string;
+  accountId: string;
+  /** 幂等键：重试 / 重发都带同一个（网关不按它去重，对账靠它） */
+  clientMsgId: string;
+  text: string;
+};
+
+/** by-client-id 查询命中：网关里最早落地的那一条 */
+export type GatewayMessageLanding = { msgId: string; sentAt: string };
+
+/** SSE 一帧解析后的事件：id 帧 → eventId（网关保证全局单调递增的整数）、event 帧 → type、data 帧 → JSON。 */
+export type GatewayEvent = {
+  eventId: number;
+  type: string;
+  data: Record<string, unknown>;
+};
+
+export type OpenEventStreamOptions = {
+  /** 独占：只要 eventId > since 的事件；null = 不带 since */
+  since: number | null;
+  /** 停机时 abort：流安静结束，不抛错 */
+  signal?: AbortSignal;
 };
 
 /** 网关明确回了 4xx / 5xx：status 与体里的 code 都给 service 分支用。 */
@@ -61,28 +107,37 @@ export function createGatewayClient(
   const fetchImpl = opts.fetch ?? fetch;
   const timeoutMs = opts.timeoutMs ?? 10_000;
 
-  async function post(path: string): Promise<unknown> {
+  /** 一次 JSON 往返：非 2xx → GatewayResponseError；连不上 / 超时 / 2xx 但不是 JSON → GatewayUnreachableError。 */
+  async function request(
+    method: "GET" | "POST",
+    path: string,
+    payload?: unknown,
+  ): Promise<{ status: number; body: unknown }> {
     let res: Response;
     try {
       res = await fetchImpl(`${baseUrl}${path}`, {
-        method: "POST",
+        method,
         headers: { "content-type": "application/json" },
-        body: "{}",
+        ...(method === "POST" ? { body: JSON.stringify(payload ?? {}) } : {}),
         signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (err) {
-      throw new GatewayUnreachableError("POST", path, err);
+      throw new GatewayUnreachableError(method, path, err);
     }
     const text = await res.text();
     let body: unknown;
     try {
       body = text.trim() === "" ? {} : (JSON.parse(text) as unknown);
     } catch (err) {
-      if (res.ok) throw new GatewayUnreachableError("POST", path, err);
+      if (res.ok) throw new GatewayUnreachableError(method, path, err);
       body = text;
     }
-    if (!res.ok) throw new GatewayResponseError("POST", path, res.status, body);
-    return body;
+    if (!res.ok) throw new GatewayResponseError(method, path, res.status, body);
+    return { status: res.status, body };
+  }
+
+  async function post(path: string): Promise<unknown> {
+    return (await request("POST", path)).body;
   }
 
   return {
@@ -104,7 +159,165 @@ export function createGatewayClient(
     async disconnect(accountId) {
       await post(`/accounts/${encodeURIComponent(accountId)}/disconnect`);
     },
+    openEventStream(opts) {
+      return openEventStream(fetchImpl, baseUrl, opts);
+    },
+    async send(input) {
+      await request(
+        "POST",
+        `/groups/${encodeURIComponent(input.groupId)}/send`,
+        {
+          accountId: input.accountId,
+          clientMsgId: input.clientMsgId,
+          text: input.text,
+        },
+      );
+      return { accepted: true };
+    },
+    async getMessageByClientId(groupId, clientMsgId) {
+      const path = `/groups/${encodeURIComponent(groupId)}/messages/by-client-id/${encodeURIComponent(clientMsgId)}`;
+      let body: unknown;
+      try {
+        ({ body } = await request("GET", path));
+      } catch (err) {
+        // 404 是这个端点的正常答案（没落地），其余错误原样抛给调用方分辨「查询不可用」
+        if (err instanceof GatewayResponseError && err.status === 404) {
+          return null;
+        }
+        throw err;
+      }
+      const { msgId, sentAt } = body as { msgId?: unknown; sentAt?: unknown };
+      if (typeof msgId !== "string" || typeof sentAt !== "string") {
+        throw new GatewayUnreachableError(
+          "GET",
+          path,
+          new Error("响应缺少 msgId / sentAt"),
+        );
+      }
+      return { msgId, sentAt };
+    },
   };
+}
+
+// ---- SSE 事件流（#8）------------------------------------------------------------------
+
+/**
+ * 读 GET /events 的 SSE 流。按 SSE 规范切帧：行以 \n（或 \r\n）分隔，空行派发一帧；`field: value`，
+ * 同一帧里多行 data 用 \n 拼接；以 `:` 开头的是注释（心跳），忽略。只认 id / event / data 三个字段。
+ * - 网关回非 2xx（503 等）→ GatewayResponseError；连不上 / 不是 text/event-stream → GatewayUnreachableError；
+ * - 服务端掐断（body 读到 done）→ GatewayUnreachableError（对 worker 来说就是「重连」的信号）；
+ * - signal abort → 生成器 return，不抛。
+ * - id 不是整数、data 不是 JSON 对象的帧：跳过（不能因为一帧坏了让整条流断掉），由调用方的日志可见 ——
+ *   这里不打日志（客户端不知道 runId）。
+ */
+async function* openEventStream(
+  fetchImpl: typeof fetch,
+  baseUrl: string,
+  opts: OpenEventStreamOptions,
+): AsyncGenerator<GatewayEvent, void, undefined> {
+  const path =
+    opts.since === null
+      ? "/events"
+      : `/events?since=${encodeURIComponent(String(opts.since))}`;
+  let res: Response;
+  try {
+    res = await fetchImpl(`${baseUrl}${path}`, {
+      method: "GET",
+      headers: { accept: "text/event-stream" },
+      signal: opts.signal,
+    });
+  } catch (err) {
+    if (opts.signal?.aborted) return;
+    throw new GatewayUnreachableError("GET", path, err);
+  }
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    let body: unknown = text;
+    try {
+      body = text.trim() === "" ? {} : (JSON.parse(text) as unknown);
+    } catch {
+      // 非 JSON 错误体：原文即可
+    }
+    throw new GatewayResponseError("GET", path, res.status, body);
+  }
+  const contentType = res.headers.get("content-type") ?? "";
+  if (!contentType.startsWith("text/event-stream") || !res.body) {
+    throw new GatewayUnreachableError(
+      "GET",
+      path,
+      new Error(`响应不是 SSE（content-type: ${contentType || "无"}）`),
+    );
+  }
+
+  // fetch 的 body 在 lib.dom 里是 ReadableStream<any>；这里钉成字节流，decode 才有类型可查
+  const reader = (res.body as ReadableStream<Uint8Array>).getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    for (;;) {
+      let chunk: Awaited<ReturnType<typeof reader.read>>;
+      try {
+        chunk = await reader.read();
+      } catch (err) {
+        if (opts.signal?.aborted) return;
+        throw new GatewayUnreachableError("GET", path, err);
+      }
+      if (chunk.done) {
+        if (opts.signal?.aborted) return;
+        throw new GatewayUnreachableError(
+          "GET",
+          path,
+          new Error("事件流已断开"),
+        );
+      }
+      const bytes: Uint8Array = chunk.value;
+      buffer += decoder.decode(bytes, { stream: true });
+      // 帧以空行结束；\r\n 统一成 \n 再切
+      buffer = buffer.replace(/\r\n/g, "\n");
+      let end = buffer.indexOf("\n\n");
+      while (end >= 0) {
+        const frame = parseSseFrame(buffer.slice(0, end));
+        buffer = buffer.slice(end + 2);
+        if (frame) yield frame;
+        end = buffer.indexOf("\n\n");
+      }
+    }
+  } finally {
+    // 生成器被提前 return（worker 停机 / 调用方 break）时释放连接
+    await reader.cancel().catch(() => undefined);
+  }
+}
+
+/** 一帧原文 → 事件；缺 id / event / data 或形状不对返回 undefined（调用方跳过）。 */
+export function parseSseFrame(raw: string): GatewayEvent | undefined {
+  let id: string | undefined;
+  let event: string | undefined;
+  const data: string[] = [];
+  for (const line of raw.split("\n")) {
+    if (line === "" || line.startsWith(":")) continue;
+    const colon = line.indexOf(":");
+    const field = colon < 0 ? line : line.slice(0, colon);
+    let value = colon < 0 ? "" : line.slice(colon + 1);
+    if (value.startsWith(" ")) value = value.slice(1);
+    if (field === "id") id = value;
+    else if (field === "event") event = value;
+    else if (field === "data") data.push(value);
+  }
+  if (id === undefined || event === undefined || data.length === 0) {
+    return undefined;
+  }
+  const eventId = Number(id);
+  if (!Number.isSafeInteger(eventId)) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(data.join("\n"));
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return undefined;
+  }
+  return { eventId, type: event, data: parsed as Record<string, unknown> };
 }
 
 /**
@@ -125,5 +338,9 @@ export function gatewayClientFromConfig(): GatewayClient {
   return {
     connect: (accountId) => resolve().connect(accountId),
     disconnect: (accountId) => resolve().disconnect(accountId),
+    openEventStream: (opts) => resolve().openEventStream(opts),
+    send: (input) => resolve().send(input),
+    getMessageByClientId: (groupId, clientMsgId) =>
+      resolve().getMessageByClientId(groupId, clientMsgId),
   };
 }

@@ -11,7 +11,12 @@ import type { Clock } from "../src/core/clock.js";
 import { type Role, signAccessToken } from "../src/core/jwt.js";
 import { hashPassword } from "../src/core/password.js";
 import { getDb } from "../src/db/client.js";
-import type { Account, Group, Prisma } from "../src/db/generated/client.js";
+import type {
+  Account,
+  Group,
+  Message,
+  Prisma,
+} from "../src/db/generated/client.js";
 import { SEED_USERS } from "../src/db/seed.js";
 
 
@@ -103,4 +108,29 @@ export async function makeGroup(
   const creatorAccountId =
     overrides.creatorAccountId ?? (await makeAccount()).id;
   return db.group.create({ data: { ...overrides, creatorAccountId } });
+}
+
+/**
+ * 往 messages 表直接插一行（时间线 / outbox 用例）：默认是别人发的入站消息（isOwn = false、deliveryStatus null）；
+ * 自己的出站行传 { isOwn: true, deliveryStatus: "queued", clientMsgId, accountId }。sentAt 默认「现在」，
+ * 排序相关的用例显式传（毫秒精度：游标按 ISO 毫秒编码）。
+ */
+export async function makeMessage(
+  overrides: Partial<Prisma.MessageUncheckedCreateInput> & { groupId: string },
+): Promise<Message> {
+  const db = getDb();
+  return db.message.create({
+    data: {
+      senderPlatformUserId: `pu-${randomUUID().slice(0, 8)}`,
+      text: `msg-${randomUUID().slice(0, 8)}`,
+      sentAt: new Date(),
+      ...overrides,
+    },
+  });
+}
+
+/** 从 loginAs / authHeaders 返回的 headers 里取出裸 access token（WebSocket 的 auth 帧要它，不是 Authorization 头）。 */
+export function tokenFrom(headers: Record<string, string>): string {
+  const header = headers.authorization ?? "";
+  return header.startsWith("Bearer ") ? header.slice("Bearer ".length) : header;
 }

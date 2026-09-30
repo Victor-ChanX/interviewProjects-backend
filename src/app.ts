@@ -2,6 +2,7 @@
 // 这里不连数据库：地图与 openapi 脚本会在 PROJECT_MAP_BUILD=1 下 import 本文件。
 import fastifyCors from "@fastify/cors";
 import fastifySwagger from "@fastify/swagger";
+import fastifyWebsocket from "@fastify/websocket";
 import Fastify, {
   type FastifyInstance,
   type onRouteHookHandler,
@@ -18,15 +19,20 @@ import {
 
 import accountRoutes from "./api/routes/accounts.js";
 import authRoutes from "./api/routes/auth.js";
+import groupMessageRoutes from "./api/routes/group-messages.js";
+import groupSendRoutes from "./api/routes/group-send.js";
 import healthRoutes from "./api/routes/health.js";
+import wsRoutes from "./api/routes/ws.js";
 import { config } from "./core/config.js";
 import { DomainError, type ErrorCode } from "./core/errors.js";
 import { assertJwtSecretConfigured } from "./core/jwt.js";
 import type { GatewayClient } from "./services/gateway-client.js";
+import { createWsHub, type WsHub } from "./services/ws-hub.js";
 // 副作用 import：让 .meta({ id }) 的 schema 在 app.swagger() 之前已进 z.globalRegistry
 import "./schemas/account.js";
 import "./schemas/auth.js";
 import "./schemas/health.js";
+import "./schemas/message.js";
 
 export type ErrorEnvelope = {
   error: {
@@ -53,6 +59,11 @@ export type BuildAppOptions = {
    * 本函数是 async、返回 Fastify 实例，await 时 thenable 已把路由插件装载完。
    */
   gateway?: GatewayClient;
+  /**
+   * WebSocket 推送 hub（#9）。src/main.ts 建一个交给这里的 WS 路由，再交给 ws-broadcast-worker 轮询；
+   * 测试同样自己建（轮询间隔调小）。不给则建一个没人轮询的 hub：连接能认证，但收不到事件。
+   */
+  wsHub?: WsHub;
 };
 
 export async function buildApp(
@@ -83,6 +94,8 @@ export async function buildApp(
   app.setSerializerCompiler(serializerCompiler);
 
   await app.register(fastifyCors, { origin: true });
+  // WS /ws（#9）：升级握手由它接管；路由声明 websocket: true 即可
+  await app.register(fastifyWebsocket);
   await app.register(fastifySwagger, {
     openapi: {
       openapi: "3.1.0",
@@ -137,6 +150,9 @@ export async function buildApp(
     prefix: "/api/accounts",
     gateway: opts.gateway,
   });
+  void app.register(groupMessageRoutes, { prefix: "/api/groups" });
+  void app.register(groupSendRoutes, { prefix: "/api/groups" });
+  void app.register(wsRoutes, { hub: opts.wsHub ?? createWsHub() });
 
   return app;
 }

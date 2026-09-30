@@ -17,7 +17,14 @@ export type ErrorCode =
   | "CAS_CONFLICT"
   | "ACCOUNT_UNAVAILABLE"
   // 网关整体不可用 / 网络错（502）：不是业务拒绝，前端按它提示「稍后再试」
-  | "GATEWAY_ERROR";
+  | "GATEWAY_ERROR"
+  // ---- 群消息时间线（#9，题目 2.3 GET /api/groups/:id/messages）----
+  | "GROUP_NOT_FOUND"
+  // ---- 出站 outbox（#7，题目 2.3 POST /api/groups/:id/send + A2）----
+  // 账号不是该群成员（409：等 member_joined 到了状态就变）
+  | "ACCOUNT_NOT_IN_GROUP"
+  // 群已 unreachable / left：不再受理发送（409：群状态不允许）
+  | "GROUP_UNREACHABLE";
 
 export type ErrorExtra = Record<string, unknown>;
 
