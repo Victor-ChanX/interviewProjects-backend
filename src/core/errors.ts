@@ -1,5 +1,6 @@
 // 领域异常：services 用 throw 表达「拒绝」，src/app.ts 的 setErrorHandler
 // 统一映射成错误信封 { error: { code, message, requestId, ...extra } }。
+// 路由里不许手写 reply.code(4xx).send(...)。
 //
 // ErrorCode 是联合类型：新增机器码必须在这里登记，tsc 保证不会有漏网的字面量。
 
