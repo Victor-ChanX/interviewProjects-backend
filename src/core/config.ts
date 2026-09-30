@@ -75,6 +75,26 @@ function readMs(
   return n;
 }
 
+/** 题目 A5 第 2 条：/agent/turn 每轮超时 10–15 秒（可配）；超出这个范围启动即失败 */
+export const AGENT_TURN_TIMEOUT_RANGE_MS = Object.freeze({
+  min: 10_000,
+  max: 15_000,
+});
+
+/** AGENT_TURN_TIMEOUT_MS：没给 = 12000；给了必须落在 10–15 秒 */
+export function parseAgentTurnTimeout(raw: string | undefined): number {
+  const n = readMs(raw, "AGENT_TURN_TIMEOUT_MS", 12_000);
+  if (
+    n < AGENT_TURN_TIMEOUT_RANGE_MS.min ||
+    n > AGENT_TURN_TIMEOUT_RANGE_MS.max
+  ) {
+    throw new Error(
+      `AGENT_TURN_TIMEOUT_MS 必须在 ${AGENT_TURN_TIMEOUT_RANGE_MS.min}–${AGENT_TURN_TIMEOUT_RANGE_MS.max} 之间（题目 A5：每轮 10–15 秒）：${raw}`,
+    );
+  }
+  return n;
+}
+
 function readPort(raw: string | undefined, fallback = 3000): number {
   if (raw === undefined || raw === "") return fallback;
   const n = Number(raw);
@@ -93,11 +113,7 @@ export const config: Readonly<Config> = Object.freeze({
   jwtSecret: process.env.JWT_SECRET || undefined,
   projectMapBuild: process.env.PROJECT_MAP_BUILD === "1",
   agentUrl: process.env.AGENT_URL || undefined,
-  agentTurnTimeoutMs: readMs(
-    process.env.AGENT_TURN_TIMEOUT_MS,
-    "AGENT_TURN_TIMEOUT_MS",
-    12_000,
-  ),
+  agentTurnTimeoutMs: parseAgentTurnTimeout(process.env.AGENT_TURN_TIMEOUT_MS),
   agentAuditTimeoutMs: readMs(
     process.env.AGENT_AUDIT_TIMEOUT_MS,
     "AGENT_AUDIT_TIMEOUT_MS",

@@ -14,12 +14,16 @@
 //
 // 上限（A5 第 2 条）：stepCount ≥ maxSteps（12，含结束那步）→ budget_exhausted；连续协议错误 ≥ 3 → protocol_errors；
 // 墙钟 accumulatedMs + (now − activeSince) ≥ budgetMs（60s）→ wall_clock —— activeSince 在 worker 领取时设、释放 /
-// 结束时折进 accumulatedMs，停机期间自然不计（worker.budget-from-db）。心跳过期的 run 被别的副本接手时只折算
-// 「心跳还活着」的那段。审计重试不计步但计时（它们发生在一步之内）。
+// 结束时折进 accumulatedMs，停机期间自然不计（worker.budget-from-db）。60 秒「从 run 创建起」算：第一次领取时把
+// 创建到领取之间的排队时间也折进去（只算本 worker 启动之后的部分 —— 之前可能是停机）。心跳过期的 run 被别的副本
+// 接手时只折算「心跳还活着」的那段。审计重试不计步但计时（它们发生在一步之内）。
+// 重启续跑（A5 第 8 条）：有未完成的步就先把它续完，再判上限 / 外部状态 —— 否则第 12 步发出去之后崩溃，恢复时先判
+// 「步数已满」就结束了，这一步的结果永远是空的。
 //
 // 协议错误（A5 第 3 条）：BAD_JSON / DUPLICATE_TOOL_USE_ID / TURN_TIMEOUT 不追加 assistant 块，记 kind=protocol_error
-// 的步（resultContent = `PROTOCOL_ERROR <code>: <一句话>`，重建历史时作为 user text 块），consecutiveProtocolErrors + 1；
-// 合法响应清零。UNKNOWN_TOOL / INVALID_INPUT 正常追加 tool_use 块 + is_error 的 tool_result，不算协议错误。
+// 的步（resultContent = `PROTOCOL_ERROR <code>: <一句话>`，重建历史时作为 user text 块）；UNKNOWN_TOOL / INVALID_INPUT
+// 正常追加 tool_use 块 + is_error 的 tool_result。两类都是协议错误（A5 第 3 条把它们列在一起，只是追加方式不同），
+// 都让 consecutiveProtocolErrors + 1，连续 3 次 → protocol_errors；合法响应清零。
 //
 // 审计（A5 第 4 条）：send_message / kick_user 执行前 /agent/audit，只有合法 JSON 且 verdict 恰为 pass 才执行；fail →
 // AUDIT_REJECTED；拿不到结论最多 3 次（auditAttempts 落库，先写后调；不计步、不返回 agent）→ run blocked（audit_blocked），
@@ -133,8 +137,8 @@ export const AGENT_TOOLS: readonly AgentTool[] = Object.freeze([
     input_schema: {
       type: "object",
       properties: {
-        text: { type: "string" },
-        idempotency_key: { type: "string" },
+        text: { type: "string", minLength: 1 },
+        idempotency_key: { type: "string", minLength: 1 },
       },
       required: ["text", "idempotency_key"],
       additionalProperties: false,
@@ -147,7 +151,7 @@ export const AGENT_TOOLS: readonly AgentTool[] = Object.freeze([
     input_schema: {
       type: "object",
       properties: {
-        platform_user_id: { type: "string" },
+        platform_user_id: { type: "string", minLength: 1 },
         reason: { type: "string" },
       },
       required: ["platform_user_id", "reason"],
@@ -296,7 +300,9 @@ const fail = (
 });
 
 /**
- * A5 第 9 条：content ≤ 8KB。超出：messages 数组从最旧的一端丢，置 truncated: true；没有数组可丢的按字节硬截。
+ * A5 第 9 条：content ≤ 8KB，且必须仍是 JSON 串（2.2）。超出：messages 数组从最旧的一端丢，置 truncated: true；
+ * 没有数组可丢（例如超长的工具名写进了 UNKNOWN_TOOL 的 message）就把最长的字符串字段对半截，直到放得下 ——
+ * code 等短字段原样保留，agent 仍能按 code 决定下一步。按字节硬截会截出半个 JSON。
  */
 export function fitContent(value: Record<string, unknown>): string {
   let text = JSON.stringify(value);
@@ -312,10 +318,25 @@ export function fitContent(value: Record<string, unknown>): string {
       }
     }
   }
-  return clipBytes(
-    JSON.stringify({ ...value, truncated: true }),
-    RESULT_CONTENT_MAX_BYTES,
-  );
+  const shrunk: Record<string, unknown> = { ...value, truncated: true };
+  for (;;) {
+    text = JSON.stringify(shrunk);
+    if (Buffer.byteLength(text, "utf8") <= RESULT_CONTENT_MAX_BYTES) {
+      return text;
+    }
+    let longest: string | null = null;
+    for (const [key, v] of Object.entries(shrunk)) {
+      if (typeof v !== "string") continue;
+      const current = longest === null ? -1 : String(shrunk[longest]).length;
+      if (v.length > current) longest = key;
+    }
+    const target = longest === null ? "" : String(shrunk[longest]);
+    if (longest === null || target.length <= 1) {
+      // 没有可截的字符串（大块结构化数据）：只留截断标记，仍是合法 JSON
+      return JSON.stringify({ truncated: true });
+    }
+    shrunk[longest] = `${target.slice(0, Math.floor(target.length / 2))}…`;
+  }
 }
 
 function elapsedMs(
@@ -453,8 +474,16 @@ export async function onInboundMessage(
 export async function claimRun(
   workerId: string,
   now: Date,
-  staleMs: number = STALE_HEARTBEAT_MS,
+  opts: {
+    staleMs?: number;
+    /**
+     * 领取者（worker 实例）启动的时刻：第一次被领取的 run 把「创建 → 领取」的排队时间折进预算，但只算这个时刻之后的
+     * 部分（之前可能是停机，A5：停机时间不计）。不给 = 从创建时刻起全算。
+     */
+    workerStartedAt?: Date;
+  } = {},
 ): Promise<string | null> {
+  const staleMs = opts.staleMs ?? STALE_HEARTBEAT_MS;
   const staleBefore = new Date(now.getTime() - staleMs);
   return getDb().$transaction(async (tx) => {
     const rows = await tx.$queryRaw<
@@ -462,9 +491,10 @@ export async function claimRun(
         id: string;
         active_since: Date | null;
         heartbeat_at: Date | null;
+        created_at: Date;
       }[]
     >`
-      SELECT id, active_since, heartbeat_at FROM agent_runs
+      SELECT id, active_since, heartbeat_at, created_at FROM agent_runs
       WHERE status = 'running'
         AND (claimed_by IS NULL OR heartbeat_at IS NULL OR heartbeat_at < ${staleBefore})
       ORDER BY created_at, id
@@ -472,13 +502,20 @@ export async function claimRun(
       FOR UPDATE SKIP LOCKED`;
     const row = rows[0];
     if (!row) return null;
-    const fold = row.active_since
-      ? Math.max(
-          0,
-          (row.heartbeat_at ?? row.active_since).getTime() -
-            row.active_since.getTime(),
-        )
-      : 0;
+    // 从没被领过（heartbeat_at 空）：排队时间计入预算（60 秒从创建起算），只算领取者启动之后的部分；
+    // 接手心跳过期的：只算心跳还活着的那段
+    const queuedSince = new Date(
+      Math.max(
+        row.created_at.getTime(),
+        opts.workerStartedAt?.getTime() ?? row.created_at.getTime(),
+      ),
+    );
+    const fold =
+      row.heartbeat_at === null
+        ? Math.max(0, now.getTime() - queuedSince.getTime())
+        : row.active_since
+          ? Math.max(0, row.heartbeat_at.getTime() - row.active_since.getTime())
+          : 0;
     await tx.agentRun.update({
       where: { id: row.id },
       data: {
@@ -664,13 +701,15 @@ export async function runStep(
   const run = await loadRun(runId);
   if (!run || run.status !== "running") return "ended";
   if (run.claimedBy !== deps.workerId) return "lost";
-  if (await endIfDue(run, deps)) return "ended";
 
   try {
+    // 未完成的步（上次中断处）先续完再判上限：它可能已经对外产生了效果（消息已入队 / kick 已发），
+    // 结果必须落库；上限与外部状态在这一步之后（afterStep）再判
     const inflight = await getDb().agentStep.findFirst({
       where: { runId, completedAt: null },
       orderBy: { index: "desc" },
     });
+    if (!inflight && (await endIfDue(run, deps))) return "ended";
     let step: AgentStep;
     if (inflight) {
       deps.log?.warn(
@@ -778,6 +817,7 @@ async function takeTurn(
   const validation = validateToolCall(block);
   if (!validation.ok) {
     await createToolStep(run, block, raw, now, deps, {
+      protocolError: true,
       immediate: fail(validation.code, validation.message, validation.hint),
     });
     return "recorded";
@@ -894,7 +934,8 @@ async function recordProtocolError(
 
 /**
  * tool_use 步（正常追加 assistant 块）：先落库再执行。immediate 给了就是不需要执行的（UNKNOWN_TOOL / INVALID_INPUT /
- * finish），直接完成；finish 同事务结束 run。合法响应把 consecutiveProtocolErrors 清零。
+ * finish），直接完成；finish 同事务结束 run。UNKNOWN_TOOL / INVALID_INPUT（protocolError）让
+ * consecutiveProtocolErrors + 1，达上限同事务结束 run；合法响应清零。
  */
 async function createToolStep(
   run: RunWithGroup,
@@ -906,8 +947,12 @@ async function createToolStep(
     kind?: "tool_use" | "final";
     immediate?: ToolResult;
     finish?: string;
+    protocolError?: boolean;
   },
 ): Promise<AgentStep> {
+  const consecutive = opts.protocolError
+    ? run.consecutiveProtocolErrors + 1
+    : 0;
   return getDb().$transaction(async (tx) => {
     await touchRun(tx, run.id, deps.workerId, now);
     const step = await tx.agentStep.create({
@@ -932,8 +977,14 @@ async function createToolStep(
     });
     await tx.agentRun.update({
       where: { id: run.id },
-      data: { stepCount: { increment: 1 }, consecutiveProtocolErrors: 0 },
+      data: {
+        stepCount: { increment: 1 },
+        consecutiveProtocolErrors: consecutive,
+      },
     });
+    if (consecutive >= CONSECUTIVE_PROTOCOL_ERRORS_LIMIT) {
+      await endRun(tx, run, "failed", "protocol_errors", now, deps);
+    }
     if (opts.finish !== undefined) {
       await endRun(tx, run, "finished", "final", now, deps, {
         summary: opts.finish,

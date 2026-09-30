@@ -2,6 +2,8 @@
 //
 // tick = 领一个 running 且没人持有的 run（FOR UPDATE SKIP LOCKED；心跳过期的也能接手）→ 一步一步跑到 run 终态
 // （或 stop() / maxStepsPerTick）→ 释放（当前活跃段折进 accumulatedMs，停机期间不计预算）。
+// 常驻循环同时跑最多 maxConcurrentRuns 个 run（各群互不等待）：一个 run 一步可能要十几秒（turn 超时 + 审计），
+// 一次只跑一个的话，同时触发的几个群要排队几分钟，而 60 秒预算从 run 创建起算。
 // 领着的期间每步刷心跳；进程死了，别的副本在 STALE_HEARTBEAT_MS 后接手，从库里的中断处续（每步先落库再产生副作用）。
 // 写法是 while + 可打断的 sleep 而不是 setInterval：tick 慢于间隔时不会叠着跑；stop() 打断等待、等在途的步完成
 // （不在 /agent/turn 或网关调用中途退出）后释放 run。
@@ -42,11 +44,17 @@ export type AgentTickDeps = {
   checkpoint?: (point: Checkpoint) => Promise<void>;
   /** 循环用：true 时不再开始新的一步 */
   shouldStop?: () => boolean;
+  /** worker 实例启动的时刻：第一次领取的 run 只把这之后的排队时间算进预算（之前可能是停机）；不给 = 从创建起全算 */
+  workerStartedAt?: Date;
 };
+
+export const DEFAULT_MAX_CONCURRENT_RUNS = 8;
 
 export type AgentWorkerDeps = AgentTickDeps & {
   /** 多久看一次有没有待执行的 run */
   intervalMs: number;
+  /** 同时跑的 run 数上限；默认 DEFAULT_MAX_CONCURRENT_RUNS */
+  maxConcurrentRuns?: number;
   /** 可注入的可打断等待；默认 setTimeout */
   wait?: (ms: number) => { promise: Promise<void>; cancel: () => void };
 };
@@ -77,8 +85,20 @@ export async function runAgentTick(
 ): Promise<AgentTickResult | null> {
   const log =
     deps.log ?? logger.child({ worker: "agent", workerId: deps.workerId });
-  const runId = await claimRun(deps.workerId, deps.clock.now());
+  const runId = await claimRun(deps.workerId, deps.clock.now(), {
+    ...(deps.workerStartedAt ? { workerStartedAt: deps.workerStartedAt } : {}),
+  });
   if (!runId) return null;
+  return driveRun(runId, { ...deps, log });
+}
+
+/** 已领到的 run：一步一步跑到终态 / 被叫停 / 达到 maxStepsPerTick，然后释放。 */
+export async function driveRun(
+  runId: string,
+  deps: AgentTickDeps,
+): Promise<AgentTickResult> {
+  const log =
+    deps.log ?? logger.child({ worker: "agent", workerId: deps.workerId });
   const serviceDeps: AgentRunDeps = {
     clock: deps.clock,
     log,
@@ -135,37 +155,62 @@ export function startAgentWorker(deps: AgentWorkerDeps): AgentWorkerHandle {
   const log =
     deps.log ?? logger.child({ worker: "agent", workerId: deps.workerId });
   const wait = deps.wait ?? defaultWait;
+  const maxConcurrent = deps.maxConcurrentRuns ?? DEFAULT_MAX_CONCURRENT_RUNS;
+  const workerStartedAt = deps.workerStartedAt ?? deps.clock.now();
+  const inflight = new Set<Promise<void>>();
   let stopped = false;
   let pending: { cancel: () => void } | undefined;
 
+  const tickDeps: AgentTickDeps = {
+    ...deps,
+    log,
+    workerStartedAt,
+    shouldStop: () => stopped,
+  };
+
+  /** 有空位就领一个 run 在后台跑；领到返回 true */
+  const claimOne = async (): Promise<boolean> => {
+    const runId = await claimRun(deps.workerId, deps.clock.now(), {
+      workerStartedAt,
+    });
+    if (!runId) return false;
+    const task: Promise<void> = driveRun(runId, tickDeps)
+      .then((result) => {
+        log.info(result, "agent run 驱动结束");
+      })
+      .catch((err: unknown) => {
+        log.error({ err, runId }, "agent run 驱动失败");
+      })
+      .finally(() => {
+        inflight.delete(task);
+        // 跑完一个就立刻看有没有下一个（pending 合并出来的 run 不该等一个间隔）
+        pending?.cancel();
+      });
+    inflight.add(task);
+    return true;
+  };
+
   const loop = (async () => {
     while (!stopped) {
-      let busy = false;
       try {
-        const result = await runAgentTick({
-          ...deps,
-          log,
-          shouldStop: () => stopped,
-        });
-        if (result) {
-          busy = result.outcome !== "stopped";
-          log.info(result, "agent tick");
+        while (!stopped && inflight.size < maxConcurrent) {
+          if (!(await claimOne())) break;
         }
       } catch (err) {
-        log.error({ err }, "agent tick 失败");
+        log.error({ err }, "领取 agent run 失败");
       }
       if (stopped) break;
-      // 刚跑完一个 run 就立刻看有没有下一个（pending 合并出来的 run 不该等一个间隔）
-      if (busy) continue;
       const s = wait(deps.intervalMs);
       pending = s;
       await s.promise;
       pending = undefined;
     }
+    // 优雅停机：在途的 run 各自在当前步之后停下并释放
+    await Promise.all([...inflight]);
   })();
 
   return {
-    // 优雅停机：不再开始新的一步 → 打断等待 → 等在途的步完成并释放 run
+    // 优雅停机：不再领新的 run、不再开始新的一步 → 打断等待 → 等在途的步完成并释放 run
     async stop() {
       stopped = true;
       pending?.cancel();

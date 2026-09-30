@@ -9,10 +9,22 @@
 import { randomUUID } from "node:crypto";
 
 import type { FastifyInstance } from "fastify";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import {
+  afterAll,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 
 import { buildApp } from "../src/app.js";
 import type { Clock } from "../src/core/clock.js";
+import {
+  AGENT_TURN_TIMEOUT_RANGE_MS,
+  parseAgentTurnTimeout,
+} from "../src/core/config.js";
 import { logger } from "../src/core/logger.js";
 import { closeDb, getDb } from "../src/db/client.js";
 import type { Account, AgentRun, Group } from "../src/db/generated/client.js";
@@ -21,12 +33,16 @@ import {
   createAgentClient,
 } from "../src/services/agent-client.js";
 import {
+  AGENT_TOOLS,
   type Checkpoint,
+  fitContent,
   MAX_STEPS,
   onInboundMessage,
+  RESULT_CONTENT_MAX_BYTES,
   RECENT_MESSAGES_MAX,
   RECENT_TEXT_MAX_CHARS,
   STALE_HEARTBEAT_MS,
+  validateToolCall,
 } from "../src/services/agent-run-service.js";
 import {
   createGatewayClient,
@@ -36,7 +52,7 @@ import { ingest } from "../src/services/inbound-service.js";
 import { applyGatewayDelivery } from "../src/services/outbox-service.js";
 import { buildAgentApp } from "../src/sim/agent/app.js";
 import { buildGatewayApp } from "../src/sim/gateway/app.js";
-import { runAgentTick } from "../src/workers/agent-worker.js";
+import { runAgentTick, startAgentWorker } from "../src/workers/agent-worker.js";
 import { runOutboxTick } from "../src/workers/outbox-worker.js";
 import { loginAs, makeAccount, makeGroup, makeMessage } from "./factories.js";
 import { truncateAll } from "./setup.js";
@@ -302,6 +318,7 @@ describe("agent run（#12 / #13）", () => {
     checkpoint?: (point: Checkpoint) => Promise<void>;
     turnTimeoutMs?: number;
     auditTimeoutMs?: number;
+    workerStartedAt?: Date;
   };
   const tick = (opts: TickOpts = {}) =>
     runAgentTick({
@@ -317,6 +334,9 @@ describe("agent run（#12 / #13）", () => {
         ? { maxStepsPerTick: opts.maxStepsPerTick }
         : {}),
       ...(opts.checkpoint ? { checkpoint: opts.checkpoint } : {}),
+      ...(opts.workerStartedAt
+        ? { workerStartedAt: opts.workerStartedAt }
+        : {}),
     });
 
   /** 一直 tick 到没有可领的 run（run 已终态），返回最后一次的结果 */
@@ -897,6 +917,29 @@ describe("agent run（#12 / #13）", () => {
       expect(ok.stepCount).toBe(6);
     });
 
+    it("UNKNOWN_TOOL / INVALID_INPUT 也是协议错误：与坏 JSON 交替连续 3 次 → failed / protocol_errors", async () => {
+      const { group } = await stageGroup();
+      await agentScenario({
+        turn: {
+          steps: [
+            { type: "invalid_json" },
+            { type: "unknown_tool" },
+            { type: "invalid_input", name: "send_message" },
+          ],
+        },
+      });
+      const runId = await startRun(group);
+      await runToEnd();
+      const r = await run(runId);
+      expectEnded(r, "failed", "protocol_errors");
+      expect(r.stepCount).toBe(3);
+      expect((await steps(runId)).map((x) => [x.kind, x.errorCode])).toEqual([
+        ["protocol_error", "BAD_JSON"],
+        ["tool_use", "UNKNOWN_TOOL"],
+        ["tool_use", "INVALID_INPUT"],
+      ]);
+    });
+
     it("TURN_TIMEOUT：超时记协议错误，迟到的响应被丢弃，下一轮照常", async () => {
       const { group } = await stageGroup();
       await agentScenario({
@@ -982,6 +1025,23 @@ describe("agent run（#12 / #13）", () => {
       const r = await run(runId);
       expectEnded(r, "finished", "final");
       expect(r.stepCount).toBe(MAX_STEPS);
+    });
+
+    it("60 秒从 run 创建起算：排队等领取的时间也计入；worker 启动之前的那段（可能是停机）不计", async () => {
+      // 服务一直在，只是没轮到它：排队 61 秒 → 一领到就 wall_clock，一次 turn 都不调
+      const a = await stageGroup();
+      const queued = await startRun(a.group);
+      clock.advance(61_000);
+      await runToEnd();
+      expectEnded(await run(queued), "failed", "wall_clock");
+      expect(await steps(queued)).toHaveLength(0);
+
+      // 创建之后没有 worker 活着（停机），61 秒后新 worker 启动才领到：这段不计，照常 finish
+      const b = await stageGroup();
+      const afterRestart = await startRun(b.group);
+      clock.advance(61_000);
+      await runToEnd({ workerStartedAt: clock.now() });
+      expectEnded(await run(afterRestart), "finished", "final");
     });
 
     it("60 秒墙钟（按落库时间戳）→ failed / wall_clock；停机期间不计", async () => {
@@ -1159,12 +1219,14 @@ describe("agent run（#12 / #13）", () => {
       expect((s[0]?.resultSummary ?? "").length).toBeLessThanOrEqual(200);
     });
 
-    it("入参不合 schema → INVALID_INPUT（追加 assistant 块，不算协议错误）", async () => {
+    it("入参不合 schema → INVALID_INPUT（追加 assistant 块，计一次协议错误；之后的合法响应清零）", async () => {
       const { group } = await stageGroup();
       await agentScenario({
         turn: { steps: [{ type: "invalid_input", name: "send_message" }] },
       });
       const runId = await startRun(group);
+      await tick({ maxStepsPerTick: 1 });
+      expect((await run(runId)).consecutiveProtocolErrors).toBe(1);
       await runToEnd();
       const s = await steps(runId);
       expect(s[0]).toMatchObject({
@@ -1476,6 +1538,59 @@ describe("agent run（#12 / #13）", () => {
     });
   });
 
+  describe("worker 并发", () => {
+    it("同时跑多个群的 run：一个群的慢 turn 不挡另一个群", async () => {
+      await agentScenario({
+        turn: {
+          steps: [
+            { type: "get_recent_messages", limit: 5, delay_ms: 1_000 },
+            { type: "finish" },
+          ],
+        },
+      });
+      const a = await stageGroup();
+      const b = await stageGroup();
+      const ra = await startRun(a.group);
+      const rb = await startRun(b.group);
+      const worker = startAgentWorker({
+        clock,
+        agent: agentClient,
+        gateway: gatewayClient,
+        workerId: "w-concurrent",
+        intervalMs: 20,
+        log: silent,
+        turnTimeoutMs: 5_000,
+        auditTimeoutMs: 2_000,
+        sleep: pollSleep,
+      });
+      try {
+        // 第一轮 turn 被模拟器挂住（delay_ms 走假 sleep，flush 才放行）：两个 run 的 turn 同时在途 ——
+        // 一次只跑一个 run 的话，第二个群的 turn 要等第一个群整个跑完才会发出
+        await vi.waitFor(() => expect(agentSleep.calls).toHaveLength(2), {
+          timeout: 2_000,
+          interval: 20,
+        });
+        const inFlight = await getDb().agentRun.findMany({
+          where: { id: { in: [ra, rb] } },
+        });
+        expect(inFlight.map((r) => r.claimedBy)).toEqual([
+          "w-concurrent",
+          "w-concurrent",
+        ]);
+        agentSleep.flush();
+        await vi.waitFor(
+          async () => {
+            expect((await run(ra)).status).toBe("finished");
+            expect((await run(rb)).status).toBe("finished");
+          },
+          { timeout: 5_000, interval: 50 },
+        );
+      } finally {
+        await worker.stop();
+      }
+    }, 15_000);
+  });
+
   // ---- 重启恢复（A5 第 8 条）+ 多副本 ------------------------------------------------------------------------
 
   describe("重启恢复", () => {
@@ -1563,6 +1678,30 @@ describe("agent run（#12 / #13）", () => {
       expect(await getDb().agentIdempotency.count({ where: { runId } })).toBe(
         1,
       );
+    });
+
+    it("最后一步（步数已满）入队后死掉：恢复时先把这一步续完、结果落库，再按 budget_exhausted 结束", async () => {
+      const { group } = await stageGroup();
+      await agentScenario({
+        turn: { steps: [{ type: "send_message", text: "最后一步" }] },
+      });
+      const runId = await startRun(group);
+      await getDb().agentRun.update({
+        where: { id: runId },
+        data: { maxSteps: 1 },
+      });
+      await tick({ workerId: "w-dead", checkpoint: crashAt("after_enqueue") });
+      expect((await steps(runId))[0]).toMatchObject({ completedAt: null });
+
+      await runToEnd({ workerId: "w-new" });
+      expectEnded(await run(runId), "failed", "budget_exhausted");
+      const s = await steps(runId);
+      expect(s).toHaveLength(1);
+      expect(s[0]!.completedAt).not.toBeNull();
+      expect(parseContent(s[0]!.resultContent)).toMatchObject({
+        deliveryStatus: "accepted",
+      });
+      expect((await gatewayState()).sendCalls).toHaveLength(1);
     });
 
     it("kick 发出后、记结果前死掉：新实例按网关成员列表确认已移除，不再 kick 一次", async () => {
@@ -1746,5 +1885,68 @@ describe("agent run（#12 / #13）", () => {
         "GROUP_NOT_FOUND",
       );
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 纯函数：结果截断、下发的 schema、配置
+// ---------------------------------------------------------------------------
+
+describe("tool_result 与工具定义", () => {
+  it("8KB 截断后仍是合法 JSON：没有 messages 数组时截最长的字符串字段，code 等短字段保留", () => {
+    for (const filler of ["x".repeat(20_000), "中".repeat(10_000)]) {
+      const out = fitContent({
+        code: "UNKNOWN_TOOL",
+        message: filler,
+        hint: "可用工具：…",
+      });
+      expect(Buffer.byteLength(out, "utf8")).toBeLessThanOrEqual(
+        RESULT_CONTENT_MAX_BYTES,
+      );
+      expect(JSON.parse(out)).toMatchObject({
+        code: "UNKNOWN_TOOL",
+        hint: "可用工具：…",
+        truncated: true,
+      });
+    }
+  });
+
+  it("下发的 input_schema 与校验一致：必填字符串写了 minLength 的，空串才判 INVALID_INPUT", () => {
+    const valid: Record<string, Record<string, unknown>> = {
+      get_recent_messages: { limit: 1 },
+      send_message: { text: "a", idempotency_key: "k" },
+      kick_user: { platform_user_id: "u", reason: "r" },
+      finish: { summary: "s" },
+    };
+    for (const tool of AGENT_TOOLS) {
+      const props = (
+        tool.input_schema as {
+          properties: Record<string, { type: string; minLength?: number }>;
+        }
+      ).properties;
+      for (const [key, spec] of Object.entries(props)) {
+        if (spec.type !== "string") continue;
+        const result = validateToolCall({
+          type: "tool_use",
+          id: "tu",
+          name: tool.name,
+          input: { ...valid[tool.name], [key]: "" },
+        });
+        expect([tool.name, key, result.ok]).toEqual([
+          tool.name,
+          key,
+          !(spec.minLength && spec.minLength > 0),
+        ]);
+      }
+    }
+  });
+
+  it("AGENT_TURN_TIMEOUT_MS 只接受 10–15 秒（题目 A5）；没给用 12 秒", () => {
+    expect(parseAgentTurnTimeout(undefined)).toBe(12_000);
+    expect(parseAgentTurnTimeout(String(AGENT_TURN_TIMEOUT_RANGE_MS.min))).toBe(
+      AGENT_TURN_TIMEOUT_RANGE_MS.min,
+    );
+    expect(() => parseAgentTurnTimeout("9999")).toThrow(/10000–15000/);
+    expect(() => parseAgentTurnTimeout("15001")).toThrow(/10000–15000/);
   });
 });
