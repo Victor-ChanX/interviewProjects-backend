@@ -1,15 +1,22 @@
-// 入口：迁移（子进程 prisma migrate deploy，自带 advisory lock）→ schema 门 → 启 worker → listen；
+// 入口：迁移（子进程 prisma migrate deploy，自带 advisory lock）→ schema 门 → 种子 → 启 worker → listen；
 // SIGTERM 优雅停机。
 import { buildApp } from "./app.js";
 import { systemClock } from "./core/clock.js";
 import { config } from "./core/config.js";
 import { logger } from "./core/logger.js";
-import { assertSchemaCurrent, closeDb, runMigrations } from "./db/client.js";
+import {
+  assertSchemaCurrent,
+  closeDb,
+  getDb,
+  runMigrations,
+} from "./db/client.js";
+import { seedDatabase } from "./db/seed.js";
 import { startExampleWorker } from "./workers/example-worker.js";
 
 async function main(): Promise<void> {
   runMigrations();
   await assertSchemaCurrent();
+  await seedDatabase(getDb(), logger);
 
   const app = await buildApp();
   const worker = startExampleWorker({

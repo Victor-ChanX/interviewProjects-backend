@@ -29,3 +29,642 @@ model Example {
 
   @@map("examples")
 }
+
+// ============================================================================
+// 领域模型（docs/plan.md 第 3 节；列名与枚举值直接对应题目 2.3 的 API 字段）
+//
+// 通用约定：
+// - 主键：业务无自然键的表用 uuid(7)（时间有序，按 id 排序 ≈ 按创建顺序）；accounts.id 由种子指定。
+// - 时间：一律 @db.Timestamptz；「现在」由应用的 Clock 注入，@default(now()) 只用于 createdAt 一类审计列。
+// - Prisma 表达不了的约束（部分唯一索引、CHECK）手写在
+//   prisma/migrations/20260930101643_domain_model/migration.sql，对应字段旁有「约束见 …」注释。
+//   prisma migrate diff 只比对 schema 能表达的部分，这些手写约束不会被报成漂移，也不会被 Prisma 自动删改。
+// ============================================================================
+
+// ---- 账号（A1）----------------------------------------------------------------
+
+/// 题目 A1 的六态；suspended / session_expired 为终态（转移表在 service 里）。
+enum AccountStatus {
+  idle
+  online
+  rate_limited
+  disconnected
+  suspended
+  session_expired
+
+  @@map("account_status")
+}
+
+model Account {
+  /// 种子预置（acc-1 …），也是网关侧的 accountId
+  id               String        @id
+  status           AccountStatus @default(idle)
+  /// 网关 connect 返回；同一账号每次相同，null = 从未 connect
+  platformUserId   String?       @unique @map("platform_user_id")
+  /// RATE_LIMITED 的 retryAfterSeconds 到期时刻；到期恢复由 worker 按这列排期。
+  /// 约束见 20260930101643_domain_model：status = rate_limited 时必须非空
+  rateLimitedUntil DateTime?     @map("rate_limited_until") @db.Timestamptz
+  /// 乐观锁：transition 用 { where: { id, version } } 做 CAS，撞不上 → CAS_CONFLICT
+  version          Int           @default(0)
+  createdAt        DateTime      @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt        DateTime      @updatedAt @map("updated_at") @db.Timestamptz
+
+  createdGroups    Group[]           @relation("group_creator")
+  memberships      GroupMember[]
+  messages         Message[]
+  sequenceRunSteps SequenceRunStep[]
+  jobErrors        JobError[]
+
+  @@map("accounts")
+}
+
+// ---- 群与成员（A3 / B2）---------------------------------------------------------
+
+enum GroupStatus {
+  active
+  unreachable
+  left
+
+  @@map("group_status")
+}
+
+enum MemberRole {
+  creator
+  admin
+  member
+
+  @@map("member_role")
+}
+
+model Group {
+  id               String      @id @default(uuid(7))
+  /// 网关的 groupId；建群 job 拿到响应后写入，之前为 null
+  gatewayGroupId   String?     @unique @map("gateway_group_id")
+  status           GroupStatus @default(active)
+  creatorAccountId String      @map("creator_account_id")
+  agentEnabled     Boolean     @default(false) @map("agent_enabled")
+  autoKickEnabled  Boolean     @default(false) @map("auto_kick_enabled")
+  createdAt        DateTime    @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt        DateTime    @updatedAt @map("updated_at") @db.Timestamptz
+
+  creator      Account       @relation("group_creator", fields: [creatorAccountId], references: [id])
+  members      GroupMember[]
+  messages     Message[]
+  jobs         Job[]
+  agentRuns    AgentRun[]
+  sequenceRuns SequenceRun[]
+
+  @@map("groups")
+}
+
+/// 群成员按网关的 member_joined / member_left 维护。外部用户（非服务账号）也进出群，
+/// 所以主键是 (groupId, platformUserId)，accountId 只对服务账号非空。
+model GroupMember {
+  groupId        String     @map("group_id")
+  platformUserId String     @map("platform_user_id")
+  accountId      String?    @map("account_id")
+  role           MemberRole @default(member)
+  joinedAt       DateTime   @default(now()) @map("joined_at") @db.Timestamptz
+
+  group   Group    @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  account Account? @relation(fields: [accountId], references: [id])
+
+  @@id([groupId, platformUserId])
+  @@index([accountId])
+  @@map("group_members")
+}
+
+// ---- 消息时间线 + 出站 outbox（A2 / A4）-----------------------------------------
+
+/// 出站消息的投递状态机：queued → accepted → sent | failed | unknown | cancelled
+enum DeliveryStatus {
+  queued
+  accepted
+  sent
+  failed
+  unknown
+  cancelled
+
+  @@map("delivery_status")
+}
+
+/// 一表两用：入站 message 事件与出站 outbox 都是这里的一行，一条消息只有一行（题目 2.3 messages 列表）。
+///
+/// 两把唯一键怎么共存：
+/// - 入站去重靠 (groupId, msgId)。出站行在收到 message_sent 之前 msgId 为 null；Postgres 的唯一索引把
+///   NULL 视为互不相等，所以多条「尚未发出」的出站行不会互撞 —— 这是选「可空唯一」而不是拆表的原因：
+///   拆成两张表就得在两处维护 sentAt 与时间线分页。代价：入站 worker 在 msgId 已被自己消息的回流行
+///   （message 事件先于 message_sent 到达，乱序 ≤ 1s）占用时，要把两行合并（保留出站行、删回流行），
+///   撞到 P2002 就是这个信号，见 #8。
+/// - 出站幂等键 clientMsgId 唯一，入站行为 null。
+/// 约束见 20260930101643_domain_model：failed / cancelled 时 failCode 必填；resendCount ≤ 1。
+model Message {
+  id                   String          @id @default(uuid(7))
+  groupId              String          @map("group_id")
+  /// 网关 msgId；出站行在 message_sent 之前为 null
+  msgId                String?         @map("msg_id")
+  /// 出站幂等键（uuid，入队时生成，重发用同一个）；入站行为 null
+  clientMsgId          String?         @unique @map("client_msg_id")
+  /// 发送方服务账号（出站行必填；入站回流的自己消息按 platformUserId 反查后可回填）
+  accountId            String?         @map("account_id")
+  senderPlatformUserId String          @map("sender_platform_user_id")
+  isOwn                Boolean         @default(false) @map("is_own")
+  text                 String
+  mediaUrl             String?         @map("media_url")
+  /// 时间线排序键。出站行先用受理时刻，message_sent 后改为网关的 sentAt
+  sentAt               DateTime        @map("sent_at") @db.Timestamptz
+  /// 仅出站行有值
+  deliveryStatus       DeliveryStatus? @map("delivery_status")
+  /// 网关错误码，或 ACCOUNT_TERMINAL / GROUP_UNREACHABLE
+  failCode             String?         @map("fail_code")
+
+  /// 累计投递尝试次数（含首发）；每次的细节在 outbound_attempts
+  attempts      Int       @default(0)
+  /// 确认未发出后的重发次数，题目允许总共重发一次
+  resendCount   Int       @default(0) @map("resend_count")
+  /// worker 领取时间戳；「到点了没」看这列，不看进程内定时器
+  nextAttemptAt DateTime? @map("next_attempt_at") @db.Timestamptz
+  claimedBy     String?   @map("claimed_by")
+  lockedAt      DateTime? @map("locked_at") @db.Timestamptz
+  lastError     String?   @map("last_error")
+  /// 网关 202 的时刻
+  acceptedAt    DateTime? @map("accepted_at") @db.Timestamptz
+  /// 进入 unknown 的时刻：504 起 5 秒内必须落定，从这列算
+  unknownSince  DateTime? @map("unknown_since") @db.Timestamptz
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt     DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+
+  group           Group                 @relation(fields: [groupId], references: [id])
+  account         Account?              @relation(fields: [accountId], references: [id])
+  attemptLog      OutboundAttempt[]
+  pendingFor      AgentPendingMessage[]
+  idempotencyHits AgentIdempotency[]
+  sequenceRunStep SequenceRunStep?
+
+  @@unique([groupId, msgId])
+  /// 时间线游标分页：before = (sentAt, id)，倒序
+  @@index([groupId, sentAt(sort: Desc), id(sort: Desc)])
+  /// outbox 领取：WHERE delivery_status = 'queued' AND next_attempt_at <= now
+  @@index([deliveryStatus, nextAttemptAt])
+  /// 账号进终态时把它排队中的消息置 cancelled
+  @@index([accountId, deliveryStatus])
+  @@map("messages")
+}
+
+/// 每次向网关投递（或 by-client-id 查询）的记录：A2 要求 504 后先确认再至多重发一次，
+/// 这张表是「发过几次、每次结果」的账本；messages.attempts / resendCount 是它的汇总。
+model OutboundAttempt {
+  id         String    @id @default(uuid(7))
+  messageId  String    @map("message_id")
+  /// 第几次投递（1 = 首发）
+  attemptNo  Int       @map("attempt_no")
+  isResend   Boolean   @default(false) @map("is_resend")
+  startedAt  DateTime  @default(now()) @map("started_at") @db.Timestamptz
+  finishedAt DateTime? @map("finished_at") @db.Timestamptz
+  /// 网关 HTTP 状态；进程死在中途 / 网络错时为 null
+  httpStatus Int?      @map("http_status")
+  /// 网关错误码（RATE_LIMITED / NETWORK_TIMEOUT …），成功为 null
+  errorCode  String?   @map("error_code")
+  /// 响应体 / 异常摘要
+  detail     Json?
+
+  message Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@unique([messageId, attemptNo])
+  @@map("outbound_attempts")
+}
+
+// ---- 入站事件与游标（A2）--------------------------------------------------------
+
+/// 网关 SSE 事件原文 + 处理状态。at-least-once：eventId 唯一，重复推送在 create 时撞 P2002 直接 ack。
+/// type 用 String 不用 enum：网关新增事件类型时也要能原样落库，不能因为枚举拒绝而丢事件。
+model InboundEvent {
+  id          String    @id @default(uuid(7))
+  /// 网关 eventId（SSE 的 id 帧；全局单调递增，比较大小由网关的 since 语义负责，这里只存原文）
+  eventId     String    @unique @map("event_id")
+  type        String
+  /// data 里的网关 groupId（account_status 事件没有）；只为按群检索，不做外键：事件可能先于本地群记录到达，外键会把事件拒之门外
+  groupId     String?   @map("group_id")
+  payload     Json
+  receivedAt  DateTime  @default(now()) @map("received_at") @db.Timestamptz
+  /// 处理成功的时刻；null = 未处理或处理失败（失败的同时写一行 inconsistencies，事件内容不丢）
+  processedAt DateTime? @map("processed_at") @db.Timestamptz
+  /// 处理失败次数与最近一次错误，供回收步骤重试
+  attempts    Int       @default(0)
+  lastError   String?   @map("last_error")
+
+  @@index([processedAt, receivedAt])
+  @@index([groupId])
+  @@map("inbound_events")
+}
+
+/// SSE 游标，单行（id 固定 1，约束见 20260930101643_domain_model）。
+/// 处理完一批并 commit 之后才推进；重启从这里的 lastEventId 带 since 补拉。
+model EventCursor {
+  id          Int      @id @default(1)
+  lastEventId String?  @map("last_event_id")
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  @@map("event_cursor")
+}
+
+// ---- 异步任务：建群 / leave-all（A3 / B2）------------------------------------------
+
+enum JobKind {
+  create_group
+  leave_all
+
+  @@map("job_kind")
+}
+
+enum JobStatus {
+  running
+  finished
+  failed
+
+  @@map("job_status")
+}
+
+/// 题目 2.3 的 step ∈ create | invite | join:<accountId> | promote | leave:<accountId>：
+/// 冒号后的账号放 JobError.accountId，API 层拼回字符串。
+enum JobStepKind {
+  create
+  invite
+  join
+  promote
+  leave
+
+  @@map("job_step_kind")
+}
+
+model Job {
+  id         String       @id @default(uuid(7))
+  kind       JobKind
+  status     JobStatus    @default(running)
+  groupId    String?      @map("group_id")
+  /// 当前执行到的步骤
+  step       JobStepKind?
+  /// 入参（creatorAccountId、memberAccountIds …）
+  input      Json
+  /// 进度快照（inviteLink、已 join 的账号、promote 次数 …）：重启后从这里继续，不从头来
+  state      Json         @default("{}")
+  attempts   Int          @default(0)
+  /// worker 排期：到点才领取
+  nextRunAt  DateTime?    @map("next_run_at") @db.Timestamptz
+  claimedBy  String?      @map("claimed_by")
+  lockedAt   DateTime?    @map("locked_at") @db.Timestamptz
+  lastError  String?      @map("last_error")
+  createdAt  DateTime     @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt  DateTime     @updatedAt @map("updated_at") @db.Timestamptz
+  finishedAt DateTime?    @map("finished_at") @db.Timestamptz
+
+  group  Group?     @relation(fields: [groupId], references: [id])
+  errors JobError[]
+
+  @@index([status, nextRunAt])
+  @@map("jobs")
+}
+
+model JobError {
+  id        String      @id @default(uuid(7))
+  jobId     String      @map("job_id")
+  step      JobStepKind
+  /// join:<accountId> / leave:<accountId> 的账号
+  accountId String?     @map("account_id")
+  code      String
+  message   String?
+  createdAt DateTime    @default(now()) @map("created_at") @db.Timestamptz
+
+  job     Job      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  account Account? @relation(fields: [accountId], references: [id])
+
+  @@index([jobId])
+  @@map("job_errors")
+}
+
+// ---- Agent run（A5）--------------------------------------------------------------
+
+enum AgentRunStatus {
+  running
+  finished
+  failed
+  blocked
+  cancelled
+
+  @@map("agent_run_status")
+}
+
+enum AgentRunEndReason {
+  final
+  budget_exhausted
+  wall_clock
+  protocol_errors
+  audit_blocked
+  cancelled
+
+  @@map("agent_run_end_reason")
+}
+
+enum AgentStepKind {
+  tool_use
+  final
+  protocol_error
+
+  @@map("agent_step_kind")
+}
+
+enum AuditVerdict {
+  pass
+  fail
+
+  @@map("audit_verdict")
+}
+
+/// 约束见 20260930101643_domain_model：
+/// - 部分唯一索引 (group_id) WHERE status = 'running'：同群同一时刻至多一个 running（多实例也成立）；
+/// - status 与 endReason 的对应关系（final→finished、audit_blocked→blocked …）。
+model AgentRun {
+  /// 同时是发给 Agent 服务的 runId
+  id              String             @id @default(uuid(7))
+  groupId         String             @map("group_id")
+  status          AgentRunStatus     @default(running)
+  endReason       AgentRunEndReason? @map("end_reason")
+  summary         String?
+  /// 触发消息快照 [{ msgId, senderPlatformUserId, text, sentAt }]，按 sentAt 升序
+  triggerMessages Json               @map("trigger_messages")
+
+  // ---- 上限与预算（A5 第 2 条），全部按落库值算，重启后从这里续 ----
+  /// 已完成的步数（一步 = 一次 /agent/turn 往返）；上限 maxSteps
+  stepCount                 Int       @default(0) @map("step_count")
+  maxSteps                  Int       @default(12) @map("max_steps")
+  /// 连续协议错误次数，合法响应清零；达到 3 → protocol_errors
+  consecutiveProtocolErrors Int       @default(0) @map("consecutive_protocol_errors")
+  /// 墙钟预算（60s）；已用 = accumulatedMs + (now − activeSince)，停机期间不计
+  budgetMs                  Int       @default(60000) @map("budget_ms")
+  accumulatedMs             Int       @default(0) @map("accumulated_ms")
+  /// 当前活跃段的起点；停机 / 让出时把段长折进 accumulatedMs 后置空
+  activeSince               DateTime? @map("active_since") @db.Timestamptz
+  /// 执行者与心跳：进程死了靠心跳过期回收，不靠「进程知道自己在跑」
+  claimedBy                 String?   @map("claimed_by")
+  heartbeatAt               DateTime? @map("heartbeat_at") @db.Timestamptz
+
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt  DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+  finishedAt DateTime? @map("finished_at") @db.Timestamptz
+
+  group           Group                 @relation(fields: [groupId], references: [id])
+  steps           AgentStep[]
+  pendingMessages AgentPendingMessage[]
+  idempotency     AgentIdempotency[]
+
+  @@index([groupId, createdAt(sort: Desc)])
+  @@index([status, heartbeatAt])
+  @@map("agent_runs")
+}
+
+/// 每一步（含协议错误步）都落库：既是 API 的 steps[]，也是重启后重建 /agent/turn 历史的依据。
+/// 约束见 20260930101643_domain_model：isError → errorCode 必填；protocol_error 步的 toolUseId / name / input 为 null。
+model AgentStep {
+  id            String        @id @default(uuid(7))
+  runId         String        @map("run_id")
+  /// 第几步（1 起）
+  index         Int
+  kind          AgentStepKind
+  /// Agent 返回的 tool_use.id；同 run 内唯一 —— 重复 id 先按协议错误处理，那一步 toolUseId 记 null
+  toolUseId     String?       @map("tool_use_id")
+  name          String?
+  input         Json?
+  /// 追加进历史的 tool_result content（≤ 8KB，超出截断并置 truncated）；重建对话历史用
+  resultContent String?       @map("result_content")
+  /// ≤ 200 字，给列表 / 前端看
+  resultSummary String?       @map("result_summary")
+  isError       Boolean       @default(false) @map("is_error")
+  /// 题目 2.2 的错误码表（UNKNOWN_TOOL / BAD_JSON / TURN_TIMEOUT …）
+  errorCode     String?       @map("error_code")
+  /// send_message / kick_user 的审计结论；未审计或拿不到结论为 null
+  auditVerdict  AuditVerdict? @map("audit_verdict")
+  /// 已尝试审计次数（上限 3，落库后重启不会重置）
+  auditAttempts Int           @default(0) @map("audit_attempts")
+  /// Agent 服务原始响应体，截断到 2KB
+  rawResponse   String?       @map("raw_response")
+  /// 工具开始执行的时刻（写库先于副作用）：重启时见到有 toolStartedAt 而无 completedAt 的步，
+  /// 先核对外部状态（by-client-id / 成员列表），不能再执行一次
+  toolStartedAt DateTime?     @map("tool_started_at") @db.Timestamptz
+  completedAt   DateTime?     @map("completed_at") @db.Timestamptz
+  createdAt     DateTime      @default(now()) @map("created_at") @db.Timestamptz
+
+  run AgentRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@unique([runId, index])
+  @@unique([runId, toolUseId])
+  @@map("agent_steps")
+}
+
+/// run 进行期间到达的非自己消息：run 结束时若非空，立即创建下一次 run 并全部放进 triggerMessages。
+model AgentPendingMessage {
+  runId     String   @map("run_id")
+  messageId String   @map("message_id")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  run     AgentRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  message Message  @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@id([runId, messageId])
+  @@map("agent_pending_messages")
+}
+
+/// A5 第 7 条：同一 run 内相同 idempotency_key 的 send_message 只发一次，之后返回那条消息的当前状态。
+/// 被 AUDIT_REJECTED / POLICY_DENIED 拒绝的调用不写这张表（key 不算用过）。
+model AgentIdempotency {
+  runId       String   @map("run_id")
+  key         String
+  /// 首次调用入队的出站消息
+  clientMsgId String   @map("client_msg_id")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  run     AgentRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  message Message  @relation(fields: [clientMsgId], references: [clientMsgId])
+
+  @@id([runId, key])
+  @@map("agent_idempotency")
+}
+
+// ---- 定时序列（B1）--------------------------------------------------------------
+
+enum SequenceRunStatus {
+  running
+  finished
+  failed
+  stopped
+
+  @@map("sequence_run_status")
+}
+
+enum SequenceStepStatus {
+  pending
+  accepted
+  sent
+  skipped
+  failed
+
+  @@map("sequence_step_status")
+}
+
+enum SequenceAccountRole {
+  admin
+  member
+
+  @@map("sequence_account_role")
+}
+
+/// 序列定义（题目 B1 的 JSON）：steps 原样存 Json，启动时校验并快照进 sequence_run_steps。
+model Sequence {
+  id        String   @id @default(uuid(7))
+  name      String
+  /// [{ index, accountRole, text, delaySeconds }]
+  steps     Json
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  runs SequenceRun[]
+
+  @@map("sequences")
+}
+
+/// 约束见 20260930101643_domain_model：部分唯一索引 (group_id) WHERE status = 'running'
+/// —— 并发两次启动恰好一个 201、一个 409 SEQUENCE_ALREADY_RUNNING。
+model SequenceRun {
+  id               String            @id @default(uuid(7))
+  sequenceId       String            @map("sequence_id")
+  groupId          String            @map("group_id")
+  status           SequenceRunStatus @default(running)
+  /// 当前待发的步骤 index（steps 的 index 从 1 起）
+  currentStepIndex Int               @default(1) @map("current_step_index")
+  /// 启动参数，原样保留
+  vars             Json
+  stepVars         Json              @map("step_vars")
+  createdAt        DateTime          @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt        DateTime          @updatedAt @map("updated_at") @db.Timestamptz
+  finishedAt       DateTime?         @map("finished_at") @db.Timestamptz
+
+  sequence Sequence          @relation(fields: [sequenceId], references: [id])
+  group    Group             @relation(fields: [groupId], references: [id])
+  steps    SequenceRunStep[]
+
+  @@index([groupId, createdAt(sort: Desc)])
+  @@map("sequence_runs")
+}
+
+/// 每步一行：定义快照 + 取值结果 + 排期 + 发送结果。排期本身就是这张表的 scheduledAt，
+/// worker 定时器只负责「到点了没」；重启只重排最早一个已过期的 pending 步。
+model SequenceRunStep {
+  id    String @id @default(uuid(7))
+  runId String @map("run_id")
+  index Int
+
+  // ---- 定义快照（序列 JSON 之后改了也不影响进行中的运行）----
+  accountRole  SequenceAccountRole @map("account_role")
+  /// 含 {key} 占位符的原文
+  template     String
+  delaySeconds Int                 @map("delay_seconds")
+
+  status       SequenceStepStatus @default(pending)
+  /// 最终取值 { key: value }
+  resolvedVars Json               @map("resolved_vars")
+  /// 每个 key 来自 default 还是 step:<index>
+  varSources   Json               @map("var_sources")
+  /// 计划发送时刻；前一步发出后才排定，之前为 null
+  scheduledAt  DateTime?          @map("scheduled_at") @db.Timestamptz
+  /// 收到 message_sent 的时刻
+  sentAt       DateTime?          @map("sent_at") @db.Timestamptz
+  /// skipped 的时刻（跳过视为在此刻「发出」，后续步骤据此排期）
+  skippedAt    DateTime?          @map("skipped_at") @db.Timestamptz
+  /// 实际选中的发送账号
+  accountId    String?            @map("account_id")
+  /// 入队的出站消息（一步至多一条）
+  clientMsgId  String?            @unique @map("client_msg_id")
+  failCode     String?            @map("fail_code")
+  createdAt    DateTime           @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt    DateTime           @updatedAt @map("updated_at") @db.Timestamptz
+
+  run     SequenceRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  account Account?    @relation(fields: [accountId], references: [id])
+  message Message?    @relation(fields: [clientMsgId], references: [clientMsgId])
+
+  @@unique([runId, index])
+  @@index([status, scheduledAt])
+  @@map("sequence_run_steps")
+}
+
+// ---- 用户与会话（A0 / B3）--------------------------------------------------------
+
+enum UserRole {
+  admin
+  viewer
+
+  @@map("user_role")
+}
+
+model User {
+  id           String   @id @default(uuid(7))
+  username     String   @unique
+  /// src/core/password.ts 的 scrypt 格式串
+  passwordHash String   @map("password_hash")
+  role         UserRole
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  sessions Session[]
+
+  @@map("users")
+}
+
+/// refresh token 轮换族：一行 = 一枚 refresh token。刷新 = 同 family 新增一行、旧行 rotatedAt 置值；
+/// 旧行再被使用 → 整个 family 全部 revokedAt；logout 同样按 family 作废。
+/// access token 里带 family id，校验时查该 family 未作废，logout 后立即失效。
+model Session {
+  id          String    @id @default(uuid(7))
+  userId      String    @map("user_id")
+  tokenFamily String    @map("token_family")
+  /// refresh token 的 sha256，不存原文
+  tokenHash   String    @unique @map("token_hash")
+  expiresAt   DateTime  @map("expires_at") @db.Timestamptz
+  rotatedAt   DateTime? @map("rotated_at") @db.Timestamptz
+  revokedAt   DateTime? @map("revoked_at") @db.Timestamptz
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([tokenFamily])
+  @@index([userId])
+  @@map("sessions")
+}
+
+// ---- WebSocket 事件日志（A4 / B4）------------------------------------------------
+
+/// 推给前端的每个事件先落库再推：seq 全局单调，重连按 sinceSeq 补发。
+/// type 用 String（account_status_changed / account_terminal / inconsistency / message / agent_run / sequence_run …）。
+model WsEvent {
+  seq       Int      @id @default(autoincrement())
+  type      String
+  payload   Json
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  @@map("ws_events")
+}
+
+// ---- 不一致记录（A2）------------------------------------------------------------
+
+/// 处理网关事件时写库失败等「事件不能丢、处理不能断」的情况：原文留在这里并推 inconsistency 事件给操作员。
+model Inconsistency {
+  id         String    @id @default(uuid(7))
+  /// 类别，如 inbound_write_failed / unknown_delivery_stuck
+  kind       String
+  /// 关联对象引用（eventId / clientMsgId / runId …）
+  ref        String?
+  message    String
+  payload    Json?
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  resolvedAt DateTime? @map("resolved_at") @db.Timestamptz
+
+  @@index([resolvedAt, createdAt])
+  @@map("inconsistencies")
+}

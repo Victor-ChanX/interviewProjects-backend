@@ -19,6 +19,7 @@
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev --create-only",
     "db:deploy": "prisma migrate deploy",
+    "db:seed": "tsx prisma/seed.ts",
     "postinstall": "prisma generate",
     "sim:gateway": "tsx src/sim/gateway/main.ts",
     "sim:agent": "tsx src/sim/agent/main.ts"

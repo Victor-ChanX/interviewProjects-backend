@@ -1,5 +1,5 @@
 {
-  // 仓根 tsconfig.json：tsc --noEmit 的范围 = src + tests + scripts + 根目录的 *.ts / *.mts
+  // 仓根 tsconfig.json：tsc --noEmit 的范围 = src + tests + scripts + prisma/*.ts（seed 壳）+ 根目录的 *.ts / *.mts
   // （vitest.config.mts、prisma.config.ts —— eslint 的 projectService 要求每个被 lint 的 TS 文件
   // 都在某个 tsconfig 的 include 里）。构建产物由 tsconfig.build.json 单独管（只编 src）。
   // src/db/generated（prisma generate 的 TS 源码）**不能 exclude**：services import 它的类型，
@@ -23,5 +23,5 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["src", "tests", "scripts", "*.ts", "*.mts"]
+  "include": ["src", "tests", "scripts", "prisma/*.ts", "*.ts", "*.mts"]
 }

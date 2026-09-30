@@ -12,10 +12,14 @@ export type Config = {
    * buildApp 不连库、main 不启 worker，保证生成物与环境无关。
    */
   projectMapBuild: boolean;
+  /** Agent 服务模拟器（src/sim/agent，`npm run sim:agent`）的监听端口 */
+  simAgentPort: number;
+  /** 消息网关模拟器（src/sim/gateway，`npm run sim:gateway`）的监听端口 */
+  simGatewayPort: number;
 };
 
-function readPort(raw: string | undefined): number {
-  if (raw === undefined || raw === "") return 3000;
+function readPort(raw: string | undefined, fallback = 3000): number {
+  if (raw === undefined || raw === "") return fallback;
   const n = Number(raw);
   if (!Number.isInteger(n) || n <= 0 || n > 65535) {
     throw new Error(`PORT 不是合法端口：${raw}`);
@@ -25,6 +29,8 @@ function readPort(raw: string | undefined): number {
 
 export const config: Readonly<Config> = Object.freeze({
   port: readPort(process.env.PORT),
+  simAgentPort: readPort(process.env.SIM_AGENT_PORT, 8200),
+  simGatewayPort: readPort(process.env.SIM_GATEWAY_PORT, 8100),
   databaseUrl: process.env.DATABASE_URL || undefined,
   projectMapBuild: process.env.PROJECT_MAP_BUILD === "1",
 });
