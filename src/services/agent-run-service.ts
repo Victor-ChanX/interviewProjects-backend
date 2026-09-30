@@ -17,6 +17,8 @@
 // 结束时折进 accumulatedMs，停机期间自然不计（worker.budget-from-db）。60 秒「从 run 创建起」算：第一次领取时把
 // 创建到领取之间的排队时间也折进去（只算本 worker 启动之后的部分 —— 之前可能是停机）。心跳过期的 run 被别的副本
 // 接手时只折算「心跳还活着」的那段。审计重试不计步但计时（它们发生在一步之内）。
+// 60 秒是硬上限，不只在步与步之间判：一步之内 turn 超时、每次审计的超时、等发送结果都以剩余预算封顶，
+// 预算在一步中途用完 → 工具不执行（已经对外产生效果的除外：已入队的消息按当前状态收下），run → wall_clock。
 // 重启续跑（A5 第 8 条）：有未完成的步就先把它续完，再判上限 / 外部状态 —— 否则第 12 步发出去之后崩溃，恢复时先判
 // 「步数已满」就结束了，这一步的结果永远是空的。
 //
@@ -348,6 +350,37 @@ function elapsedMs(
     (run.activeSince
       ? Math.max(0, now.getTime() - run.activeSince.getTime())
       : 0)
+  );
+}
+
+/** 60 秒预算还剩多少（毫秒，可为负）。一步之内 turn / 审计 / 等发送结果的等待都以它封顶。 */
+function remainingBudgetMs(
+  run: Pick<AgentRun, "accumulatedMs" | "activeSince" | "budgetMs">,
+  now: Date,
+): number {
+  return run.budgetMs - elapsedMs(run, now);
+}
+
+/** 预算在一步之内用完：同一事务里（可选）给这一步收尾、run → failed / wall_clock。 */
+async function endOnWallClock(
+  run: RunWithGroup,
+  deps: AgentRunDeps,
+  step?: { id: string; summary: string },
+): Promise<void> {
+  const now = deps.clock.now();
+  await getDb().$transaction(async (tx) => {
+    await touchRun(tx, run.id, deps.workerId, now);
+    if (step) {
+      await tx.agentStep.update({
+        where: { id: step.id },
+        data: { resultSummary: step.summary, completedAt: now },
+      });
+    }
+    await endRun(tx, run, "failed", "wall_clock", now, deps);
+  });
+  deps.log?.info(
+    { runId: run.id, stepId: step?.id ?? null },
+    "60 秒预算在一步之内用完，run failed / wall_clock",
   );
 }
 
@@ -759,10 +792,22 @@ async function takeTurn(
   await touchRun(db, run.id, deps.workerId, deps.clock.now());
   const messages = await buildMessages(run);
   await deps.checkpoint?.("before_turn");
+  // 60 秒是硬上限（A5 第 2 条）：这一轮最多等到预算用完为止；预算已经用完就不再调
+  const remaining = remainingBudgetMs(run, deps.clock.now());
+  if (remaining <= 0) {
+    await endOnWallClock(run, deps);
+    return "ended";
+  }
+  const cappedByBudget = remaining < deps.turnTimeoutMs;
   const result = await deps.agent.turn(
     { runId: run.id, tools: AGENT_TOOLS, messages },
-    { timeoutMs: deps.turnTimeoutMs },
+    { timeoutMs: Math.min(deps.turnTimeoutMs, remaining) },
   );
+  if (!result.ok && result.code === "TURN_TIMEOUT" && cappedByBudget) {
+    // 是预算先到、不是这一轮超了 10–15 秒：不记协议错误，run 按 wall_clock 结束，迟到的响应丢弃
+    await endOnWallClock(run, deps);
+    return "ended";
+  }
   const now = deps.clock.now();
   const raw = clipBytes(result.raw, RAW_RESPONSE_MAX_BYTES);
 
@@ -1190,10 +1235,19 @@ async function runAudit(
   step: AgentStep,
   text: string,
   deps: AgentRunDeps,
-): Promise<"pass" | "fail" | "blocked"> {
+): Promise<"pass" | "fail" | "blocked" | "wall_clock"> {
   const db = getDb();
   let attempts = step.auditAttempts;
   while (attempts < AUDIT_MAX_ATTEMPTS) {
+    // 等审计的时间计入 60 秒（A5 第 4 条）：预算用完就不再审、工具不执行
+    const remaining = remainingBudgetMs(run, deps.clock.now());
+    if (remaining <= 0) {
+      await endOnWallClock(run, deps, {
+        id: step.id,
+        summary: "run 的 60 秒预算在等审计时用完，工具未执行",
+      });
+      return "wall_clock";
+    }
     attempts += 1;
     await db.$transaction(async (tx) => {
       await touchRun(tx, run.id, deps.workerId, deps.clock.now());
@@ -1204,7 +1258,7 @@ async function runAudit(
     });
     const r = await deps.agent.audit(
       { text, groupId: run.group.gatewayGroupId ?? run.group.id },
-      { timeoutMs: deps.auditTimeoutMs },
+      { timeoutMs: Math.min(deps.auditTimeoutMs, remaining) },
     );
     if (r.verdict === "pass" || r.verdict === "fail") {
       await db.agentStep.update({
@@ -1336,7 +1390,7 @@ async function executeSend(
   } else {
     if (step.auditVerdict !== "pass") {
       const verdict = await runAudit(run, step, input.text, deps);
-      if (verdict === "blocked") return true;
+      if (verdict === "blocked" || verdict === "wall_clock") return true;
       if (verdict === "fail") {
         await completeStep(
           run.id,
@@ -1415,7 +1469,7 @@ async function executeSend(
     await deps.checkpoint?.("after_enqueue");
   }
 
-  const result = await waitForDelivery(clientMsgId, deps);
+  const result = await waitForDelivery(clientMsgId, deps, run);
   await completeStep(run.id, step.id, result, deps);
   return false;
 }
@@ -1424,6 +1478,7 @@ async function executeSend(
 async function waitForDelivery(
   clientMsgId: string,
   deps: AgentRunDeps,
+  run: Pick<AgentRun, "accumulatedMs" | "activeSince" | "budgetMs">,
 ): Promise<ToolResult> {
   const start = deps.clock.now().getTime();
   for (;;) {
@@ -1440,6 +1495,14 @@ async function waitForDelivery(
     }
     if (status === "failed" || status === "cancelled") {
       return deliveryFailure(status, msg.failCode, clientMsgId);
+    }
+    // 消息已入队（对外的效果已经发生，A5 第 8 条）：预算用完就按当前状态收下这一步，由 afterStep 按 wall_clock
+    // 结束 run；消息照常由出站 worker 投递
+    if (remainingBudgetMs(run, deps.clock.now()) <= 0) {
+      return ok(
+        { clientMsgId, deliveryStatus: status },
+        `已入队 ${clientMsgId}（${status}），run 的 60 秒预算已用完`,
+      );
     }
     if (deps.clock.now().getTime() - start >= SEND_WAIT_MS) {
       return fail(
@@ -1517,7 +1580,7 @@ async function executeKick(
       }),
       deps,
     );
-    if (verdict === "blocked") return true;
+    if (verdict === "blocked" || verdict === "wall_clock") return true;
     if (verdict === "fail") {
       return finish(fail("AUDIT_REJECTED", "审计未通过，未移除成员"));
     }

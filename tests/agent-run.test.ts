@@ -319,11 +319,12 @@ describe("agent run（#12 / #13）", () => {
     turnTimeoutMs?: number;
     auditTimeoutMs?: number;
     workerStartedAt?: Date;
+    agent?: AgentClient;
   };
   const tick = (opts: TickOpts = {}) =>
     runAgentTick({
       clock,
-      agent: agentClient,
+      agent: opts.agent ?? agentClient,
       gateway: gatewayClient,
       workerId: opts.workerId ?? "agent-w1",
       log: silent,
@@ -1069,8 +1070,61 @@ describe("agent run（#12 / #13）", () => {
       });
       const busyRun = await run(busy);
       expectEnded(busyRun, "failed", "wall_clock");
-      expect(busyRun.stepCount).toBe(1);
+      // 60 秒是硬上限：预算在调 turn 之前已经用完，这一轮不再调、不记步
+      expect(busyRun.stepCount).toBe(0);
+      expect((await agentState()).runs.find((r) => r.runId === busy)).toBe(
+        undefined,
+      );
       expect(busyRun.accumulatedMs).toBeGreaterThanOrEqual(60_000);
+    });
+
+    it("turn 的等待以剩余预算封顶：还剩 50ms 时 agent 不回 → 50ms 后按 wall_clock 结束，不记 TURN_TIMEOUT", async () => {
+      const { group } = await stageGroup();
+      await agentScenario({
+        turn: { steps: [{ type: "finish", hang: true }] },
+      });
+      const runId = await startRun(group);
+      await getDb().agentRun.update({
+        where: { id: runId },
+        data: { accumulatedMs: 59_950 },
+      });
+      const startedAt = Date.now();
+      await runToEnd({ turnTimeoutMs: 5_000 });
+      expect(Date.now() - startedAt).toBeLessThan(2_000);
+      const r = await run(runId);
+      expectEnded(r, "failed", "wall_clock");
+      expect(await steps(runId)).toHaveLength(0);
+    });
+
+    it("等审计的时间计入 60 秒：审计途中预算用完 → 工具不执行、wall_clock（不是再审满 3 次后 audit_blocked）", async () => {
+      const { group } = await stageGroup();
+      await agentScenario({
+        turn: { steps: [{ type: "send_message", text: "晚了" }] },
+      });
+      const runId = await startRun(group);
+      await getDb().agentRun.update({
+        where: { id: runId },
+        data: { accumulatedMs: 58_000 },
+      });
+      // 每次审计都拖 1.5 秒（假时钟）且拿不到结论
+      let audits = 0;
+      const slowAudit: AgentClient = {
+        ...agentClient,
+        async audit() {
+          audits += 1;
+          clock.advance(1_500);
+          return { verdict: "unknown", reason: "超时", status: null, raw: "" };
+        },
+      };
+      await runToEnd({ agent: slowAudit });
+      const r = await run(runId);
+      expectEnded(r, "failed", "wall_clock");
+      expect(audits).toBe(2);
+      const [s0] = await steps(runId);
+      expect(s0).toMatchObject({ name: "send_message", auditAttempts: 2 });
+      expect(s0!.completedAt).not.toBeNull();
+      expect(s0!.resultSummary).toContain("预算");
+      expect((await gatewayState()).sendCalls).toHaveLength(0);
     });
   });
 
