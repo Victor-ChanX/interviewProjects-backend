@@ -21,10 +21,17 @@ export const WS_EVENT_TYPES = [
   "agent_run",
   /** 序列运行状态 { runId, groupId, status, ... } */
   "sequence_run",
-  /** 群成员变化 { groupId, accountId, change } */
+  /**
+   * 群成员变化 { groupId, platformUserId, accountId | null, change }：
+   * change = joined | left（入站 worker #8）| promoted（建群 job #11 把 memberAccountIds[0] 提成 admin）
+   */
   "member_changed",
   /** 群状态变化 { groupId, from, to, reason }（#7：GROUP_WRITE_FORBIDDEN → unreachable） */
   "group_status_changed",
+  /** 群开关变化 { groupId, agentEnabled, autoKickEnabled }（#11：PATCH /api/groups/:id） */
+  "group_settings_changed",
+  /** 建群 / leave-all job 状态 { jobId, groupId, kind, status, step }（#11：每步推进与终态） */
+  "job",
 ] as const;
 export type WsEventType = (typeof WS_EVENT_TYPES)[number];
 

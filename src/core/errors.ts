@@ -24,7 +24,13 @@ export type ErrorCode =
   // 账号不是该群成员（409：等 member_joined 到了状态就变）
   | "ACCOUNT_NOT_IN_GROUP"
   // 群已 unreachable / left：不再受理发送（409：群状态不允许）
-  | "GROUP_UNREACHABLE";
+  | "GROUP_UNREACHABLE"
+  // ---- 建群 job（#11，题目 2.3 POST /api/groups + GET /api/jobs/:jobId）----
+  // 建群涉及的账号不是 online（含不存在的账号；422：换一批账号就能过）
+  | "ACCOUNT_NOT_ONLINE"
+  | "JOB_NOT_FOUND"
+  // ---- Agent run（#13，题目 2.3 GET /api/agent-runs/:id）----
+  | "AGENT_RUN_NOT_FOUND";
 
 export type ErrorExtra = Record<string, unknown>;
 

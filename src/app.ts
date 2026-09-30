@@ -18,10 +18,13 @@ import {
 } from "fastify-type-provider-zod";
 
 import accountRoutes from "./api/routes/accounts.js";
+import agentRunRoutes from "./api/routes/agent-runs.js";
 import authRoutes from "./api/routes/auth.js";
 import groupMessageRoutes from "./api/routes/group-messages.js";
 import groupSendRoutes from "./api/routes/group-send.js";
+import groupRoutes from "./api/routes/groups.js";
 import healthRoutes from "./api/routes/health.js";
+import jobRoutes from "./api/routes/jobs.js";
 import wsRoutes from "./api/routes/ws.js";
 import { config } from "./core/config.js";
 import { DomainError, type ErrorCode } from "./core/errors.js";
@@ -30,8 +33,11 @@ import type { GatewayClient } from "./services/gateway-client.js";
 import { createWsHub, type WsHub } from "./services/ws-hub.js";
 // 副作用 import：让 .meta({ id }) 的 schema 在 app.swagger() 之前已进 z.globalRegistry
 import "./schemas/account.js";
+import "./schemas/agent-run.js";
 import "./schemas/auth.js";
+import "./schemas/group.js";
 import "./schemas/health.js";
+import "./schemas/job.js";
 import "./schemas/message.js";
 
 export type ErrorEnvelope = {
@@ -150,8 +156,12 @@ export async function buildApp(
     prefix: "/api/accounts",
     gateway: opts.gateway,
   });
+  void app.register(groupRoutes, { prefix: "/api/groups" });
   void app.register(groupMessageRoutes, { prefix: "/api/groups" });
   void app.register(groupSendRoutes, { prefix: "/api/groups" });
+  void app.register(jobRoutes, { prefix: "/api/jobs" });
+  // agent run 查询（#13）：两条路径前缀不同（/api/agent-runs 与 /api/groups/:id/agent-runs），路由文件写全路径
+  void app.register(agentRunRoutes);
   void app.register(wsRoutes, { hub: opts.wsHub ?? createWsHub() });
 
   return app;

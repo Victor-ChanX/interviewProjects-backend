@@ -11,10 +11,16 @@ import {
   runMigrations,
 } from "./db/client.js";
 import { seedDatabase } from "./db/seed.js";
+import { agentClientFromConfig } from "./services/agent-client.js";
 import { gatewayClientFromConfig } from "./services/gateway-client.js";
 import { createWsHub } from "./services/ws-hub.js";
 import { applyGatewayDelivery } from "./services/outbox-service.js";
+import {
+  defaultAgentWorkerId,
+  startAgentWorker,
+} from "./workers/agent-worker.js";
 import { startInboundWorker } from "./workers/inbound-worker.js";
+import { defaultJobWorkerId, startJobWorker } from "./workers/job-worker.js";
 import { defaultWorkerId, startOutboxWorker } from "./workers/outbox-worker.js";
 import { startRateLimitWorker } from "./workers/rate-limit-worker.js";
 import { startWsBroadcastWorker } from "./workers/ws-broadcast-worker.js";
@@ -53,6 +59,24 @@ async function main(): Promise<void> {
     hub: wsHub,
     pollIntervalMs: 200,
   });
+  // 建群 / leave-all job（#11 / #16）：进度在 jobs.step / state，排期在 jobs.nextRunAt（join 等待按 200ms 排），
+  // 这里每 200ms 看一眼
+  const jobWorker = startJobWorker({
+    clock: systemClock,
+    gateway,
+    workerId: defaultJobWorkerId(),
+    intervalMs: 200,
+  });
+
+  // agent run（#12）：触发在入站事务里落库（agent_runs），这里每 200ms 看一眼有没有待执行的 run；
+  // 领着的 run 一步一步跑到终态，停机时在当前步之后释放（活跃时长折进 accumulatedMs，停机期间不计预算）
+  const agentWorker = startAgentWorker({
+    clock: systemClock,
+    agent: agentClientFromConfig(),
+    gateway,
+    workerId: defaultAgentWorkerId(),
+    intervalMs: 200,
+  });
 
   const shutdown = async (signal: string): Promise<void> => {
     logger.info({ signal }, "收到停机信号，开始优雅停机");
@@ -61,6 +85,8 @@ async function main(): Promise<void> {
       rateLimitWorker.stop(),
       inboundWorker.stop(),
       wsBroadcastWorker.stop(),
+      jobWorker.stop(),
+      agentWorker.stop(),
     ]);
     // 先关 WS 连接再关 HTTP：客户端收到 1001 后按 sinceSeq 重连到别的副本
     await wsHub.stop();

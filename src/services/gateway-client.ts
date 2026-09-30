@@ -34,7 +34,50 @@ export type GatewayClient = {
     groupId: string,
     clientMsgId: string,
   ): Promise<GatewayMessageLanding | null>;
+
+  // ---- 群与成员（题目 2.1「群与成员」；建群 job #11。kick / leave 由 #12 / #16 往下加）----
+  /** POST /groups { creatorAccountId } → { groupId }：创建者即群主与成员，网关不为它推 member_joined。 */
+  createGroup(input: {
+    creatorAccountId: string;
+  }): Promise<{ groupId: string }>;
+  /**
+   * POST /groups/:groupId/invite → { inviteLink, readyAfterMs }。readyAfterMs 内使用链接得到
+   * 409 INVITE_NOT_READY；链接随时可能过期（使用时 410 INVITE_EXPIRED）。
+   */
+  createInvite(groupId: string): Promise<GatewayInvite>;
+  /**
+   * POST /groups/:groupId/join { accountId, inviteLink } → 202 { accepted: true }：只是受理，入群以
+   * member_joined 事件为准。同步错误按 GatewayResponseError 抛：409 ALREADY_MEMBER / 409 INVITE_NOT_READY /
+   * 410 INVITE_EXPIRED / 409 ACCOUNT_OFFLINE。
+   */
+  joinGroup(
+    groupId: string,
+    input: { accountId: string; inviteLink: string },
+  ): Promise<{ accepted: true }>;
+  /**
+   * POST /groups/:groupId/promote { byAccountId, accountId } → 200 {}，不推事件。
+   * 403 NO_PERMISSION（by 不是群主）/ 409 NOT_MEMBER_YET（对方 member_joined 还没到）。
+   */
+  promote(
+    groupId: string,
+    input: { byAccountId: string; accountId: string },
+  ): Promise<void>;
+  /** GET /groups/:groupId/members → [{ platformUserId }]：网关视角的当前成员。 */
+  listMembers(groupId: string): Promise<{ platformUserId: string }[]>;
+  /**
+   * POST /groups/:groupId/kick { byAccountId, targetPlatformUserId } → 200 { kicked: true }（agent 的 kick_user，#12）。
+   * 目标在 200 返回前已从成员列表移除。同步错误按 GatewayResponseError 抛：409 OWNER_LEFT（群主已退群）/
+   * 403 NO_PERMISSION（by 不是群主也没被 promote）/ 409 ACCOUNT_OFFLINE / 504 NETWORK_TIMEOUT（结果未知：
+   * 调用方用 listMembers 在 2 秒内收敛判断）。响应本身可能要 1–5 秒（timeoutMs 默认 10s 够）。
+   */
+  kick(
+    groupId: string,
+    input: { byAccountId: string; targetPlatformUserId: string },
+  ): Promise<{ kicked: true }>;
 };
+
+/** 邀请链接：readyAfterMs 是网关说的「多久后才可用」（可能为 0） */
+export type GatewayInvite = { inviteLink: string; readyAfterMs: number };
 
 export type GatewaySendInput = {
   /** 网关侧的 groupId（groups.gatewayGroupId） */
@@ -196,6 +239,78 @@ export function createGatewayClient(
       }
       return { msgId, sentAt };
     },
+    async createGroup(input) {
+      const body = (await request("POST", "/groups", input)).body;
+      const groupId = (body as { groupId?: unknown }).groupId;
+      if (typeof groupId !== "string" || groupId === "") {
+        throw new GatewayUnreachableError(
+          "POST",
+          "/groups",
+          new Error("响应缺少 groupId"),
+        );
+      }
+      return { groupId };
+    },
+    async createInvite(groupId) {
+      const path = `/groups/${encodeURIComponent(groupId)}/invite`;
+      const body = (await request("POST", path)).body;
+      const { inviteLink, readyAfterMs } = body as {
+        inviteLink?: unknown;
+        readyAfterMs?: unknown;
+      };
+      if (typeof inviteLink !== "string" || inviteLink === "") {
+        throw new GatewayUnreachableError(
+          "POST",
+          path,
+          new Error("响应缺少 inviteLink"),
+        );
+      }
+      // readyAfterMs 缺了 / 不是数按 0 处理：真不可用时 join 会回 INVITE_NOT_READY，job 按它等
+      const ready =
+        typeof readyAfterMs === "number" && Number.isFinite(readyAfterMs)
+          ? Math.max(0, readyAfterMs)
+          : 0;
+      return { inviteLink, readyAfterMs: ready };
+    },
+    async joinGroup(groupId, input) {
+      await request(
+        "POST",
+        `/groups/${encodeURIComponent(groupId)}/join`,
+        input,
+      );
+      return { accepted: true };
+    },
+    async promote(groupId, input) {
+      await request(
+        "POST",
+        `/groups/${encodeURIComponent(groupId)}/promote`,
+        input,
+      );
+    },
+    async listMembers(groupId) {
+      const path = `/groups/${encodeURIComponent(groupId)}/members`;
+      const body = (await request("GET", path)).body;
+      if (!Array.isArray(body)) {
+        throw new GatewayUnreachableError(
+          "GET",
+          path,
+          new Error("响应不是成员数组"),
+        );
+      }
+      return body.flatMap((m: unknown) => {
+        const platformUserId = (m as { platformUserId?: unknown })
+          ?.platformUserId;
+        return typeof platformUserId === "string" ? [{ platformUserId }] : [];
+      });
+    },
+    async kick(groupId, input) {
+      await request(
+        "POST",
+        `/groups/${encodeURIComponent(groupId)}/kick`,
+        input,
+      );
+      return { kicked: true };
+    },
   };
 }
 
@@ -342,5 +457,11 @@ export function gatewayClientFromConfig(): GatewayClient {
     send: (input) => resolve().send(input),
     getMessageByClientId: (groupId, clientMsgId) =>
       resolve().getMessageByClientId(groupId, clientMsgId),
+    createGroup: (input) => resolve().createGroup(input),
+    createInvite: (groupId) => resolve().createInvite(groupId),
+    joinGroup: (groupId, input) => resolve().joinGroup(groupId, input),
+    promote: (groupId, input) => resolve().promote(groupId, input),
+    listMembers: (groupId) => resolve().listMembers(groupId),
+    kick: (groupId, input) => resolve().kick(groupId, input),
   };
 }

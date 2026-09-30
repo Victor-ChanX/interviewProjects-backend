@@ -158,6 +158,37 @@ export function promote(
   byAccountId: string,
   accountId: string,
 ): Record<string, never> {
+  // 每次调用都记账（含被拒绝的）：GET /_sim/state 的 promoteCalls 供测试断言「调用总数 ≤ 2」
+  try {
+    const result = promoteInner(ctx, groupId, byAccountId, accountId);
+    ctx.promoteCalls.push({
+      groupId,
+      byAccountId,
+      accountId,
+      status: 200,
+      code: null,
+    });
+    return result;
+  } catch (err) {
+    if (err instanceof GatewayError) {
+      ctx.promoteCalls.push({
+        groupId,
+        byAccountId,
+        accountId,
+        status: err.statusCode,
+        code: err.code,
+      });
+    }
+    throw err;
+  }
+}
+
+function promoteInner(
+  ctx: GatewayContext,
+  groupId: string,
+  byAccountId: string,
+  accountId: string,
+): Record<string, never> {
   const by = assertOnline(ctx, byAccountId);
   const group = getGroup(ctx, groupId);
   if (by.platformUserId !== group.ownerPlatformUserId || group.ownerLeft) {
