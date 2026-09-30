@@ -6,8 +6,11 @@
 // 并在对应 model 上加注释指向那个迁移目录。
 
 generator client {
-  provider = "prisma-client"
-  output   = "../src/db/generated"
+  provider            = "prisma-client"
+  output              = "../src/db/generated"
+  // 生成文件之间的相对导入写 .js：tsc 编译到 dist 后 node 直接能加载（tsx 开发时同样认）
+  importFileExtension = "js"
+  moduleFormat        = "esm"
 }
 
 datasource db {
