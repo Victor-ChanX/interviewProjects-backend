@@ -1,5 +1,6 @@
 // 种子：题目 2.1 要求账号在 migration / seed 里预置（初始 idle、platformUserId = null），
 // 2.3 要求预置 admin/admin、viewer/viewer。
+// 幂等种子：在 runMigrations() 之后、listen 之前由 src/main.ts 调；
 // 不写进迁移（迁移里不许有数据语句）、不挂 prisma.config.ts 的 migrations.seed。
 // 幂等靠 upsert 且 update 为空：已存在的行一个字段都不动 —— 账号的 status / platformUserId
 // 是运行态，种子重跑不能把在线账号打回 idle。多副本同时启动靠 upsert 的 ON CONFLICT 扛，不加锁。

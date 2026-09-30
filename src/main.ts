@@ -16,6 +16,7 @@ import { startExampleWorker } from "./workers/example-worker.js";
 async function main(): Promise<void> {
   runMigrations();
   await assertSchemaCurrent();
+  // 种子在迁移之后、listen 之前：幂等，多副本同时启动也安全
   await seedDatabase(getDb(), logger);
 
   const app = await buildApp();
