@@ -234,7 +234,9 @@ describe("WS /ws", () => {
     await emit("message", { groupId: "g", msgId: "before-expiry" });
     await vi.waitFor(() => expect(c.events()).toHaveLength(1));
     expect(c.closed).toBeNull();
-    clock.advance(5_000);
+    // 多拨 1 秒：token 是在 clock.reset() 之后才签的，JWT exp 又按秒取整，两步正好跨过整秒时
+    // 拨到 TTL 整还差不到 1 秒才过期（CI 慢时偶发）
+    clock.advance(5_000 + 1_000);
     await vi.waitFor(() => expect(c.closed).not.toBeNull());
     expect(c.closed?.code).toBe(WS_CLOSE_SESSION_ENDED);
   });
