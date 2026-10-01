@@ -17,7 +17,9 @@
 // 客户端据此走 refresh，拿新 token 带 sinceSeq 重连，期间的事件照常补发。
 //
 // 帧（服务端 → 客户端）：
-//   { type: "auth", success: true }                        认证通过（authenticate 里发，保证在任何事件帧之前）
+//   { type: "auth", success: true, seq }                   认证通过（authenticate 里发，保证在任何事件帧之前）；seq = 本连接接下来
+//                                                          从它之后开始推 —— 没带 sinceSeq 的客户端拿它当补发点，下次断线重连
+//                                                          能真正补发而不用全量重拉（#60）
 //   { type: "resync", sinceSeq, fromSeq }                  补发有缺口：(sinceSeq, fromSeq] 之间的事件不再补
 //   { seq, type, payload }                                 事件帧，type 见 src/services/ws-events.ts
 import { type Clock, systemClock } from "../core/clock.js";
@@ -192,7 +194,16 @@ export function createWsHub(deps: WsHubDeps = {}): WsHub {
       }
 
       // 以下同步执行：auth 成功帧一定先于任何事件帧（pump 只在 await 之后的同步段里广播，插不进来）
-      if (!safeSend(conn, JSON.stringify({ type: "auth", success: true }))) {
+      if (
+        !safeSend(
+          conn,
+          JSON.stringify({
+            type: "auth",
+            success: true,
+            seq: conn.lastSentSeq,
+          }),
+        )
+      ) {
         return { resync: null };
       }
       if (resync) {

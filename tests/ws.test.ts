@@ -81,8 +81,12 @@ async function connect(url: string): Promise<Client> {
   const client: Client = {
     ws,
     frames: [],
+    // 事件帧：带 seq、且不是控制帧（auth 成功帧也带 seq —— 那是补发点，不是事件）
     events: () =>
-      client.frames.filter((f): f is EventFrame => typeof f.seq === "number"),
+      client.frames.filter(
+        (f): f is EventFrame =>
+          typeof f.seq === "number" && f.type !== "auth" && f.type !== "resync",
+      ),
     closed: null,
     send: (frame) => ws.send(JSON.stringify(frame)),
     close: async () => {
@@ -117,7 +121,7 @@ async function connectAuthed(
     ...(sinceSeq === undefined ? {} : { sinceSeq }),
   });
   await vi.waitFor(() =>
-    expect(client.frames[0]).toEqual({ type: "auth", success: true }),
+    expect(client.frames[0]).toMatchObject({ type: "auth", success: true }),
   );
   return client;
 }
@@ -175,9 +179,10 @@ describe("WS /ws", () => {
 
   // ---- auth ------------------------------------------------------------------------
 
-  it("auth 成功：第一帧 auth 回 { type: auth, success: true }，连接保持", async () => {
+  it("auth 成功：第一帧 auth 回 { type: auth, success: true, seq }（seq = 从它之后开始推，客户端的补发点），连接保持", async () => {
+    const before = (await emit("job", { n: "1" })).seq;
     const c = await open();
-    expect(c.frames).toEqual([{ type: "auth", success: true }]);
+    expect(c.frames).toEqual([{ type: "auth", success: true, seq: before }]);
     expect(c.closed).toBeNull();
     expect(hub.size).toBe(1);
   });
