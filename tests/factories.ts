@@ -37,7 +37,6 @@ import {
   type WsEventType,
 } from "../src/services/ws-events.js";
 
-
 const LOGIN_PATH = "/api/auth/login";
 
 /** 直接打登录端点，返回原始响应：给「测登录本身」的用例用（成功 / 失败 / 校验错）。 */
