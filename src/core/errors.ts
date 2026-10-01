@@ -15,6 +15,8 @@ export type ErrorCode =
   | "INTERNAL"
   // ---- 账号（#6，题目 2.3 accounts 端点 + A1）----
   | "ACCOUNT_NOT_FOUND"
+  // 新增账号时 id 已存在（409，#63）
+  | "ACCOUNT_EXISTS"
   | "ILLEGAL_TRANSITION"
   | "CAS_CONFLICT"
   | "ACCOUNT_UNAVAILABLE"

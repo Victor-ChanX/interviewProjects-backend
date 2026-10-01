@@ -7,6 +7,7 @@ import type { FastifyInstance } from "fastify";
 import type { ZodTypeProvider } from "fastify-type-provider-zod";
 
 import {
+  AccountCreateRequest,
   AccountIdParams,
   AccountList,
   AccountRead,
@@ -15,6 +16,7 @@ import {
 } from "../../schemas/account.js";
 import {
   connect,
+  createAccount,
   DEFAULT_RATE_LIMIT_SECONDS,
   listAccounts,
   toAccountRead,
@@ -62,6 +64,25 @@ export default async function accountRoutes(
       },
     },
     async () => listAccounts(),
+  );
+
+  r.post(
+    "/",
+    {
+      prefixTrailingSlash: "no-slash",
+      onRequest: [requireUser, requireRole("admin")],
+      schema: {
+        summary:
+          "新增一个服务账号（idle，之后 connect）；题目里账号由 seed 预置，这是控制台的补充入口",
+        tags: ["accounts"],
+        body: AccountCreateRequest,
+        response: { 201: AccountRead },
+      },
+    },
+    async (req, reply) => {
+      const account = await createAccount(req.body.id, { log: req.log });
+      return reply.code(201).send(account);
+    },
   );
 
   r.post(

@@ -24,7 +24,11 @@ import {
 } from "../core/errors.js";
 import type { Logger } from "../core/logger.js";
 import { getDb } from "../db/client.js";
-import type { Account, AccountStatus, Prisma } from "../db/generated/client.js";
+import {
+  type Account,
+  type AccountStatus,
+  Prisma,
+} from "../db/generated/client.js";
 import type { AccountRead } from "../schemas/account.js";
 import {
   type GatewayClient,
@@ -141,6 +145,31 @@ export function toAccountRead(row: Account): AccountRead {
     platformUserId: row.platformUserId,
     rateLimitedUntil: row.rateLimitedUntil?.toISOString() ?? null,
   };
+}
+
+/**
+ * 新增一个服务账号（#63）：status = idle、platformUserId = null，之后照常 connect。题目里账号由 seed 预置，这是控制台的
+ * 补充入口。id 撞了 → 409 ACCOUNT_EXISTS（靠主键唯一，不先查再插）。
+ */
+export async function createAccount(
+  id: string,
+  deps: { log?: TransitionDeps["log"] } = {},
+): Promise<AccountRead> {
+  try {
+    const row = await getDb().account.create({ data: { id, status: "idle" } });
+    deps.log?.info({ accountId: id }, "已新增服务账号");
+    return toAccountRead(row);
+  } catch (err) {
+    if (
+      err instanceof Prisma.PrismaClientKnownRequestError &&
+      err.code === "P2002"
+    ) {
+      throw new Conflict("ACCOUNT_EXISTS", `账号 ${id} 已存在，换一个 ID`, {
+        accountId: id,
+      });
+    }
+    throw err;
+  }
 }
 
 export async function listAccounts(): Promise<AccountRead[]> {

@@ -434,6 +434,49 @@ describe("accounts", () => {
     });
   });
 
+  // ---- 新增账号（#63）---------------------------------------------------------------
+
+  describe("新增账号（POST /api/accounts）", () => {
+    it("admin 新增 → 201 idle、platformUserId 为 null，列表里有它，随后能照常 connect", async () => {
+      const res = await post("/api/accounts", admin, { id: "acc-new_1" });
+      expect(res.statusCode).toBe(201);
+      expect(res.json()).toEqual({
+        id: "acc-new_1",
+        status: "idle",
+        platformUserId: null,
+        rateLimitedUntil: null,
+      });
+      const list = await app.inject({
+        method: "GET",
+        url: "/api/accounts",
+        headers: viewer,
+      });
+      expect(list.json<{ id: string }[]>().map((a) => a.id)).toContain(
+        "acc-new_1",
+      );
+      const connected = await post("/api/accounts/acc-new_1/connect", admin);
+      expect(connected.statusCode).toBe(200);
+      expect(connected.json()).toMatchObject({ status: "online" });
+    });
+
+    it("id 已存在 → 409 ACCOUNT_EXISTS；不合法的 id → 400；viewer → 403", async () => {
+      await post("/api/accounts", admin, { id: "dup" });
+      const again = await post("/api/accounts", admin, { id: "dup" });
+      expect(again.statusCode).toBe(409);
+      expect(again.json()).toMatchObject({ error: { code: "ACCOUNT_EXISTS" } });
+
+      for (const id of ["", "Upper", "has space", "-lead", "x".repeat(33)]) {
+        const bad = await post("/api/accounts", admin, { id });
+        expect(bad.statusCode).toBe(400);
+      }
+      const forbidden = await post("/api/accounts", viewer, { id: "v1" });
+      expect(forbidden.statusCode).toBe(403);
+      expect(
+        await getDb().account.count({ where: { id: { in: ["v1"] } } }),
+      ).toBe(0);
+    });
+  });
+
   // ---- 终态级联 ----------------------------------------------------------------------
 
   describe("终态级联（一个事务；三种来源结果一致）", () => {

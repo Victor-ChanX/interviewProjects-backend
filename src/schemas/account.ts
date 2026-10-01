@@ -29,6 +29,18 @@ export type AccountRead = z.infer<typeof AccountRead>;
 export const AccountList = z.array(AccountRead).meta({ id: "AccountList" });
 export type AccountList = z.infer<typeof AccountList>;
 
+/** 新增账号（#63，题目之外的控制台补充）：id 只允许小写字母、数字、- 与 _ */
+export const AccountCreateRequest = z.object({
+  id: z
+    .string()
+    .trim()
+    .regex(
+      /^[a-z0-9][a-z0-9_-]{0,31}$/,
+      "账号 ID 只能用小写字母、数字、- 和 _，以字母或数字开头，最长 32 个字符",
+    ),
+});
+export type AccountCreateRequest = z.infer<typeof AccountCreateRequest>;
+
 export const AccountIdParams = z.object({
   id: z.string().min(1),
 });
