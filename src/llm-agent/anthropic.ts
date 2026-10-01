@@ -107,6 +107,17 @@ function toParam(block: AgentBlock): BetaContentBlockParam {
         content: toolResultText(block.content),
         ...(block.is_error === true ? { is_error: true } : {}),
       };
+    case "image":
+      // Claude 的 image 块：base64 + media_type（只接受 png / jpeg / gif / webp，后端只发这几种）
+      return {
+        type: "image",
+        source: {
+          type: "base64",
+          media_type: block.source.media_type as
+            "image/png" | "image/jpeg" | "image/gif" | "image/webp",
+          data: block.source.data,
+        },
+      };
   }
 }
 

@@ -87,6 +87,13 @@ content 里有 `tool_use` 取第一个 → `stop_reason: "tool_use"`（若同时
   `promptFeedback.blockReason` 或 `finishReason` 为 SAFETY / RECITATION / BLOCKLIST / PROHIBITED_CONTENT / SPII / LANGUAGE
   → `end_turn` 写明模型拒绝；`MALFORMED_FUNCTION_CALL` 或没有候选 → 502；否则拼非思考（`thought !== true`）的 text → `end_turn`。
 
+## 触发消息里的图片（后端 #61）
+
+题目 2.2 的 tool_result 有 8KB 上限，放不下图片字节，所以平台把触发消息中已下载的图片（题目 C1）以
+`{ type: "image", msgId, source: { type: "base64", media_type, data } }` 块跟在第一条 user 消息的上下文 text 后面
+（每轮最多 4 张；附件还在下载时平台先等最多 8 秒）。这里原样转给上游：Claude 是 image 块，Gemini 是 `inlineData`
+part。请求体上限因此放到 16 MB。`get_recent_messages` 里带附件的消息多一个 `hasAttachment: true`（只是标记）。
+
 ## 思考状态回传（按 runId 的会话状态）
 
 2.2 每轮只回一个块，思考内容没有位置，后端传回来的历史里只剩 `tool_use`。两家都要求多轮工具调用把思考状态原样带回：

@@ -33,7 +33,17 @@ export type ToolResultBlock = {
   content: string;
   is_error?: boolean;
 };
-export type AgentBlock = TextBlock | ToolUseBlock | ToolResultBlock;
+/**
+ * 触发消息里的图片（#61，在 2.2 协议的 Anthropic 子集上扩的一个块）：跟在第一条 user 消息的上下文 text 后面；
+ * msgId 指明是哪条消息的附件。tool_result 有 8KB 上限（A5 第 9 条），图片只能走这里。
+ */
+export type ImageBlock = {
+  type: "image";
+  msgId: string;
+  source: { type: "base64"; media_type: string; data: string };
+};
+export type AgentBlock =
+  TextBlock | ToolUseBlock | ToolResultBlock | ImageBlock;
 export type AgentMessage = {
   role: "user" | "assistant";
   content: AgentBlock[];

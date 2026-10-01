@@ -207,6 +207,8 @@ export async function buildLlmAgentApp(
   const app = Fastify({
     logger: opts.logger ?? true,
     exposeHeadRoutes: false,
+    // 第一条 user 消息可能带触发消息的图片（后端 #61，base64），默认 1 MB 的请求体上限不够
+    bodyLimit: 16 * 1024 * 1024,
   });
 
   app.setErrorHandler((err, req, reply) => {

@@ -267,6 +267,24 @@ describe("sim agent", () => {
     expect(all.runs.map((x) => x.runId).sort()).toEqual(["run-a", "run-b"]);
   });
 
+  it("请求里带图片块（后端 #61，可能超过 1 MB 默认上限）：照常受理，剧本不受影响", async () => {
+    const data = Buffer.alloc(1024 * 1024 + 100).toString("base64");
+    const res = await turn("run-img", [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "{}" },
+          {
+            type: "image",
+            msgId: "m1",
+            source: { type: "base64", media_type: "image/png", data },
+          },
+        ],
+      },
+    ]);
+    expect(res.statusCode).toBe(200);
+  });
+
   it("POST /_sim/reset 清空会话与剧本", async () => {
     await scenario({
       runId: "run-a",

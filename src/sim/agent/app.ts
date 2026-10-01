@@ -86,6 +86,8 @@ export async function buildAgentApp(
   const app = Fastify({
     logger: opts.logger !== false,
     exposeHeadRoutes: false,
+    // 请求里可能带触发消息的图片（后端 #61，base64），默认 1 MB 不够
+    bodyLimit: 16 * 1024 * 1024,
     // 关闭时掐断挂起的连接（hang 步骤会让请求永远不结束）
     forceCloseConnections: true,
   });

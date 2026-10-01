@@ -25,6 +25,12 @@ export type AgentBlock =
       tool_use_id: string;
       content: unknown;
       is_error?: boolean;
+    }
+  | {
+      /** 触发消息里的图片（后端 #61 在协议上扩的块）：转成上游各自的图片输入 */
+      type: "image";
+      msgId?: string;
+      source: { type: "base64"; media_type: string; data: string };
     };
 
 export type AgentMessage = {
@@ -71,6 +77,15 @@ const Block = z.discriminatedUnion("type", [
     tool_use_id: z.string().min(1),
     content: z.unknown(),
     is_error: z.boolean().optional(),
+  }),
+  z.looseObject({
+    type: z.literal("image"),
+    msgId: z.string().optional(),
+    source: z.object({
+      type: z.literal("base64"),
+      media_type: z.string().min(1),
+      data: z.string().min(1),
+    }),
   }),
 ]);
 

@@ -492,13 +492,25 @@ export async function readMessageMedia(
     select: { localFilePath: true },
   });
   if (!m?.localFilePath) throw unavailable();
+  const file = await readLocalMedia(m.localFilePath);
+  if (!file) throw unavailable();
+  return file;
+}
+
+/**
+ * 读一个已下载到本地的附件：字节 + 按扩展名推出的 Content-Type；文件不在了返回 null。
+ * 控制台取文件（readMessageMedia）与 agent 看图（agent-run-service，#61）共用。
+ */
+export async function readLocalMedia(
+  path: string,
+): Promise<{ bytes: Buffer; contentType: string } | null> {
   let bytes: Buffer;
   try {
-    bytes = await readFile(m.localFilePath);
+    bytes = await readFile(path);
   } catch {
-    throw unavailable();
+    return null;
   }
-  const ext = extname(m.localFilePath).toLowerCase();
+  const ext = extname(path).toLowerCase();
   const contentType =
     Object.entries(EXTENSIONS).find(([, e]) => e === ext)?.[0] ??
     "application/octet-stream";

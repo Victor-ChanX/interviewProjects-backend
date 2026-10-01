@@ -7,10 +7,14 @@
 // 时间：应用、service、worker、两个模拟器共用一个可拨动的假 Clock；只有 Agent 模拟器的 delay_ms（TURN_TIMEOUT 用例）
 // 用可控的假 sleep，超时本身是客户端真等几百毫秒。
 import { randomUUID } from "node:crypto";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import type { FastifyInstance } from "fastify";
 import {
   afterAll,
+  afterEach,
   beforeAll,
   beforeEach,
   describe,
@@ -41,6 +45,7 @@ import {
   onInboundMessage,
   RESULT_CONTENT_MAX_BYTES,
   RECENT_MESSAGES_MAX,
+  TRIGGER_MEDIA_WAIT_MS,
   RECENT_TEXT_MAX_CHARS,
   STALE_HEARTBEAT_MS,
   validateToolCall,
@@ -1371,6 +1376,125 @@ describe("agent run（#12 / #13）", () => {
       const r = await run(runId);
       expectEnded(r, "cancelled", "cancelled");
       expect(r.stepCount).toBe(2);
+    });
+  });
+
+  describe("看图（#61）：触发消息里的图片随第一条 user 消息发给 agent", () => {
+    const PNG = Buffer.from("89504e470d0a1a0a0000000d49484452", "hex");
+    let dir: string;
+    beforeEach(async () => {
+      dir = await mkdtemp(join(tmpdir(), "agent-media-"));
+    });
+    afterEach(async () => {
+      await rm(dir, { recursive: true, force: true });
+    });
+
+    /** 外部用户发一条带附件的消息并触发 run；downloaded = 附件是否已在本地 */
+    async function triggerWithImage(group: Group, downloaded: boolean) {
+      const msgId = `m-${randomUUID().slice(0, 8)}`;
+      const path = join(dir, `${msgId}-abcd1234.png`);
+      if (downloaded) await writeFile(path, PNG);
+      const msg = await makeMessage({
+        groupId: group.id,
+        msgId,
+        senderPlatformUserId: "u-ext-1",
+        isOwn: false,
+        text: "看看这张图",
+        sentAt: clock.now(),
+        mediaUrl: `/media/${msgId}`,
+        ...(downloaded
+          ? { localFilePath: path, mediaFetchedAt: clock.now() }
+          : { mediaNextAttemptAt: clock.now() }),
+      });
+      const outcome = await getDb().$transaction((tx) =>
+        onInboundMessage(
+          { groupId: group.id, messageId: msg.id },
+          { tx, clock, log: silent },
+        ),
+      );
+      if (outcome.kind !== "run_created") throw new Error("没建出 run");
+      return { runId: outcome.runId, msgId, path, messageId: msg.id };
+    }
+
+    const firstUserContent = async (runId: string) =>
+      (
+        (await agentState()).runs.find((x) => x.runId === runId)?.requests[0]
+          ?.messages[0] as { content: Json[] } | undefined
+      )?.content ?? [];
+
+    it("已下载的图片：第一轮请求里在上下文 text 后带 image 块（msgId + base64）；get_recent_messages 标 hasAttachment", async () => {
+      const { group } = await stageGroup();
+      const { runId, msgId } = await triggerWithImage(group, true);
+      await runToEnd();
+      expect(await firstUserContent(runId)).toEqual([
+        expect.objectContaining({ type: "text" }),
+        {
+          type: "image",
+          msgId,
+          source: {
+            type: "base64",
+            media_type: "image/png",
+            data: PNG.toString("base64"),
+          },
+        },
+      ]);
+      const s = await steps(runId);
+      const recent = parseContent(s[0]?.resultContent ?? null) as {
+        messages: { msgId: string; hasAttachment?: boolean }[];
+      };
+      expect(recent.messages.find((m) => m.msgId === msgId)).toMatchObject({
+        hasAttachment: true,
+      });
+    });
+
+    it("附件还在下载：第一轮先等它（下好了就带上），不在没图的情况下急着调 agent", async () => {
+      const { group } = await stageGroup();
+      const { runId, path, messageId } = await triggerWithImage(group, false);
+      let finishDownload = true;
+      await runAgentTick({
+        clock,
+        agent: agentClient,
+        gateway: gatewayClient,
+        workerId: "agent-w1",
+        log: silent,
+        turnTimeoutMs: 5_000,
+        auditTimeoutMs: 2_000,
+        sleep: async (ms) => {
+          if (finishDownload) {
+            finishDownload = false;
+            // 等的过程中 media worker 把它下好了
+            await writeFile(path, PNG);
+            await getDb().message.update({
+              where: { id: messageId },
+              data: {
+                localFilePath: path,
+                mediaFetchedAt: clock.now(),
+                mediaNextAttemptAt: null,
+              },
+            });
+          }
+          await pollSleep(ms);
+        },
+        maxStepsPerTick: 1,
+      });
+      expect(
+        (await firstUserContent(runId)).filter(
+          (b) => (b as { type: string }).type === "image",
+        ),
+      ).toHaveLength(1);
+    });
+
+    it("附件一直下不好：最多等 TRIGGER_MEDIA_WAIT_MS 就不带图继续，run 照常跑完", async () => {
+      const { group } = await stageGroup();
+      const { runId } = await triggerWithImage(group, false);
+      const started = clock.now().getTime();
+      await runToEnd();
+      const content = await firstUserContent(runId);
+      expect(content).toEqual([expect.objectContaining({ type: "text" })]);
+      expect(clock.now().getTime() - started).toBeGreaterThanOrEqual(
+        TRIGGER_MEDIA_WAIT_MS,
+      );
+      expectEnded(await run(runId), "finished", "final");
     });
   });
 

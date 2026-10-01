@@ -200,6 +200,12 @@ export function toGeminiContents(
     }
     for (const b of m.content) {
       if (b.type === "text") parts.push({ text: b.text });
+      // 触发消息里的图片（后端 #61）：inlineData
+      if (b.type === "image") {
+        parts.push({
+          inlineData: { mimeType: b.source.media_type, data: b.source.data },
+        });
+      }
     }
     pushUser(parts);
   }

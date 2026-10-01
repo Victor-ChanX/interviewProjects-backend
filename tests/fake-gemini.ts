@@ -28,7 +28,12 @@ export async function startFakeGemini(): Promise<FakeGemini> {
   const closed = new Promise<void>((resolve) => {
     release = resolve;
   });
-  const app = Fastify({ logger: false, forceCloseConnections: true });
+  // 真上游收得下几十 MB（带图片的请求，后端 #61）；默认 1 MB 会把大请求拒成 413
+  const app = Fastify({
+    logger: false,
+    forceCloseConnections: true,
+    bodyLimit: 32 * 1024 * 1024,
+  });
   app.addHook("onClose", async () => release());
   const fake: FakeGemini = {
     app,

@@ -31,7 +31,10 @@ import {
   toAnthropicMessages,
 } from "../src/llm-agent/anthropic.js";
 import type { ConfigStore, LlmTarget } from "../src/llm-agent/config-store.js";
-import { SKIP_THOUGHT_SIGNATURE } from "../src/llm-agent/gemini.js";
+import {
+  SKIP_THOUGHT_SIGNATURE,
+  toGeminiContents,
+} from "../src/llm-agent/gemini.js";
 import {
   AUDIT_SYSTEM_PROMPT,
   TURN_SYSTEM_PROMPT,
@@ -185,6 +188,32 @@ describe("llm-agent（C2 / #21）", () => {
   // ---- 1. Claude ---------------------------------------------------------------------------
 
   describe("Claude /agent/turn", () => {
+    it("带大图的请求（> 1 MB 默认上限）照常受理，image 块原样转给 Claude（后端 #61）", async () => {
+      claude.turnScript.push(
+        A.callTool("toolu_img", "finish", { summary: "看到了" }),
+      );
+      const data = Buffer.alloc(1024 * 1024 + 100).toString("base64");
+      const res = await turn([
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "{}" },
+            {
+              type: "image",
+              msgId: "m1",
+              source: { type: "base64", media_type: "image/jpeg", data },
+            },
+          ],
+        },
+      ]);
+      expect(res.statusCode).toBe(200);
+      const sent = (lastClaude().messages as { content: Json[] }[])[0]!.content;
+      expect(sent[1]).toMatchObject({
+        type: "image",
+        source: { type: "base64", media_type: "image/jpeg" },
+      });
+    });
+
     it("tools / messages 直通，系统提示、tool_choice auto（不并行）、adaptive 思考 + low effort、x-api-key、拒绝兜底", async () => {
       claude.turnScript.push(
         A.callTool("toolu_1", "get_recent_messages", { limit: 10 }),
@@ -401,6 +430,51 @@ describe("llm-agent（C2 / #21）", () => {
       );
       expect((lastClaude().messages as Json[])[1]?.content).toEqual([
         A.toolUse("toolu_m", "get_recent_messages", { limit: 1 }),
+      ]);
+    });
+
+    it("触发消息的图片（后端 #61）：image 块转成 Claude 的 image 块、Gemini 的 inlineData，紧跟在上下文 text 后面", () => {
+      const withImage: AgentMessage[] = [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: '{"groupId":"g1"}' },
+            {
+              type: "image",
+              msgId: "m1",
+              source: {
+                type: "base64",
+                media_type: "image/png",
+                data: "iVBORw==",
+              },
+            },
+          ],
+        },
+      ];
+      expect(toAnthropicMessages(withImage, () => undefined).messages).toEqual([
+        {
+          role: "user",
+          content: [
+            { type: "text", text: '{"groupId":"g1"}' },
+            {
+              type: "image",
+              source: {
+                type: "base64",
+                media_type: "image/png",
+                data: "iVBORw==",
+              },
+            },
+          ],
+        },
+      ]);
+      expect(toGeminiContents(withImage, () => undefined).contents).toEqual([
+        {
+          role: "user",
+          parts: [
+            { text: '{"groupId":"g1"}' },
+            { inlineData: { mimeType: "image/png", data: "iVBORw==" } },
+          ],
+        },
       ]);
     });
 

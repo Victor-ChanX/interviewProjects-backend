@@ -60,6 +60,7 @@ import type {
   AgentClient,
   AgentMessage,
   AgentTool,
+  ImageBlock,
   ToolUseBlock,
 } from "./agent-client.js";
 import {
@@ -74,6 +75,7 @@ import {
   encodeTimeCursor,
   sliceCursorPage,
 } from "./cursor.js";
+import { readLocalMedia } from "./media-service.js";
 import { enqueueMessageInTx } from "./outbox-service.js";
 import { emitWsEvent } from "./ws-events.js";
 
@@ -93,6 +95,13 @@ export const KICK_POLL_MS = 250;
 /** 2.2 工具表：get_recent_messages 的 limit 上限 50、单条 text 超过 500 字截断 */
 export const RECENT_MESSAGES_MAX = 50;
 export const RECENT_TEXT_MAX_CHARS = 500;
+/**
+ * 看图（#61）：触发消息里已下载的图片随每一轮的第一条 user 消息发给 agent，最多这么多张；第一轮开始时附件还在
+ * 下载的，最多等这么久（计入 60 秒预算），等不到就不带图继续。
+ */
+export const TURN_IMAGE_MAX = 4;
+export const TRIGGER_MEDIA_WAIT_MS = 8_000;
+export const TRIGGER_MEDIA_POLL_MS = 250;
 /** A5 第 9 条：tool_result content ≤ 8KB；resultSummary ≤ 200 字；2.3：rawResponse 截到 2KB */
 export const RESULT_CONTENT_MAX_BYTES = 8 * 1024;
 export const RESULT_SUMMARY_MAX_CHARS = 200;
@@ -814,6 +823,7 @@ async function takeTurn(
 ): Promise<AgentStep | "recorded" | "ended"> {
   const db = getDb();
   await touchRun(db, run.id, deps.workerId, deps.clock.now());
+  await waitForTriggerMedia(run, deps);
   const messages = await buildMessages(run);
   await deps.checkpoint?.("before_turn");
   // 60 秒是硬上限（A5 第 2 条）：这一轮最多等到预算用完为止；预算已经用完就不再调
@@ -1111,7 +1121,10 @@ export async function buildMessages(
   const messages: AgentMessage[] = [
     {
       role: "user",
-      content: [{ type: "text", text: JSON.stringify(context) }],
+      content: [
+        { type: "text", text: JSON.stringify(context) },
+        ...(await triggerImages(run.groupId, context.triggerMessages)),
+      ],
     },
   ];
   const steps = await db.agentStep.findMany({
@@ -1158,6 +1171,82 @@ export async function buildMessages(
     });
   }
   return messages;
+}
+
+/**
+ * 触发消息的图片块（#61）：已下载到本地、是图片的附件，按触发顺序最多 TURN_IMAGE_MAX 张。文件读不到（已清理 /
+ * 卷丢了）就跳过 —— 看不到图不影响 run 继续。
+ */
+async function triggerImages(
+  groupId: string,
+  triggers: TriggerMessage[],
+): Promise<ImageBlock[]> {
+  const msgIds = triggers.map((t) => t.msgId);
+  if (msgIds.length === 0) return [];
+  const rows = await getDb().message.findMany({
+    where: { groupId, msgId: { in: msgIds }, localFilePath: { not: null } },
+    select: { msgId: true, localFilePath: true },
+  });
+  const byId = new Map(rows.map((r) => [r.msgId, r.localFilePath]));
+  const blocks: ImageBlock[] = [];
+  for (const msgId of msgIds) {
+    if (blocks.length >= TURN_IMAGE_MAX) break;
+    const path = byId.get(msgId);
+    if (!path) continue;
+    const file = await readLocalMedia(path);
+    if (!file?.contentType.startsWith("image/")) continue;
+    blocks.push({
+      type: "image",
+      msgId,
+      source: {
+        type: "base64",
+        media_type: file.contentType,
+        data: file.bytes.toString("base64"),
+      },
+    });
+  }
+  return blocks;
+}
+
+/**
+ * 第一轮之前：触发消息的附件还在下载（入站后由 media worker 异步下）就先等一会儿，免得 agent 第一眼看不到图（#61）。
+ * 只在还没有任何步骤时等；最多 TRIGGER_MEDIA_WAIT_MS，且不超过剩余预算；等的同时续心跳。
+ */
+async function waitForTriggerMedia(
+  run: RunWithGroup,
+  deps: AgentRunDeps,
+): Promise<void> {
+  const db = getDb();
+  if ((await db.agentStep.count({ where: { runId: run.id } })) > 0) return;
+  const msgIds = (run.triggerMessages as unknown as TriggerMessage[]).map(
+    (t) => t.msgId,
+  );
+  if (msgIds.length === 0) return;
+  const start = deps.clock.now().getTime();
+  for (;;) {
+    const downloading = await db.message.count({
+      where: {
+        groupId: run.groupId,
+        msgId: { in: msgIds },
+        localFilePath: null,
+        mediaNextAttemptAt: { not: null },
+      },
+    });
+    if (downloading === 0) return;
+    const now = deps.clock.now();
+    if (
+      now.getTime() - start >= TRIGGER_MEDIA_WAIT_MS ||
+      remainingBudgetMs(run, now) <= TRIGGER_MEDIA_POLL_MS
+    ) {
+      deps.log?.info(
+        { runId: run.id, downloading },
+        "触发消息的附件还没下好，不带图继续",
+      );
+      return;
+    }
+    await deps.sleep(TRIGGER_MEDIA_POLL_MS);
+    await touchRun(db, run.id, deps.workerId, deps.clock.now());
+  }
 }
 
 // ---- 工具执行 --------------------------------------------------------------------------------------------
@@ -1220,6 +1309,9 @@ async function recentMessages(
       isOwn: r.isOwn,
       text,
       sentAt: r.sentAt.toISOString(),
+      // 只是标记（#61），且只给带附件的消息加（没附件的保持题目 2.2 的原形状，也不多占 8KB 的预算）；
+      // 字节放不进 tool_result，触发消息的图片随每轮第一条 user 消息发
+      ...(r.mediaUrl !== null ? { hasAttachment: true } : {}),
     };
   });
 
