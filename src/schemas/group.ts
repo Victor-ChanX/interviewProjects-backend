@@ -111,3 +111,14 @@ export const LeaveAllResponse = z
   })
   .meta({ id: "LeaveAllResponse" });
 export type LeaveAllResponse = z.infer<typeof LeaveAllResponse>;
+
+/** 删除群（#62）：删了多少条消息 / agent run / 序列运行（给控制台的提示用） */
+export const DeleteGroupResponse = z
+  .object({
+    id: z.string(),
+    messagesDeleted: z.number().int(),
+    agentRunsDeleted: z.number().int(),
+    sequenceRunsDeleted: z.number().int(),
+  })
+  .meta({ id: "DeleteGroupResponse" });
+export type DeleteGroupResponse = z.infer<typeof DeleteGroupResponse>;

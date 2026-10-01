@@ -18,12 +18,14 @@ import {
   GroupIdParams,
   GroupList,
   GroupRead,
+  DeleteGroupResponse,
   LeaveAllResponse,
   PatchGroupRequest,
 } from "../../schemas/group.js";
 import {
   createGroupJob,
   createLeaveAllJob,
+  deleteGroup,
   getGroup,
   listGroups,
   patchGroup,
@@ -113,5 +115,20 @@ export default async function groupRoutes(app: FastifyInstance): Promise<void> {
       });
       return reply.code(202).send({ jobId });
     },
+  );
+
+  r.delete(
+    "/:id",
+    {
+      onRequest: [requireUser, requireRole("admin")],
+      schema: {
+        summary:
+          "删除已退出（left）的群及其消息、运行记录（题目之外的控制台补充；不可恢复）",
+        tags: ["groups"],
+        params: GroupIdParams,
+        response: { 200: DeleteGroupResponse },
+      },
+    },
+    async (req) => deleteGroup(req.params.id, { log: req.log }),
   );
 }

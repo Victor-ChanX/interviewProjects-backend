@@ -32,7 +32,7 @@ import {
   type JobStepKind,
   Prisma,
 } from "../db/generated/client.js";
-import type { GroupRead } from "../schemas/group.js";
+import type { DeleteGroupResponse, GroupRead } from "../schemas/group.js";
 import type { JobRead } from "../schemas/job.js";
 import {
   type CreateGroupJobInput,
@@ -518,4 +518,56 @@ export async function getJob(jobId: string): Promise<JobRead> {
     createdAt: row.createdAt.toISOString(),
     finishedAt: row.finishedAt?.toISOString() ?? null,
   };
+}
+
+/**
+ * 删除一个已退出的群（#62，题目之外的控制台补充）。只删 status = left 的群（服务账号都已退出，网关那边与我们无关了），
+ * 还有进行中的 job / agent run / 序列运行的不删。一个事务、先锁群行：序列运行（连同步骤）→ agent run（连同步骤、
+ * 幂等记录）→ job（连同 errors）→ 消息（连同投递记录）→ 群（连同成员）。本地已下载的附件随记录消失成为孤儿文件，
+ * 由媒体清理按宽限期删掉（media-service 的孤儿扫描），这里不碰盘。
+ */
+export async function deleteGroup(
+  groupId: string,
+  deps: { log?: Pick<Logger, "info"> } = {},
+): Promise<DeleteGroupResponse> {
+  const result = await getDb().$transaction(async (tx) => {
+    const rows = await tx.$queryRaw<{ status: string }[]>`
+      SELECT status FROM groups WHERE id = ${groupId} FOR UPDATE`;
+    const group = rows[0];
+    if (!group) {
+      throw new NotFound("GROUP_NOT_FOUND", "群不存在或已被删除", { groupId });
+    }
+    if (group.status !== "left") {
+      throw new Conflict(
+        "GROUP_NOT_LEFT",
+        "只能删除已退出的群：先「全部退群」，完成后再删除",
+        { groupId, status: group.status },
+      );
+    }
+    // 交互式事务里查询在同一条连接上串行执行：逐条 await
+    const running = { groupId, status: "running" as const };
+    const jobs = await tx.job.count({ where: running });
+    const agentRuns = await tx.agentRun.count({ where: running });
+    const sequenceRuns = await tx.sequenceRun.count({ where: running });
+    if (jobs + agentRuns + sequenceRuns > 0) {
+      throw new Conflict(
+        "GROUP_BUSY",
+        "群里还有进行中的任务或运行，等它们结束后再删除",
+        { groupId, jobs, agentRuns, sequenceRuns },
+      );
+    }
+    const seq = await tx.sequenceRun.deleteMany({ where: { groupId } });
+    const runs = await tx.agentRun.deleteMany({ where: { groupId } });
+    await tx.job.deleteMany({ where: { groupId } });
+    const messages = await tx.message.deleteMany({ where: { groupId } });
+    await tx.group.delete({ where: { id: groupId } });
+    return {
+      id: groupId,
+      messagesDeleted: messages.count,
+      agentRunsDeleted: runs.count,
+      sequenceRunsDeleted: seq.count,
+    };
+  });
+  deps.log?.info(result, "已删除群");
+  return result;
 }

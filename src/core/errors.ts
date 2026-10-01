@@ -38,6 +38,9 @@ export type ErrorCode =
   // ---- leave-all job（#16，题目 2.3 POST /api/groups/:id/leave-all + B2）----
   // 群已是 left：没有成员可退（409：状态不允许，请求本身没问题）
   | "GROUP_ALREADY_LEFT"
+  // 删除群（#62）：只能删已退出（left）的群；还有进行中的 job / agent run / 序列运行也不删（409）
+  | "GROUP_NOT_LEFT"
+  | "GROUP_BUSY"
   // 群在网关里还没建成（gatewayGroupId 为空：建群 job 未完成或已失败），没有可退的群（409：等状态变）
   | "GROUP_NOT_READY"
   // 该群已有一个 running 的 job（建群还在跑 / 已有 leave-all 在跑）；部分唯一索引撞出的 P2002 → 409
